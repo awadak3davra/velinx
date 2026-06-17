@@ -1,0 +1,14 @@
+# build output
+/dist/
+# local runtime state (created by demo/run) — machine-specific, may hold secrets
+/.kxdata/
+/profile.json
+/profile.json.tmp
+/dev-config.json
+/dev-config.json.tmp
+/servers.json
+/servers.json.tmp
+/singbox.json
+# editor / OS cruft
+*.swp
+.DS_Store

@@ -1,0 +1,350 @@
+package model
+
+import (
+	"encoding/base64"
+	"fmt"
+	"net"
+	"strings"
+)
+
+// Validate checks structural integrity: unique IDs, resolvable members and
+// rule targets, and sane ports. It returns the first problem found.
+func (p *Profile) Validate() error {
+	ids := map[string]string{}   // id -> kind, for duplicate + resolution checks
+	enabled := map[string]bool{} // target id -> usable (endpoints honor Enabled; groups are always usable)
+
+	for _, e := range p.Endpoints {
+		if e.ID == "" {
+			return fmt.Errorf("endpoint %q has empty id", e.Name)
+		}
+		if prev, ok := ids[e.ID]; ok {
+			return fmt.Errorf("duplicate id %q (already used by %s)", e.ID, prev)
+		}
+		ids[e.ID] = "endpoint"
+		enabled[e.ID] = e.Enabled
+		if e.Engine == EngineExternal {
+			// Routes via an existing OS interface, not a server — it needs only the
+			// interface name; server/port/protocol do not apply.
+			if s, _ := e.Params["interface"].(string); strings.TrimSpace(s) == "" {
+				return fmt.Errorf("endpoint %q: external engine needs params.interface", e.ID)
+			}
+			continue
+		}
+		if e.Server == "" {
+			return fmt.Errorf("endpoint %q: empty server", e.ID)
+		}
+		if e.Port < 1 || e.Port > 65535 {
+			return fmt.Errorf("endpoint %q: port %d out of range", e.ID, e.Port)
+		}
+		if e.Protocol == "" {
+			return fmt.Errorf("endpoint %q: empty protocol", e.ID)
+		}
+		// An ENABLED endpoint must carry the identity fields its protocol needs.
+		// sing-box rejects an outbound/endpoint missing them ("missing private
+		// key" / "invalid uuid" / "missing password"); since the whole profile
+		// generates into ONE singbox.json loaded all-or-nothing, a single such
+		// endpoint would fail the entire config on apply and take down all routing.
+		// Catching it here (Generate calls Validate first) fails the apply safely,
+		// leaving the last-good live config in place. Disabled endpoints aren't
+		// emitted by the generator, so they're exempt (a half-edited draft is fine).
+		if e.Enabled {
+			if missing := missingProtoParam(&e); missing != "" {
+				return fmt.Errorf("endpoint %q (%s): missing required %s", e.ID, e.Protocol, missing)
+			}
+			if bad := invalidProtoParam(&e); bad != "" {
+				return fmt.Errorf("endpoint %q (%s): %s", e.ID, e.Protocol, bad)
+			}
+		}
+	}
+
+	for _, g := range p.Groups {
+		if g.ID == "" {
+			return fmt.Errorf("group %q has empty id", g.Name)
+		}
+		if prev, ok := ids[g.ID]; ok {
+			return fmt.Errorf("duplicate id %q (already used by %s)", g.ID, prev)
+		}
+		ids[g.ID] = "group"
+		enabled[g.ID] = true
+		if len(g.Members) == 0 {
+			return fmt.Errorf("group %q: no members", g.ID)
+		}
+	}
+
+	// Members must resolve to a known, ENABLED endpoint or a group. A disabled
+	// member isn't emitted by the generator, so the group would reference a
+	// non-existent outbound tag and sing-box would reject the config.
+	for _, g := range p.Groups {
+		for _, m := range g.Members {
+			if _, ok := ids[m]; !ok {
+				return fmt.Errorf("group %q: member %q does not resolve", g.ID, m)
+			}
+			if m == g.ID {
+				return fmt.Errorf("group %q: cannot contain itself", g.ID)
+			}
+			if !enabled[m] {
+				return fmt.Errorf("group %q: member %q is disabled", g.ID, m)
+			}
+		}
+	}
+
+	// Rule targets must resolve to an enabled id or a builtin, and a non-default
+	// rule must carry at least one matcher (a condition-less rule is invalid in
+	// sing-box).
+	defaults := 0
+	for _, r := range p.Rules {
+		if r.Default {
+			defaults++
+		} else {
+			if ruleHasNoMatcher(r) {
+				return fmt.Errorf("rule %q: has no match condition (domain/geosite/geoip/ip/port)", r.ID)
+			}
+			// A malformed ip_cidr entry FATALs sing-box at config-load
+			// ("netip.ParsePrefix: no '/'"), bricking the whole shared singbox.json
+			// on apply. sing-box accepts a bare IP or a CIDR; reject anything else
+			// here so the apply fails safely with a precise error instead of bricking.
+			// (Blank entries are handled by ruleHasNoMatcher / the generator.)
+			if bad := firstInvalidCIDR(r.IPCIDR); bad != "" {
+				return fmt.Errorf("rule %q: invalid ip_cidr %q (must be an IP or CIDR, e.g. 10.0.0.0/8)", r.ID, bad)
+			}
+			// sing-box route ports are uint16: a value <0 or >65535 FATALs the whole
+			// config at decode ("cannot unmarshal number 70000 into uint16"), bricking
+			// the shared singbox.json on apply. Range-check here so the apply fails
+			// safely. (0 is valid — sing-box accepts it.)
+			for _, port := range r.Port {
+				if port < 0 || port > 65535 {
+					return fmt.Errorf("rule %q: port %d out of range (must be 0-65535)", r.ID, port)
+				}
+			}
+		}
+		if !isResolvable(r.Outbound, ids) {
+			return fmt.Errorf("rule %q: outbound %q does not resolve", r.ID, r.Outbound)
+		}
+		if !isBuiltin(r.Outbound) && !enabled[r.Outbound] {
+			return fmt.Errorf("rule %q: outbound %q targets a disabled endpoint", r.ID, r.Outbound)
+		}
+	}
+	if defaults > 1 {
+		return fmt.Errorf("more than one default rule (%d)", defaults)
+	}
+
+	// Routing lists (the "Routing" page): unique id, some content, and an
+	// outbound + download interface that resolve to an enabled target/builtin.
+	for _, rl := range p.RoutingLists {
+		if rl.ID == "" {
+			return fmt.Errorf("routing list %q has empty id", rl.Name)
+		}
+		if prev, ok := ids[rl.ID]; ok {
+			return fmt.Errorf("duplicate id %q (already used by %s)", rl.ID, prev)
+		}
+		ids[rl.ID] = "routing list"
+		if rl.Source == "" && len(rl.Manual) == 0 {
+			return fmt.Errorf("routing list %q: needs a source URL or manual entries", rl.ID)
+		}
+		if !isResolvable(rl.Outbound, ids) {
+			return fmt.Errorf("routing list %q: outbound %q does not resolve", rl.ID, rl.Outbound)
+		}
+		if !isBuiltin(rl.Outbound) && !enabled[rl.Outbound] {
+			return fmt.Errorf("routing list %q: outbound %q targets a disabled endpoint", rl.ID, rl.Outbound)
+		}
+		if rl.DownloadVia != "" {
+			if !isResolvable(rl.DownloadVia, ids) {
+				return fmt.Errorf("routing list %q: download_via %q does not resolve", rl.ID, rl.DownloadVia)
+			}
+			// A disabled endpoint isn't emitted as an outbound, so a download_detour
+			// pointing at it would reference a missing tag and sing-box would reject
+			// the config — same guard as Outbound above.
+			if !isBuiltin(rl.DownloadVia) && !enabled[rl.DownloadVia] {
+				return fmt.Errorf("routing list %q: download_via %q targets a disabled endpoint", rl.ID, rl.DownloadVia)
+			}
+		}
+	}
+	return nil
+}
+
+// missingProtoParam returns the name of the first mandatory identity param the
+// endpoint's protocol requires but is empty, or "" if all are present.
+//
+// Scope is deliberately the fields whose absence makes sing-box HARD-REJECT the
+// generated config (verified against sing-box 1.12 on the live device): TUIC uuid
+// ("invalid uuid: length 0"), Shadowsocks method/password ("unknown method" /
+// "missing password"), and WireGuard/AmneziaWG private_key ("missing private
+// key"). Those are the cases that fail the whole shared singbox.json and take
+// down all routing. sing-box TOLERATES an empty vless/vmess uuid or trojan/
+// hysteria2 password at load (the endpoint just won't authenticate — an isolated
+// failure, not a config-bricking one), so they are intentionally not required
+// here. socks/http (and external, handled earlier) carry no mandatory params.
+func missingProtoParam(e *Endpoint) string {
+	get := func(k string) string { s, _ := e.Params[k].(string); return strings.TrimSpace(s) }
+	firstEmpty := func(keys ...string) string {
+		for _, k := range keys {
+			if get(k) == "" {
+				return k
+			}
+		}
+		return ""
+	}
+	switch e.Protocol {
+	case ProtoTUIC:
+		return firstEmpty("uuid")
+	case ProtoShadowsocks:
+		return firstEmpty("method", "password")
+	case ProtoWireGuard, ProtoAmneziaWG:
+		// peer_public_key is mandatory. An empty one is especially dangerous for
+		// native WireGuard: it PASSES `sing-box check` (the peer public_key
+		// base64-decodes "" to nil with no error at config-load) but then FATALs at
+		// runtime when the endpoint starts (wireguard IpcSet rejects a 0-byte key),
+		// bringing ALL routing down AFTER the pre-apply check already passed. Catch
+		// it here, before Generate emits it, so the apply fails safely.
+		return firstEmpty("private_key", "peer_public_key")
+	}
+	return ""
+}
+
+// knownSSMethods is the EXACT set of Shadowsocks methods sing-box 1.12.x accepts
+// (enumerated against the live `sing-box check`): AEAD, AEAD-2022, the legacy
+// stream ciphers it still ships, and "none". A method outside this set makes
+// sing-box fail the whole shared singbox.json with "unknown method" — so a real
+// old-server link using e.g. salsa20 / chacha20 (bare) / rc4 / camellia-*-cfb
+// would take ALL routing down on apply. The method is mandatory and can't be
+// degraded (no sane default for an arbitrary server), so it is rejected at
+// Validate, which fails the apply safely and leaves the last-good config live.
+// Erring narrow here only rejects a dead endpoint (sing-box would reject it too);
+// it never lets a bricking value through.
+var knownSSMethods = map[string]bool{
+	"aes-128-gcm": true, "aes-192-gcm": true, "aes-256-gcm": true,
+	"chacha20-ietf-poly1305": true, "xchacha20-ietf-poly1305": true,
+	"2022-blake3-aes-128-gcm": true, "2022-blake3-aes-256-gcm": true, "2022-blake3-chacha20-poly1305": true,
+	"aes-128-ctr": true, "aes-192-ctr": true, "aes-256-ctr": true,
+	"aes-128-cfb": true, "aes-192-cfb": true, "aes-256-cfb": true,
+	"rc4-md5": true, "chacha20-ietf": true, "xchacha20": true, "none": true,
+}
+
+// invalidProtoParam returns a message when a PRESENT mandatory param has a value
+// sing-box hard-rejects (a different failure mode than missingProtoParam's empty
+// fields, but the same all-or-nothing config-bricking consequence): a malformed
+// TUIC uuid ("invalid uuid: incorrect UUID length"), an unsupported Shadowsocks
+// method ("unknown method"), or a Shadowsocks-2022 PSK of the wrong length ("bad
+// key length, required N"). None can be degraded — there is no sane default — so
+// rejecting at Validate fails the apply safely instead of bricking the whole config.
+func invalidProtoParam(e *Endpoint) string {
+	get := func(k string) string { s, _ := e.Params[k].(string); return strings.TrimSpace(s) }
+	switch e.Protocol {
+	case ProtoTUIC:
+		// TUIC authenticates with a uuid + password; sing-box parses the uuid
+		// strictly (a non-canonical one fails the whole config load). vless/vmess
+		// tolerate a bad uuid, so this guard is TUIC-only.
+		if u := get("uuid"); u != "" && !isUUIDish(u) {
+			return fmt.Sprintf("invalid uuid %q (want 8-4-4-4-12 hex)", u)
+		}
+	case ProtoShadowsocks:
+		// An unsupported method bricks the shared config (sing-box "unknown method").
+		// missingProtoParam already rejected an empty method, so a non-empty one here
+		// must be in the set sing-box actually implements.
+		if m := get("method"); m != "" && !knownSSMethods[m] {
+			return fmt.Sprintf("unsupported method %q (sing-box rejects it, failing the whole config)", m)
+		}
+		// SS-2022 (2022-blake3-*) needs a base64 PSK of an exact byte length:
+		// aes-128 -> 16, aes-256 / chacha20 -> 32. sing-box rejects a wrong one.
+		if m := get("method"); strings.HasPrefix(m, "2022-blake3-") {
+			want := 32
+			if strings.Contains(m, "aes-128") {
+				want = 16
+			}
+			if pw := get("password"); pw != "" && b64Len(pw) != want {
+				return fmt.Sprintf("%s needs a %d-byte base64 key", m, want)
+			}
+		}
+	}
+	return ""
+}
+
+// isUUIDish reports whether s looks like a canonical 8-4-4-4-12 hex UUID.
+func isUUIDish(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// b64Len returns the decoded byte length of a base64 string (std or raw-std,
+// padded or not), or -1 if it does not decode.
+func b64Len(s string) int {
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if b, err := enc.DecodeString(s); err == nil {
+			return len(b)
+		}
+	}
+	return -1
+}
+
+func isBuiltin(target string) bool {
+	switch strings.ToLower(target) {
+	case OutboundDirect, OutboundBlock:
+		return true
+	}
+	return false
+}
+
+func isResolvable(target string, ids map[string]string) bool {
+	if isBuiltin(target) {
+		return true
+	}
+	_, ok := ids[target]
+	return ok
+}
+
+func ruleHasNoMatcher(r Rule) bool {
+	return !hasNonBlank(r.DomainSuffix) && !hasNonBlank(r.Domain) && !hasNonBlank(r.GeoSite) &&
+		!hasNonBlank(r.GeoIP) && !hasNonBlank(r.IPCIDR) && len(r.Port) == 0
+}
+
+// hasNonBlank reports whether ss has at least one non-whitespace entry. A matcher
+// slice of only blank strings (e.g. geosite:[""]) is NOT a real matcher: the
+// generator trims blanks away, so such a rule would emit a CONDITION-LESS route
+// rule that matches ALL traffic and shadows every later rule plus the
+// block-default — a routing leak. Counting only non-blank entries lets
+// ruleHasNoMatcher reject an all-blank rule at Validate, failing the apply safely
+// instead of silently routing everything to that rule's outbound.
+func hasNonBlank(ss []string) bool {
+	for _, s := range ss {
+		if strings.TrimSpace(s) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// firstInvalidCIDR returns the first non-blank entry that sing-box would reject
+// as an ip_cidr matcher — i.e. one that is neither a CIDR (net.ParseCIDR) nor a
+// bare IP (net.ParseIP; sing-box accepts a bare address and treats it as /32 or
+// /128). Returns "" when every entry is valid. Blank entries are skipped (they
+// are handled by ruleHasNoMatcher and dropped by the generator's matcher build).
+func firstInvalidCIDR(cidrs []string) string {
+	for _, c := range cidrs {
+		s := strings.TrimSpace(c)
+		if s == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(s); err == nil {
+			continue
+		}
+		if net.ParseIP(s) != nil {
+			continue
+		}
+		return c
+	}
+	return ""
+}

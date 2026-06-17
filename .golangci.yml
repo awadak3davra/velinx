@@ -1,0 +1,34 @@
+# golangci-lint v2 config. This is an INFORMATIONAL gate (continue-on-error in
+# ci.yml); the blocking gates are gofmt + `go vet`. golangci-lint v2 removed the
+# built-in default exclusions that v1 shipped, so without this it re-flags the
+# idiomatic false positives v1 hid: unchecked Close()/Fprintf()/best-effort
+# Remove() (errcheck) and the opt-in "quickfix" refactor SUGGESTIONS (staticcheck
+# QF*), which are style preferences, not defects. We keep golangci-lint's default
+# linter/check set (so e.g. the ST* stylecheck naming rules stay OFF, as the test
+# helpers intentionally use pkg_name underscores) and only exclude the noise.
+version: "2"
+
+linters:
+  exclusions:
+    presets:
+      - std-error-handling     # unchecked Close/Fprintf/Fprint/Write (idiomatic)
+      - common-false-positives
+      - legacy                 # restores golangci-lint v1's default exclude set
+    rules:
+      # staticcheck "quickfix" checks are opt-in refactor suggestions, not defects.
+      - linters: [staticcheck]
+        text: 'QF1001|QF1006|QF1012'
+      # Best-effort cleanup removes whose failure is not actionable.
+      - linters: [errcheck]
+        source: 'os\.Remove'
+      # Test helpers routinely ignore Close()/Write() on scratch buffers/files,
+      # and string(Body.Bytes()) vs Body.String() is readability-only.
+      - linters: [errcheck]
+        path: _test\.go
+      - linters: [staticcheck]
+        path: _test\.go
+        text: 'S1030'
+      # Two long-standing unused private symbols (a duplicate const + a helper).
+      # Kept per the project's preserve-code rule; flagged for a removal review.
+      - linters: [unused]
+        text: 'strDefault|defaultHealthURL'

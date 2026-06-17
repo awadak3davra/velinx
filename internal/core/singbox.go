@@ -1,0 +1,301 @@
+// Package core supervises the sing-box process: locate, check, start, stop, reload.
+package core
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"wakeroute/internal/atomicfile"
+)
+
+// SingBox manages a sing-box process driven by a generated config file.
+type SingBox struct {
+	bin    string
+	config string
+
+	mu        sync.Mutex
+	cmd       *exec.Cmd
+	done      chan struct{} // closed when the supervised process exits
+	desired   bool          // Start was called and Stop was not (watchdog intent)
+	startedAt time.Time
+	exitErr   error
+	log       *ringLog
+}
+
+// New returns a supervisor for the given binary and config path.
+func New(bin, config string) *SingBox {
+	return &SingBox{bin: bin, config: config, log: newRingLog(500)}
+}
+
+// LogLines returns the captured sing-box output (oldest first).
+func (s *SingBox) LogLines() []string { return s.log.Lines() }
+
+// ringLog keeps the last N lines written to it (sing-box stdout+stderr).
+type ringLog struct {
+	mu    sync.Mutex
+	lines []string
+	size  int
+	buf   []byte
+}
+
+func newRingLog(size int) *ringLog { return &ringLog{size: size} }
+
+func (r *ringLog) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	for {
+		i := bytes.IndexByte(r.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := strings.TrimRight(string(r.buf[:i]), "\r")
+		r.buf = r.buf[i+1:]
+		if line == "" {
+			continue
+		}
+		// Append, and only compact to the most-recent `size` lines once we've grown
+		// to 2×size — amortized O(1) per line instead of shifting the whole slice
+		// on every line (matters on a chatty log + a slow router CPU).
+		r.lines = append(r.lines, line)
+		if len(r.lines) > 2*r.size {
+			r.lines = append(r.lines[:0], r.lines[len(r.lines)-r.size:]...)
+		}
+	}
+	return len(p), nil
+}
+
+func (r *ringLog) Lines() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.lines))
+	copy(out, r.lines)
+	return out
+}
+
+// Available reports whether the sing-box binary exists and looks runnable.
+func (s *SingBox) Available() bool {
+	if s.bin == "" {
+		return false
+	}
+	if _, err := exec.LookPath(s.bin); err == nil {
+		return true
+	}
+	info, err := os.Stat(s.bin)
+	return err == nil && !info.IsDir()
+}
+
+// Check validates the active config with `sing-box check`.
+func (s *SingBox) Check(ctx context.Context) error {
+	return s.CheckConfig(ctx, s.config)
+}
+
+// CheckConfig validates an arbitrary config file with `sing-box check`. Used by
+// apply to verify a freshly generated config before swapping it in.
+func (s *SingBox) CheckConfig(ctx context.Context, path string) error {
+	if !s.Available() {
+		return fmt.Errorf("sing-box binary not found at %q", s.bin)
+	}
+	out, err := exec.CommandContext(ctx, s.bin, "check", "-c", path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("sing-box check failed: %v: %s", err, out)
+	}
+	return nil
+}
+
+// Start launches sing-box if it is not already running. It marks the process as
+// "desired" (the watchdog restarts it if it later crashes) and tracks its exit
+// via a goroutine so Alive() stays accurate without a separate Wait() caller.
+func (s *SingBox) Start() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cmd != nil && s.aliveLocked() {
+		s.desired = true
+		return nil
+	}
+	if !s.Available() {
+		// Nothing to supervise (e.g. demo with no binary) — don't mark desired,
+		// or the watchdog would loop on a process it can never start.
+		return fmt.Errorf("sing-box binary not found at %q", s.bin)
+	}
+	cmd := exec.Command(s.bin, "run", "-c", s.config)
+	mw := io.MultiWriter(os.Stdout, s.log)
+	cmd.Stdout = mw
+	cmd.Stderr = mw
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start sing-box: %w", err)
+	}
+	done := make(chan struct{})
+	s.cmd = cmd
+	s.done = done
+	s.desired = true
+	s.startedAt = time.Now()
+	s.exitErr = nil
+	go func() {
+		err := cmd.Wait()
+		s.mu.Lock()
+		s.exitErr = err
+		s.mu.Unlock()
+		close(done)
+	}()
+	return nil
+}
+
+// Stop terminates sing-box if it is running and clears the "desired" intent so
+// the watchdog won't restart it.
+func (s *SingBox) Stop() error {
+	s.mu.Lock()
+	s.desired = false
+	cmd, done := s.cmd, s.done
+	s.cmd, s.done = nil, nil
+	s.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	// If the process already exited on its own (a crash), the exit goroutine has
+	// closed done. Killing an already-reaped process returns a spurious error
+	// (os.ErrProcessDone on Unix, EINVAL on Windows) — that is NOT a Stop failure,
+	// and returning it would make Reload() abort instead of relaunching the core.
+	if done != nil {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+	}
+	// Graceful first: SIGTERM lets sing-box tear down its TUN before we force-kill
+	// it. In TUN-gateway mode sing-box installs kernel routing state (auto_route ip
+	// rules + a route table, the auto_redirect nft table); SIGKILL bypasses its
+	// signal handler so that state is left stranded on a now-dead tun0 (a transient
+	// routing blackhole on every reload/restart) until a fresh start re-establishes
+	// it. SIGTERM removes it cleanly (traffic falls back to the WAN default instead).
+	// Wait briefly for a clean exit, then force-kill. On Windows (demo) Signal is
+	// unsupported and returns an error, so we fall straight through to Kill.
+	if err := cmd.Process.Signal(syscall.SIGTERM); err == nil && done != nil {
+		select {
+		case <-done:
+			return nil
+		case <-time.After(stopGrace):
+		}
+	}
+	err := cmd.Process.Kill()
+	if done != nil {
+		<-done // let the exit-tracking goroutine finish Wait()
+	}
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil // lost the race: process died between the select and Kill
+	}
+	return err
+}
+
+// stopGrace is how long Stop() waits for a clean SIGTERM exit before SIGKILL. A
+// var (not const) so tests can shrink it.
+var stopGrace = 3 * time.Second
+
+// Reload re-applies the config by restarting sing-box. sing-box also supports
+// SIGHUP on Unix, but a restart is portable and good enough for M1.
+func (s *SingBox) Reload() error {
+	if err := s.Stop(); err != nil {
+		return err
+	}
+	err := s.Start()
+	if err != nil {
+		// Stop() cleared the "desired" intent and Start() only sets it on success,
+		// so a failed reload would leave the core both DOWN and un-supervised — the
+		// watchdog would never retry. Re-assert the intent so it keeps trying to
+		// bring the core back up.
+		s.mu.Lock()
+		s.desired = true
+		s.mu.Unlock()
+	}
+	return err
+}
+
+// Running reports whether sing-box is currently up (alive). Note: after a crash
+// this is false even though Start was called — see Desired() for intent.
+func (s *SingBox) Running() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.aliveLocked()
+}
+
+// Alive reports whether the supervised process is currently running.
+func (s *SingBox) Alive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.aliveLocked()
+}
+
+func (s *SingBox) aliveLocked() bool {
+	if s.cmd == nil || s.done == nil {
+		return false
+	}
+	select {
+	case <-s.done: // exited
+		return false
+	default:
+		return true
+	}
+}
+
+// Desired reports whether sing-box is supposed to be running (Start called,
+// Stop not). The watchdog uses this to decide whether a crash warrants a restart.
+func (s *SingBox) Desired() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.desired
+}
+
+// StartedAt is when the current process was launched (zero if never started).
+func (s *SingBox) StartedAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.startedAt
+}
+
+// Backup copies the active config to <config>.bak (no-op if it doesn't exist yet).
+func (s *SingBox) Backup() error {
+	if _, err := os.Stat(s.config); err != nil {
+		return nil
+	}
+	return copyFile(s.config, s.config+".bak")
+}
+
+// Restore restores the config from <config>.bak (used by fail-safe rollback).
+func (s *SingBox) Restore() error {
+	bak := s.config + ".bak"
+	if _, err := os.Stat(bak); err != nil {
+		return fmt.Errorf("no backup config to restore")
+	}
+	return copyFile(bak, s.config)
+}
+
+// Commit marks the active config as the known-good baseline (<config>.good).
+func (s *SingBox) Commit() error {
+	if _, err := os.Stat(s.config); err != nil {
+		return nil
+	}
+	return copyFile(s.config, s.config+".good")
+}
+
+// copyFile copies src to dst with a durable, atomic write (temp + fsync +
+// rename). These dst paths are the config snapshots the fail-safe relies on —
+// .bak (rollback target), .good (baseline), and the live config itself on
+// Restore — so a power loss mid-write must not leave a torn/zero-length config
+// that won't start. That is exactly what atomicfile guards against on a router.
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return atomicfile.Write(dst, data, 0o600)
+}

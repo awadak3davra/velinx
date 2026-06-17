@@ -1,0 +1,134 @@
+name: ci
+
+# Comprehensive per-element quality gates. Complements build.yml (which runs the
+# unit tests, cross-compiles the 5 router arches, and publishes releases). Here we
+# add the checks build.yml lacks: format/vet, fuzzing, the real sing-box config
+# validation for every protocol, source-builds of the engine binaries WakeRoute
+# orchestrates (so a broken/upgraded olcRTC or amneziawg-go is caught in CI), and
+# informational static analysis (golangci-lint / govulncheck / shellcheck).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '37 5 * * 1'   # weekly — catches upstream engine-build breakage with no push
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Quality gates run on the dev-toolchain Go so gofmt matches locally; the
+  # release builds in build.yml stay on the router-target 1.22.
+  GO_VERSION: '1.26'
+  # Run the JS-based actions on the runner's bundled Node 24 (Node 20 is
+  # deprecated). The self-hosted runner ships node24; this opts in now.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  # --- format + vet (blocking) + static analysis (informational) ---
+  lint:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}', cache: false}
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint (informational)
+        continue-on-error: true
+        uses: golangci/golangci-lint-action@v8
+        with: { version: v2.12.2 }
+      - name: govulncheck (informational)
+        continue-on-error: true
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  # --- fuzz the parsers (each target a short smoke run) ---
+  fuzz:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}', cache: false}
+      - name: Fuzz smoke (importer + exporter targets)
+        run: |
+          set -euo pipefail
+          go test -run=^$ -fuzz=^FuzzParse$             -fuzztime=25s ./internal/importer/
+          go test -run=^$ -fuzz=^FuzzParseSubscription$ -fuzztime=25s ./internal/importer/
+          go test -run=^$ -fuzz=^FuzzExportRoundTrip$   -fuzztime=25s ./internal/exporter/
+          go test -run=^$ -fuzz=^FuzzExportOddParams$   -fuzztime=25s ./internal/exporter/
+
+  # --- shellcheck the install / init scripts (informational until clean) ---
+  scripts:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck packaging scripts
+        continue-on-error: true
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck packaging/*.sh packaging/openwrt/*.sh \
+                     packaging/S99wakeroute packaging/openwrt/wakeroute.init
+
+  # --- validate EVERY protocol against the real sing-box core, on BOTH the
+  # deployed 1.12.x line AND 1.13.x (which REMOVED the legacy wireguard outbound).
+  # Native WireGuard is emitted as a top-level `endpoints` entry, so the
+  # all-protocols config must pass `sing-box check` on both — this matrix proves
+  # the schema is forward-compatible past the 1.13 removal. ---
+  singbox-check:
+    runs-on: [self-hosted, Linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.12.17 = the version on the AX3000T today; 1.13.13 = the line that
+        # removed the wireguard outbound. Bump deliberately when WakeRoute moves.
+        singbox: ['1.12.17', '1.13.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}', cache: false}
+      - name: Fetch sing-box ${{ matrix.singbox }}
+        run: |
+          set -euo pipefail
+          ver='${{ matrix.singbox }}'
+          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-amd64.tar.gz" -o sb.tgz
+          tar -xzf sb.tgz
+          echo "WR_SINGBOX=$PWD/sing-box-${ver}-linux-amd64/sing-box" >> "$GITHUB_ENV"
+      - name: sing-box ${{ matrix.singbox }} check on an all-protocols config
+        run: go test -run TestAllProtocolsGenerate -count=1 ./internal/generator/
+
+  # --- source-build the engine binaries WakeRoute orchestrates ---
+  # Heavy (olcRTC pulls a large WebRTC stack and needs Go 1.26), so it is skipped
+  # on PRs to keep them fast and runs on push / the weekly schedule / manual.
+  engines:
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26' }   # olcRTC go.mod requires go 1.26.3; amneziawg-go builds on it too
+      - name: amneziawg-go binary cross-builds (arm64)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-go awg
+          cd awg
+          # Build the binary (.), NOT ./... — a transitive dep (outline-sdk/x/smart)
+          # fails to cross-compile but is not imported by the amneziawg-go binary.
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/amneziawg-go .
+      - name: olcRTC cross-builds (arm64 + mipsle)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/openlibrecommunity/olcrtc olc
+          cd olc
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64           go build -trimpath -ldflags '-s -w' -o /tmp/olcrtc-arm64  ./cmd/olcrtc
+          CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -o /tmp/olcrtc-mipsle ./cmd/olcrtc
+          ls -la /tmp/olcrtc-arm64 /tmp/olcrtc-mipsle

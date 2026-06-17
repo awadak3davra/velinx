@@ -1,0 +1,412 @@
+// Package health runs background latency probes against each endpoint/group via
+// the Clash API and accumulates per-target stats: current state + latency,
+// success rate, average latency, reconnection count, uptime, a handshake state,
+// a probable failure cause (from the engine log via the knowledgebase), and
+// per-endpoint traffic (rate + approximate total) from the Clash connections API.
+package health
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"wakeroute/internal/clash"
+	"wakeroute/internal/kb"
+	"wakeroute/internal/store"
+)
+
+type State string
+
+const (
+	Alive   State = "alive"
+	Down    State = "down"
+	Unknown State = "unknown"
+)
+
+// LogSource provides recent engine log lines (implemented by core.SingBox).
+type LogSource interface {
+	LogLines() []string
+}
+
+type stat struct {
+	name, kind                       string
+	probes, ok, fail                 int
+	sumLatency                       int64
+	lastLatency                      int
+	state                            State
+	reconnects                       int
+	firstSeen, lastChange, lastProbe int64 // unix ms
+
+	// traffic (from Clash /connections, best-effort)
+	activeUp, activeDown int64 // last sampled active-connection byte sums
+	rateUp, rateDown     int64 // bytes/s
+	totalUp, totalDown   int64 // approx bytes since monitoring started
+	lastConnSample       int64
+}
+
+// View is the JSON snapshot of a target's health + stats.
+type View struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Kind         string `json:"kind"`
+	State        string `json:"state"`     // alive | down | unknown
+	Handshake    string `json:"handshake"` // ok | failed | unknown
+	LatencyMs    int    `json:"latency_ms"`
+	AvgLatencyMs int    `json:"avg_latency_ms"`
+	SuccessRate  int    `json:"success_rate"`
+	Probes       int    `json:"probes"`
+	Reconnects   int    `json:"reconnects"`
+	UptimeS      int64  `json:"uptime_s"`
+	RateUpBps    int64  `json:"rate_up_bps"`
+	RateDownBps  int64  `json:"rate_down_bps"`
+	BytesUp      int64  `json:"bytes_up"`
+	BytesDown    int64  `json:"bytes_down"`
+	Cause        string `json:"cause,omitempty"` // why it's down (R6)
+	CauseFix     string `json:"cause_fix,omitempty"`
+}
+
+// Monitor probes targets and accumulates their stats.
+type Monitor struct {
+	mu        sync.Mutex
+	stats     map[string]*stat
+	clash     *clash.Client
+	store     *store.Store
+	logs      LogSource
+	demo      bool
+	testURL   string
+	interval  time.Duration
+	timeoutMS int
+}
+
+// NewMonitor builds a Monitor probing every 10s with a 5s per-probe timeout.
+// In demo mode it synthesizes plausible per-tunnel stats (so the dashboard shows
+// what real data looks like without a running sing-box).
+func NewMonitor(cl *clash.Client, st *store.Store, logs LogSource, demo bool) *Monitor {
+	return &Monitor{
+		stats:     map[string]*stat{},
+		clash:     cl,
+		store:     st,
+		logs:      logs,
+		demo:      demo,
+		testURL:   "http://cp.cloudflare.com/generate_204",
+		interval:  10 * time.Second,
+		timeoutMS: 5000,
+	}
+}
+
+func nowMS() int64 { return time.Now().UnixMilli() }
+
+func (m *Monitor) record(id, name, kind string, state State, latency int, now int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.stats[id]
+	if s == nil {
+		s = &stat{state: Unknown, firstSeen: now, lastChange: now}
+		m.stats[id] = s
+	}
+	if name != "" {
+		s.name = name
+	}
+	if kind != "" {
+		s.kind = kind
+	}
+	s.probes++
+	s.lastProbe = now
+	switch state {
+	case Alive:
+		s.ok++
+		s.sumLatency += int64(latency)
+		s.lastLatency = latency
+	case Down:
+		s.fail++
+	}
+	if state != s.state {
+		if state == Alive && s.state == Down {
+			s.reconnects++
+		}
+		s.state = state
+		s.lastChange = now
+	}
+}
+
+// probe runs the Clash delay test through proxy id, using testURL (the per-tunnel
+// health target) when set, else the monitor's default.
+func (m *Monitor) probe(ctx context.Context, id, testURL string) (State, int) {
+	if m.clash == nil {
+		return Unknown, 0
+	}
+	url := testURL
+	if url == "" {
+		url = m.testURL
+	}
+	d, err := m.clash.Delay(ctx, id, url, m.timeoutMS)
+	if err == nil {
+		return Alive, d
+	}
+	if errors.Is(err, clash.ErrProxyDown) {
+		return Down, 0
+	}
+	return Unknown, 0
+}
+
+type target struct{ id, name, kind, testURL string }
+
+func (m *Monitor) targets() []target {
+	p := m.store.Profile()
+	var t []target
+	for _, e := range p.Endpoints {
+		if e.Enabled {
+			u := ""
+			if e.Health != nil {
+				u = e.Health.URL
+			}
+			t = append(t, target{e.ID, e.Name, "endpoint", u})
+		}
+	}
+	for _, g := range p.Groups {
+		u := ""
+		if g.Test != nil {
+			u = g.Test.URL
+		}
+		t = append(t, target{g.ID, g.Name, "group", u})
+	}
+	return t
+}
+
+// Run probes all targets on a ticker until ctx is cancelled.
+func (m *Monitor) Run(ctx context.Context) {
+	t := time.NewTicker(m.interval)
+	defer t.Stop()
+	m.tick(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			m.tick(ctx)
+		}
+	}
+}
+
+func (m *Monitor) tick(ctx context.Context) {
+	if m.demo {
+		m.demoTick(nowMS())
+		return
+	}
+	// Bound the tick so a wedged Clash API can't leave probe goroutines hanging
+	// forever (the shared HTTP client has no timeout because /traffic streams).
+	// Headroom = the proxy-side delay timeout plus the HTTP round trip.
+	tctx, cancel := context.WithTimeout(ctx, time.Duration(m.timeoutMS)*time.Millisecond+5*time.Second)
+	defer cancel()
+	tgs := m.targets()
+	now := nowMS()
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for _, tg := range tgs {
+		wg.Add(1)
+		go func(tg target) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			st, lat := m.probe(tctx, tg.id, tg.testURL)
+			m.record(tg.id, tg.name, tg.kind, st, lat, now)
+		}(tg)
+	}
+	wg.Wait()
+	m.sampleTraffic(tctx, now)
+}
+
+// sampleTraffic attributes Clash /connections bytes to endpoints/groups (a
+// connection's chain names include the outbound + group tags) and derives a
+// best-effort rate + accumulated total from sample-to-sample deltas.
+func (m *Monitor) sampleTraffic(ctx context.Context, now int64) {
+	if m.clash == nil {
+		return
+	}
+	conns, err := m.clash.Connections(ctx)
+	if err != nil {
+		return
+	}
+	agg := map[string][2]int64{} // id -> {up, down}
+	for _, c := range conns.Connections {
+		for _, tag := range c.Chains {
+			v := agg[tag]
+			agg[tag] = [2]int64{v[0] + c.Upload, v[1] + c.Download}
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, a := range agg {
+		s := m.stats[id]
+		if s == nil {
+			continue
+		}
+		if s.lastConnSample > 0 && now > s.lastConnSample {
+			dt := float64(now-s.lastConnSample) / 1000.0
+			if du := a[0] - s.activeUp; du > 0 {
+				s.rateUp = int64(float64(du) / dt)
+				s.totalUp += du
+			} else {
+				s.rateUp = 0
+			}
+			if dd := a[1] - s.activeDown; dd > 0 {
+				s.rateDown = int64(float64(dd) / dt)
+				s.totalDown += dd
+			} else {
+				s.rateDown = 0
+			}
+		}
+		s.activeUp, s.activeDown, s.lastConnSample = a[0], a[1], now
+	}
+}
+
+func hashStr(s string) int {
+	h := 0
+	for _, c := range s {
+		h = h*131 + int(c)
+	}
+	if h < 0 {
+		h = -h
+	}
+	return h
+}
+
+// demoTick fabricates believable per-tunnel health so the demo dashboard shows
+// ping/speed/traffic/uptime (and one endpoint "down" to show the failure cause).
+func (m *Monitor) demoTick(now int64) {
+	tgs := m.targets()
+	lastEp := -1
+	for i, tg := range tgs {
+		if tg.kind == "endpoint" {
+			lastEp = i
+		}
+	}
+	for i, tg := range tgs {
+		base := hashStr(tg.id)
+		state := Alive
+		lat := 25 + base%90 + int((now/1000)%15)
+		if i == lastEp && lastEp > 0 { // demonstrate the "down + cause" row
+			state, lat = Down, 0
+		}
+		m.record(tg.id, tg.name, tg.kind, state, lat, now)
+		m.mu.Lock()
+		if s := m.stats[tg.id]; s != nil {
+			if state == Alive {
+				s.rateDown = int64(400_000 + base%3_000_000)
+				s.rateUp = int64(80_000 + base%600_000)
+				secs := int64(m.interval / time.Second)
+				if secs < 1 {
+					secs = 1
+				}
+				s.totalDown += s.rateDown * secs
+				s.totalUp += s.rateUp * secs
+			} else {
+				s.rateDown, s.rateUp = 0, 0
+			}
+		}
+		m.mu.Unlock()
+	}
+}
+
+// ProbeOne probes a single target immediately and returns its view.
+func (m *Monitor) ProbeOne(ctx context.Context, id string) View {
+	var tgt target
+	for _, tg := range m.targets() {
+		if tg.id == id {
+			tgt = tg
+		}
+	}
+	tctx, cancel := context.WithTimeout(ctx, time.Duration(m.timeoutMS)*time.Millisecond+5*time.Second)
+	defer cancel()
+	st, lat := m.probe(tctx, id, tgt.testURL)
+	m.record(id, tgt.name, tgt.kind, st, lat, nowMS())
+	return m.viewWithCause(id)
+}
+
+// Snapshot returns the current view for every active target.
+func (m *Monitor) Snapshot() []View {
+	tgs := m.targets()
+	now := nowMS()
+	m.mu.Lock()
+	views := make([]View, 0, len(tgs))
+	for _, tg := range tgs {
+		v := toView(tg.id, m.stats[tg.id], now)
+		if v.Name == "" {
+			v.Name = tg.name
+		}
+		if v.Kind == "" {
+			v.Kind = tg.kind
+		}
+		views = append(views, v)
+	}
+	m.mu.Unlock()
+	// causeFor scans the whole engine log and is identical for every down target,
+	// so compute it once per snapshot rather than re-scanning per down endpoint.
+	var cause, fix string
+	var computed bool
+	for i := range views {
+		if views[i].State == "down" {
+			if !computed {
+				cause, fix = m.causeFor()
+				computed = true
+			}
+			views[i].Cause, views[i].CauseFix = cause, fix
+		}
+	}
+	return views
+}
+
+func (m *Monitor) viewWithCause(id string) View {
+	m.mu.Lock()
+	v := toView(id, m.stats[id], nowMS())
+	m.mu.Unlock()
+	if v.State == "down" {
+		v.Cause, v.CauseFix = m.causeFor()
+	}
+	return v
+}
+
+// causeFor scans recent engine log lines (newest first) for a known error and
+// returns its title + fix; falls back to a generic timeout explanation.
+func (m *Monitor) causeFor() (string, string) {
+	if m.logs != nil {
+		lines := m.logs.LogLines()
+		for i := len(lines) - 1; i >= 0; i-- {
+			if mm := kb.Match(lines[i]); len(mm) > 0 {
+				return mm[0].Title, mm[0].Fix
+			}
+		}
+	}
+	return "No response (timed out or blocked)",
+		"Run Diagnostics (ping/traceroute) to the server. If the path is filtered (DPI/TSPU), try a camouflaged transport (Reality/WS-CDN) or AmneziaWG."
+}
+
+func toView(id string, s *stat, now int64) View {
+	if s == nil {
+		return View{ID: id, State: string(Unknown), Handshake: "unknown"}
+	}
+	v := View{
+		ID: id, Name: s.name, Kind: s.kind, State: string(s.state),
+		LatencyMs: s.lastLatency, Probes: s.probes, Reconnects: s.reconnects,
+		RateUpBps: s.rateUp, RateDownBps: s.rateDown, BytesUp: s.totalUp, BytesDown: s.totalDown,
+	}
+	switch s.state {
+	case Alive:
+		v.Handshake = "ok"
+	case Down:
+		v.Handshake = "failed"
+	default:
+		v.Handshake = "unknown"
+	}
+	if def := s.ok + s.fail; def > 0 {
+		v.SuccessRate = s.ok * 100 / def
+	}
+	if s.ok > 0 {
+		v.AvgLatencyMs = int(s.sumLatency) / s.ok
+	}
+	if s.state == Alive {
+		v.UptimeS = (now - s.lastChange) / 1000
+	}
+	return v
+}

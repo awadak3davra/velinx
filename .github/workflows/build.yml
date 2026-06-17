@@ -1,0 +1,122 @@
+name: build
+
+# CI on every push/PR (test + cross-compile all router arches, artifacts downloadable),
+# and on a v* tag it additionally publishes a GitHub Release with the per-SoC tarballs.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Run the JS-based actions on the runner's bundled Node 24 (Node 20 is
+  # deprecated). The self-hosted runner ships node24; this opts in now.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  test:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+      - run: go vet ./...
+      - run: go test -race ./...   # race detector (host build, CGO default on)
+
+  build:
+    needs: test
+    runs-on: [self-hosted, Linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Router SoC families (Keenetic/Entware + OpenWrt/Asus-Merlin):
+          - { name: mipsle, goarch: mipsle, gomips: softfloat }  # MediaTek MT7621 etc. (most Keenetic)
+          - { name: mips,   goarch: mips,   gomips: softfloat }  # big-endian MIPS
+          - { name: arm,    goarch: arm,    goarm: '7' }         # ARMv7 (Cortex-A7/A9)
+          - { name: arm64,  goarch: arm64 }                      # ARMv8 (aarch64)
+          - { name: amd64,  goarch: amd64 }                      # x86-64 (VPS/testing)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.2.0-dev+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cross-compile + package ${{ matrix.name }}
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOARM: ${{ matrix.goarm }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          stage="wakeroute-${{ matrix.name }}-pkg"
+          mkdir -p "$stage"
+          go build -trimpath \
+            -ldflags "-s -w -X wakeroute/internal/version.Version=${VERSION}" \
+            -o "$stage/wakeroute-${{ matrix.name }}" ./cmd/wakeroute
+
+          # Entware /opt tarball: binary + install/uninstall + sysvinit S99 script
+          cp packaging/install.sh packaging/uninstall.sh packaging/S99wakeroute "$stage/"
+          chmod +x "$stage"/*.sh "$stage"/S99wakeroute "$stage/wakeroute-${{ matrix.name }}"
+          tar -C "$stage" -czf "wakeroute-${VERSION}-${{ matrix.name }}.tar.gz" .
+          sha256sum "wakeroute-${VERSION}-${{ matrix.name }}.tar.gz"
+
+          # OpenWrt native tarball: same binary + procd install/uninstall + procd init
+          owstage="wakeroute-${{ matrix.name }}-openwrt-pkg"
+          mkdir -p "$owstage"
+          cp "$stage/wakeroute-${{ matrix.name }}" "$owstage/wakeroute-${{ matrix.name }}"
+          cp packaging/openwrt/install.sh packaging/openwrt/uninstall.sh packaging/openwrt/wakeroute.init "$owstage/"
+          chmod +x "$owstage"/*.sh "$owstage"/wakeroute.init "$owstage/wakeroute-${{ matrix.name }}"
+          tar -C "$owstage" -czf "wakeroute-${VERSION}-${{ matrix.name }}-openwrt.tar.gz" .
+          sha256sum "wakeroute-${VERSION}-${{ matrix.name }}-openwrt.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wakeroute-${{ matrix.name }}
+          path: |
+            wakeroute-*-${{ matrix.name }}.tar.gz
+            wakeroute-*-${{ matrix.name }}-openwrt.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: write   # create the release + upload assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ( cd artifacts && sha256sum *.tar.gz > SHA256SUMS.txt )
+          gh release create "${GITHUB_REF_NAME}" artifacts/*.tar.gz artifacts/SHA256SUMS.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "WakeRoute ${GITHUB_REF_NAME}" \
+            --generate-notes
