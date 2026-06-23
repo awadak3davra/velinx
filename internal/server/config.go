@@ -3,7 +3,9 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 
 	"wakeroute/internal/config"
 )
@@ -40,6 +42,17 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Listen and Ports.UI both encode the panel's bind port; keep them from diverging so editing
+	// the UI port in Settings actually MOVES the bind (the documented escape from the lighttpd
+	// :8088 conflict) instead of silently no-opping. Ports.UI is authoritative for the port; Listen
+	// keeps its host/interface. Reject a malformed Listen here rather than letting ListenAndServe
+	// fail (log.Fatal) at the next restart.
+	host, _, splitErr := net.SplitHostPort(in.Listen)
+	if splitErr != nil {
+		writeErr(w, http.StatusBadRequest, `listen must be host:port (e.g. ":8088" or "192.168.1.1:8088")`)
+		return
+	}
+	in.Listen = net.JoinHostPort(host, strconv.Itoa(in.Ports.UI))
 
 	// Apply exported fields to the live config (the unexported file path on
 	// s.cfg is preserved), then persist — under the config lock so we don't race
@@ -58,6 +71,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Updater = in.Updater
 	s.cfg.FailSafe = in.FailSafe
 	s.cfg.Watchdog = in.Watchdog
+	s.cfg.AllowedHosts = in.AllowedHosts
 	err := s.cfg.Save()
 	s.cfgMu.Unlock()
 	if err != nil {

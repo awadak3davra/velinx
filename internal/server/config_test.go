@@ -37,6 +37,34 @@ func putConfig(t *testing.T, s *Server, body string) *httptest.ResponseRecorder 
 	return w
 }
 
+// TestHandlePutConfig_ListenFollowsUIPort: editing the UI port in Settings must move the actual
+// bind (Listen) — the documented escape from the lighttpd :8088 conflict — not silently no-op.
+// Listen's host/interface is preserved, and a malformed Listen is rejected at save, not at restart.
+func TestHandlePutConfig_ListenFollowsUIPort(t *testing.T) {
+	cfg, err := config.Load(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: cfg}
+
+	w := putConfig(t, s, `{"listen":":8088","ports":{"ui":8089,"clash":9090,"dns":5353,"mixed":7890}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if s.cfg.Listen != ":8089" {
+		t.Errorf("Listen must follow Ports.UI: got %q, want :8089", s.cfg.Listen)
+	}
+
+	w = putConfig(t, s, `{"listen":"192.168.1.1:8088","ports":{"ui":8090,"clash":9090,"dns":5353,"mixed":7890}}`)
+	if w.Code != http.StatusOK || s.cfg.Listen != "192.168.1.1:8090" {
+		t.Errorf("host preserved + port from UI: got %q (code %d), want 192.168.1.1:8090", s.cfg.Listen, w.Code)
+	}
+
+	if w := putConfig(t, s, `{"listen":"8088","ports":{"ui":8089,"clash":9090,"dns":5353,"mixed":7890}}`); w.Code != http.StatusBadRequest {
+		t.Errorf("malformed listen (no port) must be rejected at save: got %d, want 400", w.Code)
+	}
+}
+
 func TestHandlePutConfig(t *testing.T) {
 	cfg, err := config.Load(filepath.Join(t.TempDir(), "config.json"))
 	if err != nil {

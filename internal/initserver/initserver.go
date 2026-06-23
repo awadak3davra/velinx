@@ -159,6 +159,14 @@ echo "WR_CLIENT_CONFIG=vless://$UUID@$PUBLIC_IP:443?security=reality&sni=$SNI&fp
 
 // BuildScript assembles the installer for the chosen protocols. publicHost (the
 // server's reachable address) overrides the script's auto-detected public IP.
+//
+// SECURITY PRECONDITION: publicHost MUST already be validated to a bare host/IP
+// (callers use netdiag.ValidTarget, which rejects shell metacharacters, spaces, and a
+// leading '-'). The %q below is Go-quoting, NOT shell-quoting — inside the emitted
+// double-quoted `PUBLIC_IP="…"`, a `$(…)`/backtick in publicHost would still be expanded
+// by the remote shell. ValidTarget's charset (alnum . _ : - [ ]) contains no such
+// characters, so %q is safe here; do NOT call BuildScript with unvalidated input, or
+// shell-quote publicHost first.
 func BuildScript(protocols []string, publicHost string) string {
 	var b strings.Builder
 	b.WriteString(scriptHeader)

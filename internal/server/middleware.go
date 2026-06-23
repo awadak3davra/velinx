@@ -7,7 +7,9 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -36,7 +38,10 @@ func (s *Server) staticHandler() http.Handler {
 func (s *Server) uiETag() string {
 	s.etagOnce.Do(func() {
 		h := fnv.New64a()
-		for _, name := range []string{"index.html", "app.js", "styles.css"} {
+		// All bundled assets the browser caches — every file that can change the
+		// served UI must be hashed, else a revalidation returns 304 and the browser
+		// keeps a stale copy (this previously bit i18n.js: edits didn't bust cache).
+		for _, name := range []string{"index.html", "app.js", "styles.css", "i18n.js", "nav.js"} {
 			if b, err := fs.ReadFile(s.ui, name); err == nil {
 				_, _ = h.Write(b)
 			}
@@ -190,4 +195,167 @@ func gzipCompressible(ct string) bool {
 		strings.Contains(ct, "css") ||
 		strings.Contains(ct, "svg") ||
 		strings.Contains(ct, "xml")
+}
+
+// ---- same-origin (CSRF) guard ----
+
+// sameOriginGuard rejects state-changing requests (POST/PUT/PATCH/DELETE) that
+// arrive with a *cross-origin* Origin (or, as a fallback, Referer) header.
+//
+// The panel binds to :8088 on all interfaces, has no authentication, and decodes
+// JSON bodies without requiring a non-simple Content-Type — so without this guard
+// a malicious web page open in any LAN browser could silently POST to
+// http://<router>:8088/api/service/restart, /api/apply, /api/apply/rollback,
+// /api/updater/self/install, /api/server/provision, … (a cross-origin fetch in
+// no-cors mode, or a plain <form> auto-submit, is a CORS "simple request" that
+// sends with no preflight). That is classic CSRF against a router admin panel.
+//
+// A browser ALWAYS attaches an Origin to a cross-origin fetch/XHR and to form
+// POSTs, so checking it closes the browser-borne vector while leaving the
+// same-origin SPA untouched (its Origin equals our Host). Non-browser clients
+// (curl, scripts, the service's own calls) send no Origin/Referer and are allowed
+// — they are not the confused-deputy threat this defends against. Malformed or
+// mismatched values fail closed (403).
+//
+// Caveat: this compares the Origin host to the request Host as the server sees it.
+// If the panel is ever fronted by a reverse proxy that rewrites Host while the
+// browser keeps the public Origin, legitimate requests would be rejected; such a
+// deployment must forward the original Host (or terminate same-origin upstream).
+// It does NOT stop DNS-rebinding (Origin==Host post-rebind) — that needs Host
+// allow-listing, tracked separately so we don't risk locking out valid hostnames.
+func sameOriginGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r) // safe (non-mutating) methods need no guard
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if !originMatchesHost(origin, r.Host) {
+				http.Error(w, "cross-origin request blocked", http.StatusForbidden)
+				return
+			}
+		} else if ref := r.Header.Get("Referer"); ref != "" {
+			// Older browsers may omit Origin on form POSTs but still send Referer.
+			if !originMatchesHost(ref, r.Host) {
+				http.Error(w, "cross-origin request blocked", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// originMatchesHost reports whether the authority (host:port) of an Origin or
+// Referer URL equals the request's Host. Fails closed on anything unparseable.
+func originMatchesHost(originOrReferer, host string) bool {
+	u, err := url.Parse(originOrReferer)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Host == host
+}
+
+// ---- request body size cap ----
+
+// maxRequestBody bounds how much of any single request body the server will
+// buffer. The panel is LAN-reachable and unauthenticated, and every JSON handler
+// decodes r.Body without its own limit, so without this cap one oversized POST
+// from any LAN host (the same-origin guard still lets header-less curl/script
+// clients through) could buffer hundreds of MB and OOM the ~256 MB router — and
+// the kernel OOM-killer could take sing-box, i.e. the family's routing, down with
+// it. 16 MiB is far above any legitimate body (configs/IDs are KB; the largest is
+// a pasted subscription, and the fetched-subscription reader already caps content
+// at 8 MiB) while trivially defeating the exhaustion attack.
+const maxRequestBody = 16 << 20
+
+// limitBody wraps r.Body in a MaxBytesReader so a read past maxRequestBody fails
+// instead of growing unbounded. The JSON handlers already surface a body-read
+// error as a 400, so legitimate traffic is unaffected and the cap is invisible
+// until something abusive hits it. Applied to every method: GET/stream handlers
+// don't read their body (Go discards it), and the Clash-proxy bodies are tiny.
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ---- Host allow-list (DNS-rebinding guard) ----
+
+// hostAllowGuard, when allowed is non-empty, rejects (403) any request whose Host
+// (port stripped, lower-cased) is not in the list. This is the DNS-rebinding
+// defense the same-origin guard can't provide: after a rebind, Origin==Host both
+// equal the attacker's own hostname, so only pinning Host to known names helps.
+// It applies to ALL methods — a rebinding attack could GET secrets, not just POST.
+//
+// An EMPTY list (the default) disables the guard with zero wrapping/per-request
+// cost, so behaviour is unchanged until an operator opts in (config allowed_hosts)
+// by listing the names/IPs they reach the panel by. A misconfigured list locks out
+// the UI; it is recoverable by clearing allowed_hosts in config.json + restarting.
+func hostAllowGuard(allowed []string, next http.Handler) http.Handler {
+	if len(allowed) == 0 {
+		return next
+	}
+	set := make(map[string]struct{}, len(allowed))
+	for _, h := range allowed {
+		if n := normalizeHost(h); n != "" {
+			set[n] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := set[normalizeHost(r.Host)]; !ok {
+			http.Error(w, "host not allowed", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// normalizeHost reduces a Host/authority to a bare host for comparison: strips any
+// :port, IPv6 brackets, surrounding space, and lower-cases it.
+func normalizeHost(h string) string {
+	h = strings.TrimSpace(h)
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	return strings.ToLower(strings.Trim(h, "[]"))
+}
+
+// ---- security response headers ----
+
+// securityHeaders sets defensive headers on every reply. The panel is an
+// unauthenticated LAN admin UI with one-click state-changing controls (Apply /
+// Apply&Save in the header, Rollback / Restart elsewhere), so the chief residual
+// browser risk AFTER the same-origin/CSRF guard is clickjacking: a malicious page
+// can frame the panel and trick the user into clicking those controls — and since
+// such a click is genuinely same-origin, the CSRF guard does NOT stop it.
+// X-Frame-Options + CSP frame-ancestors make the browser refuse to render the
+// panel in any frame, closing that gap. nosniff blocks MIME-confusion, and
+// Referrer-Policy keeps panel URLs (incl. /api/sub/<token>) out of the Referer
+// header sent to external sites.
+//
+// The CSP also pins script-src to 'self' — the panel is unauthenticated, so an
+// injected/reflected script would be game-over; this neutralises that class even
+// if a sink exists. It works because the bundled UI loads only same-origin
+// scripts (i18n.js, nav.js, app.js) and has no inline <script> or on*= handlers
+// (the former nav-toggle handler moved to nav.js for exactly this). We do NOT set
+// style-src/img-src/connect-src/default-src: the UI uses inline style attributes
+// (a style-src would need 'unsafe-inline', and style injection can't execute JS),
+// so leaving them unset keeps styles/images/fetches unrestricted — meaning this
+// policy can only ever affect scripts, never silently break the rest of the UI.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "script-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'")
+		next.ServeHTTP(w, r)
+	})
 }

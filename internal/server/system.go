@@ -23,6 +23,8 @@ type systemInfo struct {
 	UptimeS    int64   `json:"uptime_s"`
 	Version    string  `json:"version,omitempty"`
 	Arch       string  `json:"arch,omitempty"`
+	TempC      float64 `json:"temp_c,omitempty"`     // CPU temperature, °C (0 = unavailable)
+	Interfaces []Iface `json:"interfaces,omitempty"` // real per-iface byte counters (rates computed UI-side)
 }
 
 // handleSystem reports host CPU-load / RAM / uptime for the Dashboard. RAM is the #1
@@ -41,7 +43,10 @@ func readSystemInfo() systemInfo {
 	}
 	load, _ := os.ReadFile("/proc/loadavg")
 	up, _ := os.ReadFile("/proc/uptime")
-	return parseSystem(string(mem), string(load), string(up))
+	si := parseSystem(string(mem), string(load), string(up))
+	si.Interfaces = readInterfaces() // real per-iface throughput (incl. the kernel fast-path)
+	si.TempC = readTempC()
+	return si
 }
 
 // parseSystem is the pure (file-I/O-free) parser, so it is unit-testable with samples.

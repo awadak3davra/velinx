@@ -76,6 +76,16 @@ func (p *Profile) Validate() error {
 	// non-existent outbound tag and sing-box would reject the config.
 	for _, g := range p.Groups {
 		for _, m := range g.Members {
+			// `direct` (WAN) is a valid, always-reachable sing-box outbound, so it may be a
+			// failover/WAN-fallback member (e.g. an ordered urltest [vpn…, direct] that only
+			// reaches WAN when every VPN tier is dead). `block` is a route ACTION (reject) in
+			// sing-box ≥1.12, NOT an outbound — it cannot be a urltest/selector member.
+			if m == OutboundDirect {
+				continue
+			}
+			if m == OutboundBlock {
+				return fmt.Errorf("group %q: member %q is a route action (reject), not an outbound", g.ID, m)
+			}
 			if _, ok := ids[m]; !ok {
 				return fmt.Errorf("group %q: member %q does not resolve", g.ID, m)
 			}
@@ -138,8 +148,11 @@ func (p *Profile) Validate() error {
 			return fmt.Errorf("duplicate id %q (already used by %s)", rl.ID, prev)
 		}
 		ids[rl.ID] = "routing list"
-		if rl.Source == "" && len(rl.Manual) == 0 {
-			return fmt.Errorf("routing list %q: needs a source URL or manual entries", rl.ID)
+		if rl.Source == "" && len(rl.Manual) == 0 && rl.CIDRSource == "" && len(rl.CIDRCache) == 0 {
+			return fmt.Errorf("routing list %q: needs a source URL, a CIDR source, or manual entries", rl.ID)
+		}
+		if rl.CIDRSource != "" && !validCIDRSource(rl.CIDRSource) {
+			return fmt.Errorf("routing list %q: cidr_source %q must be https://… , http://… , or asn:N,N", rl.ID, rl.CIDRSource)
 		}
 		if !isResolvable(rl.Outbound, ids) {
 			return fmt.Errorf("routing list %q: outbound %q does not resolve", rl.ID, rl.Outbound)
@@ -160,6 +173,34 @@ func (p *Profile) Validate() error {
 		}
 	}
 	return nil
+}
+
+// validCIDRSource reports whether a RoutingList.CIDRSource has a supported scheme: an
+// http(s) feed URL, or "asn:N[,N…]" (digit ASNs, optional AS prefix). It does NOT fetch —
+// just a shape check so the API/UI rejects typos early (cidrfeed.Fetch is the real parser).
+func validCIDRSource(s string) bool {
+	if strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://") {
+		return true
+	}
+	if !strings.HasPrefix(s, "asn:") {
+		return false
+	}
+	list := strings.TrimPrefix(s, "asn:")
+	if strings.TrimSpace(list) == "" {
+		return false
+	}
+	for _, a := range strings.Split(list, ",") {
+		a = strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(a)), "AS")
+		if a == "" {
+			return false
+		}
+		for _, r := range a {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // missingProtoParam returns the name of the first mandatory identity param the

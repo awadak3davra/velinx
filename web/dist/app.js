@@ -18,6 +18,26 @@ function el(tag, props, ...kids) {
   return n;
 }
 
+/* ---------- a11y ---------- */
+// associateLabels wires each .field's sibling <label> to its single control via
+// for/id so screen readers announce form fields by name. The UI renders labels as
+// visual siblings (not wrapping, not for-linked); this is additive (for/id only —
+// no visual change) and idempotent. Call after each page/modal render.
+let _wfLabelId = 0;
+function associateLabels(root) {
+  if (!root) return;
+  root.querySelectorAll(".field").forEach(f => {
+    const label = f.querySelector(":scope > label");
+    if (!label || label.htmlFor) return;
+    const ctrls = f.querySelectorAll("input, select, textarea");
+    if (ctrls.length !== 1) return;     // skip empty / ambiguous fields
+    const c = ctrls[0];
+    if (label.contains(c)) return;      // a wrapping label already associates
+    if (!c.id) c.id = "wf" + (++_wfLabelId);
+    label.htmlFor = c.id;
+  });
+}
+
 /* ---------- API ---------- */
 async function apiErr(r) {
   try { const j = await r.json(); return new Error(j.error || r.statusText); }
@@ -165,7 +185,19 @@ function i18nObserve() {
 }
 // Static chrome (nav labels + topbar) lives in index.html, outside any render();
 // translate it directly. data-page -> English label.
-const NAV_LABELS = { dashboard: "Dashboard", server: "Init Server", connections: "Connections", failover: "Failover", routing: "Routing", updater: "Updater", diagnostics: "Diagnostics", settings: "Settings" };
+const NAV_LABELS = { dashboard: "Dashboard", server: "Set up Server", connections: "Connections", failover: "Failover", routing: "Routing", updater: "Updater", diagnostics: "Diagnostics", settings: "Settings" };
+// Short hover explanations for each nav item (data-page -> English tooltip). Applied as the
+// element's title in translateChrome so they localize alongside the labels.
+const NAV_TOOLTIPS = {
+  dashboard: "Overview — status, live connections, traffic, and routing-list health",
+  server: "Provision a fresh server into a proxy over SSH, and manage existing ones",
+  connections: "Your proxy/VPN connections — add, import, edit and test them",
+  failover: "Group connections so traffic auto-switches to a healthy one",
+  routing: "Send chosen domain/IP lists through a tunnel; everything else stays direct",
+  updater: "Update the proxy cores and the panel itself",
+  diagnostics: "Health checks — connectivity, DNS, IPv6, exit IP, ping/traceroute",
+  settings: "Ports, routing mode, web panel, fail-safe and other options",
+};
 function translateChrome() {
   document.documentElement.setAttribute("lang", lang());
   document.documentElement.setAttribute("dir", RTL_LANGS.has(lang()) ? "rtl" : "ltr");
@@ -176,6 +208,8 @@ function translateChrome() {
     it.textContent = "";
     if (ico) it.appendChild(ico);
     it.appendChild(document.createTextNode(" " + t(en)));
+    const tip = NAV_TOOLTIPS[it.dataset.page];
+    if (tip) it.title = t(tip); // hover explanation, localized
   });
   const ab = document.getElementById("applybtn"), asb = document.getElementById("applysavebtn");
   // Static chrome that is NOT rebuilt per render must be re-rendered from its English
@@ -289,7 +323,7 @@ function updateStatusPill() {
 /* ---------- routing ---------- */
 const PAGES = {
   dashboard: { title: "Dashboard", render: renderDashboard },
-  server: { title: "Init Server", render: renderServer },
+  server: { title: "Set up Server", render: renderServer },
   connections: { title: "Connections", render: renderConnections },
   failover: { title: "Failover", render: renderFailover },
   routing: { title: "Routing", render: renderRouting },
@@ -297,6 +331,45 @@ const PAGES = {
   diagnostics: { title: "Diagnostics", render: renderDiagnostics },
   settings: { title: "Settings", render: renderSettings },
 };
+// isNetworkError distinguishes a daemon-UNREACHABLE failure (fetch rejected — the
+// panel can't reach the daemon, e.g. mid-restart/deploy/crash) from an application
+// error (a 4xx/5xx that came back WITH a message). The former should auto-recover,
+// not show a dead error page.
+function isNetworkError(e) {
+  return e instanceof TypeError || /failed to fetch|networkerror|load failed|connection refused|fetch/i.test(String(e && e.message));
+}
+
+// showReconnect puts up a non-blocking banner and polls /api/health until the daemon
+// answers again, then reloads onto the fresh instance. Idempotent (one banner). This
+// generalises the Settings restart-flow poll to ANY daemon-down moment — so the family
+// no longer just sees a broken "Error:" page on every restart/deploy.
+let wrReconnecting = false;
+function showReconnect() {
+  if (wrReconnecting) return;
+  wrReconnecting = true;
+  const sub = el("div", { class: "hint", style: "margin-top:4px" }, t("The panel will return as soon as the service is back."));
+  const ov = el("div", { class: "wr-reconnect" }, el("div", { class: "wr-reconnect-box" },
+    el("span", { class: "spin" }),
+    el("div", {}, el("div", { style: "font-weight:600" }, t("Reconnecting to WakeRoute…")), sub)));
+  document.body.appendChild(ov);
+  let tries = 0;
+  const iv = setInterval(async () => {
+    tries++;
+    try {
+      const r = await fetch("/api/health", { cache: "no-store" });
+      if (r.ok) { clearInterval(iv); setTimeout(() => location.reload(), 400); return; }
+    } catch (_) { /* still down */ }
+    if (tries > 60) { clearInterval(iv); wrReconnecting = false; sub.textContent = t("Still unreachable — reload the page when the router is back."); }
+  }, 1500);
+}
+
+// renderError shows a page-render failure: a daemon-down error becomes the
+// auto-recovering reconnect banner; any other (application) error stays an inline note.
+function renderError(view, e) {
+  if (isNetworkError(e)) { showReconnect(); return; }
+  view.appendChild(el("div", { class: "empty" }, "Error: " + e.message));
+}
+
 async function route() {
   // Close any open modal when navigating: modals are appended to <body>, so
   // clearing #view alone would leave the dialog floating over the new page.
@@ -308,7 +381,7 @@ async function route() {
   graphCanvas = null;
   const view = $("#view");
   view.innerHTML = "";
-  try { await page.render(view); } catch (e) { view.appendChild(el("div", { class: "empty" }, "Error: " + e.message)); }
+  try { await page.render(view); associateLabels(view); } catch (e) { renderError(view, e); }
   i18nApply(view); // localize the freshly-rendered (English) page in place
 }
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -330,6 +403,12 @@ async function renderDashboard(view) {
 
   // System-health strip (RAM gauge / CPU / uptime) — removes itself when procfs is absent.
   view.appendChild(systemStrip());
+
+  // Per-interface throughput: each tunnel + the WAN with its live ↓download/↑upload
+  // rate (painted by paintThroughput from the same /api/system byte counters).
+  view.appendChild(el("div", { class: "card", id: "if-card", style: "display:none" },
+    el("div", { class: "card-title", style: "margin-bottom:6px" }, "Interfaces"),
+    el("div", { id: "if-list" })));
 
   // Graceful degradation: when the proxy core isn't running (and we're not in demo),
   // say so plainly at the top instead of leaving the dashboard silently empty — the
@@ -381,7 +460,7 @@ async function renderDashboard(view) {
     if (members.length) subStacks.push({ label: g.name + " · " + g.type, rows: members, spark: true });
   });
   const ungrouped = eps.filter(e => !inGroup.has(e.id));
-  if (ungrouped.length) subStacks.push({ label: groups.length ? "Other connections" : "All connections", rows: ungrouped, spark: false });
+  if (ungrouped.length) subStacks.push({ label: groups.length ? t("Other connections") : t("All connections"), rows: ungrouped, spark: false });
 
   if (!subStacks.length) {
     card.appendChild(el("div", { class: "card-title", style: "margin:18px 0 4px" }, "Connections"));
@@ -503,9 +582,12 @@ function systemStrip() {
       el("div", { class: "sys-v" }, "…"),
       el("div", { class: "sys-bar" }, el("span", { class: "sys-bar-fill" }))),
     sysTile("CPU load", "load"),
-    sysTile("Uptime", "uptime"));
+    sysTile("Uptime", "uptime"),
+    sysTile("CPU temp", "temp"),
+    sysTile("WAN now", "thru"));
   return strip; // painted by paintSystem() after it's in the DOM (see renderDashboard)
 }
+let prevIfaces = null; // {name:{rx,tx,t}} — previous /api/system iface counters, for rate calc
 function paintSystem() {
   const strip = document.getElementById("sys-strip");
   if (!strip) return;
@@ -521,7 +603,68 @@ function paintSystem() {
     const lv = strip.querySelector('[data-sys="load"] .sys-v');
     lv.innerHTML = ""; lv.append((si.load1 || 0).toFixed(2), el("small", {}, "  " + t("1-min")));
     strip.querySelector('[data-sys="uptime"] .sys-v').textContent = fmtUptime(si.uptime_s);
+    const tt = strip.querySelector('[data-sys="temp"]'), tv = tt && tt.querySelector(".sys-v");
+    if (tv) {
+      tv.textContent = si.temp_c ? Math.round(si.temp_c) + "°C" : "—";
+      if (si.temp_c) tt.title = si.temp_c.toFixed(1) + " °C (CPU)";
+    }
+    const thru = strip.querySelector('[data-sys="thru"] .sys-v');
+    if (thru) paintThroughput(thru, si.interfaces || []);
   }).catch(() => strip.remove());
+}
+// paintThroughput shows REAL WAN throughput (rate = Δbytes/Δt across successive /api/system
+// polls) and, on the tile's hover title, the per-interface breakdown (WAN + each tunnel +
+// LAN). Captures all traffic incl. the kernel fast-path — unlike the proxy-only graph.
+function paintThroughput(node, ifaces) {
+  const now = Date.now() / 1000;
+  const cur = {};
+  ifaces.forEach(f => { cur[f.name] = { rx: f.rx_bytes, tx: f.tx_bytes, t: now }; });
+  const rate = (name) => {
+    const p = prevIfaces && prevIfaces[name], c = cur[name];
+    if (!p || !c) return null;
+    const dt = c.t - p.t; if (dt <= 0) return null;
+    return { down: Math.max(0, (c.rx - p.rx) / dt), up: Math.max(0, (c.tx - p.tx) / dt) };
+  };
+  // WAN iface: prefer one literally named "wan", else the busiest non-bridge/non-tunnel.
+  const wan = ifaces.find(f => f.name === "wan") ||
+    ifaces.filter(f => !/^(br-|lo$|awg|wg|tun)/.test(f.name)).sort((a, b) => (b.rx_bytes + b.tx_bytes) - (a.rx_bytes + a.tx_bytes))[0];
+  const w = wan && rate(wan.name);
+  if (!w) { node.textContent = "…"; prevIfaces = cur; return; }
+  node.innerHTML = ""; node.append("↓" + fmtBytes(w.down) + "/s ", el("small", {}, "↑" + fmtBytes(w.up) + "/s"));
+  const tile = node.closest(".sys-tile");
+  if (tile) {
+    const lines = ifaces.map(f => { const r = rate(f.name); return r ? f.name + ": ↓" + fmtBytes(r.down) + "/s ↑" + fmtBytes(r.up) + "/s" : null; }).filter(Boolean);
+    tile.title = lines.join("\n");
+  }
+  paintIfaceList(ifaces, rate, wan && wan.name); // visible per-interface DL/UL
+  prevIfaces = cur;
+}
+
+// paintIfaceList fills the dashboard Interfaces card with each tunnel's + the WAN's
+// live ↓download / ↑upload rate (same /api/system byte counters as the throughput
+// tile). Hidden until there's data — the off-Linux dev box reports no interfaces.
+function paintIfaceList(ifaces, rate, wanName) {
+  const card = document.getElementById("if-card"), box = document.getElementById("if-list");
+  if (!card || !box) return;
+  const rows = ifaces
+    .filter(f => f.name === wanName || /^(nwg|awg|wg|tun)/.test(f.name))
+    .map(f => ({ f, r: rate(f.name) })).filter(x => x.r);
+  if (!rows.length) { card.style.display = "none"; return; }
+  box.innerHTML = "";
+  rows.forEach(({ f, r }, i) => {
+    box.appendChild(el("div", { style: "display:flex;justify-content:space-between;align-items:center;padding:8px 0" + (i ? ";border-top:1px solid var(--divider)" : "") },
+      el("span", { style: "font-weight:500" }, f.name === wanName ? "WAN (direct)" : ifaceFriendly(f.name)),
+      el("span", { style: "font-variant-numeric:tabular-nums;font-size:12.5px" },
+        el("span", { style: "color:var(--rx)" }, "↓ " + fmtBytes(r.down) + "/s"),
+        el("span", { class: "hint", style: "margin:0 8px" }, "·"),
+        el("span", { style: "color:var(--tx)" }, "↑ " + fmtBytes(r.up) + "/s"))));
+  });
+  card.style.display = "";
+}
+// ifaceFriendly maps a kernel iface (nwg1) to the name of the endpoint bound to it.
+function ifaceFriendly(name) {
+  const ep = ((state.profile && state.profile.endpoints) || []).find(e => e.params && e.params.interface === name);
+  return ep ? (ep.name || ep.id) : name;
 }
 
 // Live connections (the #1 Clash-dashboard feature): make routing observable — see
@@ -536,7 +679,28 @@ function fmtAge(startISO) {
   if (s < 3600) return Math.floor(s / 60) + "m";
   return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
 }
+// exitLabel maps a conntrack connection's resolved egress tag to a friendly name: "direct"
+// (general WAN) stays as-is; an endpoint id resolves to that connection's name.
+function exitLabel(tag) {
+  if (!tag || tag === "direct") return "direct";
+  const e = findEndpoint(tag);
+  return (e && e.name) ? e.name : tag;
+}
+// connItem renders one REAL kernel connection (from /api/conntrack) — remote dst:port, the
+// L4 proto, which exit it took, and per-direction bytes. The right-hand slot shows the TCP
+// state. Sees the kernel fast-path that the Clash view cannot.
 function connItem(c) {
+  const dst = (c.dst || "—") + (c.dport ? ":" + c.dport : "");
+  return el("div", { class: "conn-item" },
+    el("div", { class: "conn-main" },
+      el("div", { class: "conn-host", title: (c.src || "") + " → " + dst }, dst),
+      el("div", { class: "conn-sub" }, (c.proto || "") + " · via " + exitLabel(c.exit) +
+        "  ·  ↓" + fmtBytes(c.down_bytes || 0) + " ↑" + fmtBytes(c.up_bytes || 0))),
+    el("div", { class: "conn-age" }, c.state || ""));
+}
+// connItemClash renders a sing-box (Clash) connection — used only as the demo / off-router
+// fallback when /api/conntrack is unavailable (it shows the proxy chain + matched rule).
+function connItemClash(c) {
   const m = c.metadata || {};
   const host = (m.host || m.destinationIP || "—") + (m.destinationPort ? ":" + m.destinationPort : "");
   const chain = (c.chains && c.chains.length) ? c.chains.join(" → ") : "direct";
@@ -547,6 +711,48 @@ function connItem(c) {
       el("div", { class: "conn-sub" }, "⇢ " + chain + (rule ? "  ·  " + rule : "") +
         "  ·  ↓" + fmtBytes(c.download || 0) + " ↑" + fmtBytes(c.upload || 0))),
     el("div", { class: "conn-age" }, fmtAge(c.start)));
+}
+// groupConnsByIP aggregates a normalized connection list ({ip,port,proto,up,down,exit})
+// into per-destination-IP groups — each carrying its used ports (with per-port conn
+// count + bytes), total bytes, exits and connection count. Backs the "summarize live
+// connections by IP" view: one row per remote IP, the ports it used listed beneath.
+function groupConnsByIP(rows) {
+  const byIP = new Map();
+  rows.forEach(r => {
+    const ip = r.ip || "—";
+    let g = byIP.get(ip);
+    if (!g) { g = { ip, up: 0, down: 0, conns: 0, exits: new Set(), ports: new Map() }; byIP.set(ip, g); }
+    g.up += r.up || 0; g.down += r.down || 0; g.conns++;
+    if (r.exit) g.exits.add(r.exit);
+    if (r.port) {
+      const key = r.port + (r.proto ? "/" + r.proto : "");
+      const p = g.ports.get(key) || { n: 0, up: 0, down: 0 };
+      p.n++; p.up += r.up || 0; p.down += r.down || 0;
+      g.ports.set(key, p);
+    }
+  });
+  return [...byIP.values()].sort((a, b) => (b.up + b.down) - (a.up + a.down));
+}
+// connGroupItem renders one destination-IP group: the IP + aggregate (exits, bytes,
+// conn count) on top, and the set of used ports beneath (proto-tagged, ×N when reused;
+// per-port conns + bytes on hover) — the by-IP summary form of connItem.
+function connGroupItem(g) {
+  const exits = [...g.exits].map(exitLabel).join(", ");
+  const sub = (exits ? "via " + exits + "  ·  " : "") +
+    "↓" + fmtBytes(g.down) + " ↑" + fmtBytes(g.up) + "  ·  " + g.conns + (g.conns > 1 ? " conns" : " conn");
+  const chips = [...g.ports.entries()]
+    .sort((a, b) => (parseInt(a[0]) || 0) - (parseInt(b[0]) || 0))
+    .map(([key, p]) => el("span", {
+      class: "conn-port",
+      title: key + "  ·  " + p.n + (p.n > 1 ? " conns" : " conn") + "  ·  ↓" + fmtBytes(p.down) + " ↑" + fmtBytes(p.up),
+    }, p.n > 1 ? key + " ×" + p.n : key));
+  return el("div", { class: "conn-group" },
+    el("div", { class: "conn-item" },
+      el("div", { class: "conn-main" },
+        el("div", { class: "conn-host", title: g.ip }, g.ip),
+        el("div", { class: "conn-sub" }, sub)),
+      el("div", { class: "conn-age" }, g.ports.size + (g.ports.size === 1 ? " port" : " ports"))),
+    g.ports.size ? el("div", { class: "conn-ports" }, chips) : null);
 }
 function connectionsCard() {
   const card = el("div", { class: "card" });
@@ -562,17 +768,61 @@ function talkersCard() {
   card.appendChild(el("div", { class: "talkers-list", id: "talkers-list" }));
   return card;
 }
-function renderConnList(list, conns) {
+// exitsSummary turns the per-exit byte totals into a short "direct 1.2G · NL 300M" line.
+function exitsSummary(exits) {
+  if (!exits) return "";
+  return Object.entries(exits).sort((a, b) => b[1] - a[1]).slice(0, 3)
+    .map(([tag, bytes]) => exitLabel(tag) + " " + fmtBytes(bytes)).join("  ·  ");
+}
+// renderConnList paints the REAL connection table from the /api/conntrack payload, with the
+// live count vs the conntrack limit and a per-exit traffic split in the header.
+function renderConnList(list, data) {
+  const sum = document.getElementById("conns-sum");
+  const conns = (data && data.conns) || [];
+  list.innerHTML = "";
+  if (!conns.length) { list.appendChild(el("div", { class: "empty" }, t("No active connections"))); if (sum) sum.textContent = ""; return; }
+  if (sum) {
+    let s = (data.total || conns.length) + " " + t("active");
+    if (data.max) s += "  ·  " + Math.round((data.total / data.max) * 100) + "% of " + data.max;
+    const ex = exitsSummary(data.exits);
+    if (ex) s += "  ·  " + ex;
+    sum.textContent = s;
+  }
+  const groups = groupConnsByIP(conns.map(c => ({ ip: c.dst, port: c.dport, proto: c.proto, up: c.up_bytes, down: c.down_bytes, exit: c.exit })));
+  groups.slice(0, 40).forEach(g => list.appendChild(connGroupItem(g)));
+}
+// renderConnListClash — demo / off-router fallback (sing-box connections array).
+function renderConnListClash(list, conns) {
   const sum = document.getElementById("conns-sum");
   list.innerHTML = "";
   if (!conns.length) { list.appendChild(el("div", { class: "empty" }, t("No active connections"))); if (sum) sum.textContent = ""; return; }
   if (sum) sum.textContent = conns.length + " " + t("active");
-  conns.slice(0, 40).forEach(c => list.appendChild(connItem(c)));
+  const groups = groupConnsByIP(conns.map(c => {
+    const m = c.metadata || {};
+    return { ip: m.destinationIP || m.host, port: m.destinationPort, proto: "", up: c.upload, down: c.download, exit: (c.chains && c.chains.length) ? c.chains[c.chains.length - 1] : "" };
+  }));
+  groups.slice(0, 40).forEach(g => list.appendChild(connGroupItem(g)));
 }
-// Top talkers ("what's using my bandwidth"): aggregate the live connections by host
-// (sum up+down), ranked with a proportional bar. Derived for free from the same
-// /api/connections payload — no extra backend.
-function paintTopTalkers(list, conns) {
+// Top talkers ("which device is using my bandwidth"): the /api/conntrack payload already
+// aggregates per LAN client (name from DHCP leases + total up/down + conn count). Ranked
+// with a proportional bar. Real — includes the kernel fast-path, unlike the Clash view.
+function paintTopTalkers(list, data) {
+  const clients = (data && data.clients) || [];
+  list.innerHTML = "";
+  if (!clients.length) { list.appendChild(el("div", { class: "empty" }, t("No traffic"))); return; }
+  const top = clients.slice(0, 8);
+  const max = ((top[0].up_bytes || 0) + (top[0].down_bytes || 0)) || 1;
+  top.forEach(c => {
+    const total = (c.up_bytes || 0) + (c.down_bytes || 0);
+    list.appendChild(el("div", { class: "talker" },
+      el("div", { class: "talker-row" },
+        el("span", { class: "talker-host", title: c.ip + "  ·  " + (c.conns || 0) + " conns" }, c.name || c.ip),
+        el("span", { class: "talker-bytes" }, fmtBytes(total))),
+      el("div", { class: "talker-bar" }, el("span", { class: "talker-bar-fill", style: "width:" + Math.max(2, Math.round(total / max * 100)) + "%" }))));
+  });
+}
+// paintTopTalkersClash — demo / off-router fallback (aggregate sing-box conns by host).
+function paintTopTalkersClash(list, conns) {
   list.innerHTML = "";
   if (!conns.length) { list.appendChild(el("div", { class: "empty" }, t("No traffic"))); return; }
   const byHost = {};
@@ -593,10 +843,18 @@ function paintTopTalkers(list, conns) {
 function paintConnections() {
   const list = document.getElementById("conns-list"), tlist = document.getElementById("talkers-list");
   if (!list && !tlist) return;
-  api.get("/api/connections").then(data => {
-    const conns = (data && data.connections) || [];
-    if (list) renderConnList(list, conns);
-    if (tlist) paintTopTalkers(tlist, conns);
+  // Prefer the REAL kernel connection table (/api/conntrack) — it sees every flow incl. the
+  // fast-path. Off-router / demo (available:false) falls back to the sing-box Clash view.
+  api.get("/api/conntrack").then(data => {
+    if (!data || !data.available) {
+      return api.get("/api/connections").then(cd => {
+        const conns = (cd && cd.connections) || [];
+        if (list) renderConnListClash(list, conns);
+        if (tlist) paintTopTalkersClash(tlist, conns);
+      });
+    }
+    if (list) renderConnList(list, data);
+    if (tlist) paintTopTalkers(tlist, data);
   }).catch(() => {
     if (list) { list.innerHTML = ""; list.appendChild(el("div", { class: "empty" }, "—")); }
     if (tlist) { tlist.innerHTML = ""; tlist.appendChild(el("div", { class: "empty" }, "—")); }
@@ -700,8 +958,8 @@ async function renderConnections(view) {
       el("div", { class: "ttl" }, "Connections"),
       el("div", { class: "desc" }, "VPN and proxy tunnels. Paste a vless:// / hysteria2:// link or import a WireGuard config to add one.")),
     el("div", { class: "side" },
-      el("button", { class: "btn", onclick: openSubscription }, "⛓ Subscription"),
-      el("button", { class: "btn btn-primary", onclick: openAddConnection }, "+ Add connection")));
+      el("button", { class: "btn", title: "Import many connections at once from a subscription URL or pasted list", onclick: openSubscription }, "⛓ Subscription"),
+      el("button", { class: "btn btn-primary", title: "Add one connection — paste a vless://, hysteria2://… link, fill a form, or import a config", onclick: openAddConnection }, "+ Add connection")));
   view.appendChild(head);
 
   const card = el("div", { class: "card" });
@@ -736,7 +994,7 @@ async function renderFailover(view) {
   await loadProfile();
   const head = el("div", { class: "row-between", style: "margin-bottom:16px" },
     el("div", { class: "card-title" }, "Failover groups"),
-    el("button", { class: "btn btn-primary", onclick: openNewGroup }, "+ New group"));
+    el("button", { class: "btn btn-primary", title: "Create a failover group — pick members and traffic auto-switches to a healthy one", onclick: openNewGroup }, "+ New group"));
   view.appendChild(head);
 
   if (!state.profile.groups.length) {
@@ -794,9 +1052,9 @@ function rlFirstTunnel() {
 function rlOutboundFor(suggest) { return suggest === "block" ? "block" : suggest === "direct" ? "direct" : rlFirstTunnel(); }
 function rlShortURL(u) { return u.replace(/^https?:\/\//, "").replace(/\/releases\/latest\/download\//, "/…/").slice(0, 50); }
 function rlSlug(s) {
-  // A Cyrillic-only name (the target audience names lists in Russian) strips to an
-  // empty body — fall back to "list" so it isn't just "rl-". Uniqueness is then
-  // enforced by rlUniqueId so two such lists don't collide to one id.
+  // A name in a non-Latin script (Cyrillic, CJK, etc.) strips to an empty body —
+  // fall back to "list" so it isn't just "rl-". Uniqueness is then enforced by
+  // rlUniqueId so two such lists don't collide to one id.
   const body = (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   return "rl-" + (body || "list");
 }
@@ -822,10 +1080,11 @@ async function renderRouting(view) {
   view.appendChild(el("div", { class: "block-head" },
     el("div", {},
       el("div", { class: "ttl" }, "Routing"),
-      el("div", { class: "desc" }, "Route domain/IP lists through any tunnel. Add a ready preset (unblock Russia) or your own list; choose which connection each list uses — and which connection downloads it.")),
+      el("div", { class: "desc" }, "Route domain/IP lists through any tunnel. Add a ready-made preset or your own list; choose which connection each list uses — and which connection downloads it.")),
     el("div", { class: "side" },
-      el("button", { class: "btn", onclick: openRoutingCatalog }, "Preset lists"),
-      el("button", { class: "btn btn-primary", onclick: () => openRoutingList(null) }, "+ Custom list"))));
+      el("button", { class: "btn", title: "Re-fetch CIDRs for any list with an auto-refresh source, then Apply to activate", onclick: refreshCidrSources }, "↻ Refresh sources"),
+      el("button", { class: "btn", title: "Add a ready-made routing list from the catalog", onclick: openRoutingCatalog }, "Preset lists"),
+      el("button", { class: "btn btn-primary", title: "Create your own routing list (domains/IPs or a feed)", onclick: () => openRoutingList(null) }, "+ Custom list"))));
 
   if (!state.profile.endpoints.filter(e => e.enabled).length) {
     view.appendChild(el("div", { class: "card" }, el("div", { class: "hint" },
@@ -834,7 +1093,7 @@ async function renderRouting(view) {
   const lists = state.profile.routing_lists || [];
   const card = el("div", { class: "card" });
   if (!lists.length) {
-    card.appendChild(el("div", { class: "empty" }, "No routing lists. Add a preset like “RU bundle” and point it at your tunnel — blocked sites then go through the VPN, everything else stays direct."));
+    card.appendChild(el("div", { class: "empty" }, "No routing lists yet. Add a ready-made preset (or your own list) and point it at a tunnel — matching sites then go through the VPN, everything else stays direct."));
   } else {
     // Fixed-column grid so the per-row "Route via" / "Download via" dropdowns line up
     // in their own columns instead of flowing inline after variable-width source text
@@ -929,6 +1188,14 @@ function openRoutingList(rl) {
   const dlSel = routingOutboundSelect(rl.download_via || "direct", false);
   const srcField = el("div", { class: "field" }, el("label", {}, "Rule-set URL"), source);
   const manField = el("div", { class: "field" }, el("label", {}, "Domains / IP-CIDRs (one per line)"), manual);
+  // Optional auto-refresh CIDR feed (kernel modes hybrid/fast) — independent of the
+  // url/manual mode above; its result is cached and unioned with any Manual entries.
+  const cidrSrc = el("input", { type: "text", value: rl.cidr_source || "", placeholder: "asn:64512,64513  or  https://…/cidrs.txt" });
+  const cachedNote = (rl.cidr_cache && rl.cidr_cache.length) ? "  Cached: " + rl.cidr_cache.length + " CIDRs." : "";
+  const cidrField = el("div", { class: "field" },
+    el("label", {}, "Auto-refresh CIDR source (optional, kernel modes)"),
+    cidrSrc,
+    el("div", { class: "hint" }, "Keep this list's IP-CIDRs current from a feed: asn:N,N (RIPEstat announced prefixes) or an https text list. Cached + unioned with Manual entries; active in hybrid/fast. After saving, use «↻ Refresh sources», then Apply." + cachedNote));
   function applyMode() {
     srcField.style.display = mode.value === "url" ? "" : "none";
     manField.style.display = mode.value === "manual" ? "" : "none";
@@ -942,6 +1209,9 @@ function openRoutingList(rl) {
       download_via: dlSel.value === "direct" ? "" : dlSel.value, enabled: rl.enabled };
     if (mode.value === "url") { body.source = source.value.trim(); body.manual = []; }
     else { body.manual = manual.value.split("\n").map(s => s.trim()).filter(Boolean); body.source = ""; }
+    // Independent kernel-CIDR auto-refresh feed (the store preserves the system cache on a
+    // same-source edit and drops it when this changes). Omit cidr_cache — server-managed.
+    body.cidr_source = cidrSrc.value.trim();
     // Preserve the explicit rule-set format on edit — the form has no input for it, so
     // dropping it makes a list whose URL extension doesn't reveal the format (a .json
     // source, or a query-string URL) silently re-infer wrong and fail to load. Catalog
@@ -953,13 +1223,30 @@ function openRoutingList(rl) {
   const body = el("div", {},
     el("div", { class: "field" }, el("label", {}, "Name"), name),
     el("div", { class: "field" }, el("label", {}, "Source"), mode),
-    srcField, manField,
+    srcField, manField, cidrField,
     el("div", { class: "field" }, el("label", {}, "Route matching traffic via"), routeSel),
     el("div", { class: "field" }, el("label", {}, "Download the list via"), dlSel),
     el("div", { class: "hint" }, "Download-via lets a blocked list source (GitHub) be fetched through a working tunnel."));
   const back = modal({ title: editing ? "Edit routing list" : "New routing list", body,
     footer: [el("button", { class: "btn btn-ghost", onclick: () => back.remove() }, "Cancel"),
     el("button", { class: "btn btn-primary", onclick: save }, editing ? "Save" : "Add")] });
+}
+
+// refreshCidrSources re-fetches every routing list that has an auto-refresh CIDR source
+// (POST /api/routing/refresh) and reports the result. It updates each list's cached CIDRs
+// but does NOT apply — the user clicks Apply to activate (matching the stage-then-Apply
+// model). A no-op (friendly toast) when no list has a CIDR source configured.
+async function refreshCidrSources() {
+  try {
+    const r = await api.post("/api/routing/refresh", {});
+    await loadProfile(); route();
+    const srcN = (r.lists || []).length;
+    const errN = (r.errors || []).length;
+    if (!srcN) { toast("No auto-refresh CIDR sources — set one on a list first.", "ok"); return; }
+    const msg = (r.changed ? "Refreshed" : "No changes") + " · " + srcN + " source" + (srcN === 1 ? "" : "s") +
+      (errN ? " · " + errN + " failed" : "") + (r.changed ? " — click Apply to activate." : "");
+    toast(msg, errN ? "err" : "ok");
+  } catch (e) { toast(e.message, "err"); }
 }
 
 async function openRoutingCatalog() {
@@ -996,21 +1283,17 @@ function modal({ title, body, footer }) {
   const back = el("div", { class: "modal-backdrop", onclick: e => { if (e.target === back) back.remove(); } });
   const m = el("div", { class: "modal" },
     el("div", { class: "modal-head" }, el("div", { class: "card-title" }, title),
-      el("div", { class: "x", onclick: () => back.remove() }, "×")),
+      el("div", { class: "x", onclick: () => back.remove(), "aria-label": t("Close") }, "×")),
     el("div", { class: "modal-body" }, body));
   if (footer) m.appendChild(el("div", { class: "modal-foot" }, footer));
   back.appendChild(m);
   i18nApply(m); // localize the modal's English content (titles, labels, hints, buttons)
+  associateLabels(m); // wire form labels to their controls for screen readers
   document.body.appendChild(back);
   return back;
 }
 
 /* ---------- share / QR / subscription ---------- */
-function copyText(text) {
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => toast("Copied", "ok"), () => toast("Copy failed", "err"));
-  } else { toast("Clipboard not available", "err"); }
-}
 // QR is rendered server-side (no external service — the config never leaves the
 // router) and POSTed so secrets never hit a URL. Returns an <img> filled async.
 async function qrImg(text, size) {
@@ -1617,6 +1900,7 @@ function refreshPills() {
   document.querySelectorAll("[data-spark]").forEach(c => drawSpark(c, sparkBuf[c.getAttribute("data-spark")]));
   paintHero();
   paintConnections(); // live-refresh the connections table (no-op off the dashboard)
+  paintSystem();      // live-refresh RAM/temp + compute real interface throughput rates
 }
 // Pin the last speed-test result for `key` (an endpoint id, or "__global" for the
 // throughput test) into `out`, with the time it was measured — so the Speed/Speedtest
@@ -1654,7 +1938,12 @@ async function pollHealth() {
     try { const pl = await api.get("/api/plugins"); pluginMap = {}; (pl || []).forEach(p => pluginMap[p.id] = p); } catch (_) {}
     try { watchdog = await api.get("/api/watchdog"); } catch (_) {}
     refreshPills();
-  } catch (_) {} finally { healthInFlight = false; }
+  } catch (e) {
+    // The dashboard polls every 5s. If the daemon went down while the user is just
+    // SITTING on the dashboard (not navigating, so route()'s catch never fires), the
+    // stats would silently freeze — surface the same auto-reconnect banner instead.
+    if (isNetworkError(e)) showReconnect();
+  } finally { healthInFlight = false; }
 }
 async function testEndpoint(e) {
   try {
@@ -1680,13 +1969,29 @@ async function renderUpdater(view) {
   view.appendChild(selfUpdateCard()); // WakeRoute self-update — at the top (fills async, non-blocking)
   let data;
   try { data = await api.get("/api/updater/engines"); }
-  catch (e) { view.appendChild(el("div", { class: "empty" }, "Error: " + e.message)); return; }
+  catch (e) { renderError(view, e); return; }
   const mirrorCount = (data.mirrors || []).filter(Boolean).length;
   view.appendChild(el("div", { class: "row-between", style: "margin:18px 0 16px" },
     el("div", { class: "card-title" }, "Engine versions"),
     el("div", { class: "hint" }, "router arch: " + (data.arch || "?") + " · " + (mirrorCount ? mirrorCount + " mirror(s)" : "direct"))));
-  (data.engines || []).forEach(e => view.appendChild(engineCard(e)));
+  // Foreground the engines the router actually runs (core + plugins); tuck the
+  // catalog-only standalone cores (sing-box covers their protocols natively) into a
+  // collapsed "Advanced" group. Falls back to a flat list if the backend predates roles.
+  const engines = data.engines || [];
+  const router = engines.filter(e => e.role && e.role !== "standalone");
+  const advanced = engines.filter(e => !e.role || e.role === "standalone");
+  (router.length ? router : engines).forEach(e => view.appendChild(engineCard(e)));
+  if (router.length && advanced.length) {
+    const det = el("details", { style: "margin-top:6px" });
+    det.appendChild(el("summary", { class: "hint", style: "cursor:pointer;font-weight:600;padding:8px 0" },
+      "Advanced — " + advanced.length + " engine" + (advanced.length > 1 ? "s" : "") + " not used on this router"));
+    det.appendChild(el("div", { class: "hint", style: "margin:2px 0 12px;max-width:60ch" },
+      "sing-box handles these protocols natively, so the router never runs these binaries. Install one only if you run the standalone core yourself."));
+    advanced.forEach(e => det.appendChild(engineCard(e)));
+    view.appendChild(det);
+  }
 }
+const ENGINE_ROLE_HINT = { "core": "core", "kernel-plugin": "kernel plugin", "socks-plugin": "SOCKS plugin", "standalone": "standalone core" };
 
 // WakeRoute self-update card: current version, available release, "Update now",
 // and an auto-update toggle. Backed by /api/updater/self*. Returns synchronously with a
@@ -1694,7 +1999,7 @@ async function renderUpdater(view) {
 function selfUpdateCard() {
   const card = el("div", { class: "card" });
   card.appendChild(el("div", { class: "card-title", style: "margin-bottom:10px" }, "WakeRoute"));
-  const body = el("div", {}, el("div", { class: "hint" }, "checking for updates…"));
+  const body = el("div", {}, el("div", { class: "hint" }, t("checking for updates…")));
   card.appendChild(body);
   (async () => {
   try {
@@ -1746,7 +2051,7 @@ function engineCard(e) {
         inst.present
           ? el("span", { class: "badge", style: "margin-left:8px" }, inst.version || "installed")
           : el("span", { class: "pill muted", style: "margin-left:8px" }, el("span", { class: "dot" }), "not installed")),
-      el("div", { class: "sub", style: "margin-top:3px" }, e.repo)),
+      el("div", { class: "sub", style: "margin-top:3px" }, e.repo + (e.role ? " · runs as " + (ENGINE_ROLE_HINT[e.role] || e.role) : ""))),
     el("div", { class: "acts" }, el("button", { class: "btn btn-sm", onclick: () => loadVersions(e, card) }, "Check updates"))));
   const box = el("div", { class: "vbox", style: "margin-top:12px" });
   if (e.source_only) box.appendChild(el("div", { class: "hint" }, e.note || "No prebuilt releases."));
@@ -1998,9 +2303,40 @@ function humanDur(sec) { sec = +sec || 0; const d = Math.floor(sec / 86400), h =
 // ccFlag turns a 2-letter ISO country code into its regional-indicator emoji flag.
 function ccFlag(cc) { if (!cc || !/^[A-Za-z]{2}$/.test(cc)) return ""; cc = cc.toUpperCase(); return String.fromCodePoint(...[...cc].map(c => 0x1F1E6 + c.charCodeAt(0) - 65)); }
 function timeAgo(ms) { const s = Math.round((Date.now() - ms) / 1000); return s < 60 ? "just now" : s < 3600 ? Math.floor(s / 60) + " min ago" : Math.floor(s / 3600) + "h ago"; }
+// copyText copies to the clipboard with graceful degradation for the panel's real
+// deployment: it is served over plain HTTP on a LAN IP (e.g. http://192.168.1.1:8088),
+// which is NOT a secure context, so navigator.clipboard is undefined. Chain:
+// async Clipboard API → execCommand("copy") → a manual-copy modal (pre-selected
+// textarea) so the user can always get the text out (Ctrl/Cmd+C) instead of a dead end.
 function copyText(str) {
-  if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(str).then(() => toast("Copied", "ok")).catch(() => toast("Copy failed", "err")); return; }
-  try { const ta = el("textarea", {}); ta.value = str; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); toast("Copied", "ok"); } catch (_) { toast("Copy failed", "err"); }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(str).then(() => toast("Copied", "ok"), () => execCopy(str));
+    return;
+  }
+  execCopy(str);
+}
+function execCopy(str) {
+  try {
+    const ta = el("textarea", { style: "position:fixed;top:-1000px;opacity:0" });
+    ta.value = str;
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (ok) { toast("Copied", "ok"); return; }
+  } catch (_) { /* fall through to the manual modal */ }
+  copyManualModal(str);
+}
+function copyManualModal(str) {
+  const ta = el("textarea", { readonly: "readonly", style: "width:100%;min-height:160px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.5" });
+  ta.value = str;
+  modal({
+    title: "Copy manually",
+    body: el("div", {},
+      el("div", { class: "hint", style: "margin-bottom:8px" }, "Automatic copy is blocked (the panel runs over plain HTTP, not a secure context). Select all and press Ctrl/Cmd+C."),
+      ta),
+  });
+  setTimeout(() => { ta.focus(); ta.select(); }, 60);
 }
 function copyReport() {
   const h = state.hbat; if (!h) return;
@@ -2053,8 +2389,8 @@ function egressSelect(selected) {
 // Preset reachability targets (bare hosts: pingable on WAN, GET https://host through a tunnel).
 const NETDIAG_PRESETS = [
   { cat: "Connectivity", items: [["Cloudflare", "cloudflare.com"], ["Google", "google.com"], ["Apple", "apple.com"]] },
-  { cat: "Blocked in RU", items: [["Instagram", "instagram.com"], ["X", "x.com"], ["YouTube", "youtube.com"], ["Facebook", "facebook.com"], ["Telegram", "web.telegram.org"]] },
-  { cat: "DNS / IP", items: [["1.1.1.1", "1.1.1.1"], ["8.8.8.8", "8.8.8.8"], ["ya.ru", "ya.ru"]] },
+  { cat: "Commonly blocked", items: [["Instagram", "instagram.com"], ["X", "x.com"], ["YouTube", "youtube.com"], ["Facebook", "facebook.com"], ["Telegram", "web.telegram.org"]] },
+  { cat: "DNS / IP", items: [["1.1.1.1", "1.1.1.1"], ["8.8.8.8", "8.8.8.8"], ["9.9.9.9", "9.9.9.9"]] },
   { cat: "Streaming / geo", items: [["Netflix", "netflix.com"], ["ChatGPT", "chat.openai.com"], ["Spotify", "spotify.com"]] },
 ];
 
@@ -2076,7 +2412,9 @@ async function renderDiagnostics(view) {
   const egress = egressSelect((state.diag && state.diag.egress) || "direct");
   const target = el("input", { type: "text", value: (state.diag && state.diag.target) || "", placeholder: "host, IP or URL — e.g. youtube.com, 1.1.1.1, https://chat.openai.com" });
   const ndOut = el("div", { style: "margin-top:14px" });
-  const btnRow = el("div", { style: "margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center" });
+  // Hero action: test the target across every exit at once — the universal answer.
+  const testAll = el("button", { class: "btn btn-primary", onclick: () => runDiagAll(target.value, ndOut) }, "Test all exits");
+  const btnRow = el("div", { style: "margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center" });
   // An interface-backed egress (an external endpoint bound to a kernel iface like
   // awg0/awg1) can run real ICMP through that link, so it gets ping/traceroute too —
   // only a proxy outbound (vless/etc.) or group is restricted to HTTP reachability.
@@ -2093,31 +2431,21 @@ async function renderDiagnostics(view) {
         btnRow.appendChild(el("button", { class: "btn btn-sm" + (tool === "all" ? " btn-primary" : ""), onclick: () => runDiagStream(tool, target.value, egress.value, ndOut) }, lbl)));
       if (iface) btnRow.appendChild(el("span", { class: "hint" }, "↳ bound to " + iface));
     }
-    btnRow.appendChild(el("button", { class: "btn btn-sm", style: "margin-left:auto", onclick: () => runDiagAll(target.value, ndOut) }, "Test all exits"));
   }
   egress.onchange = diagButtons;
   diagButtons();
-  target.addEventListener("keydown", e => {
-    if (e.key !== "Enter") return;
-    if (egress.value && egress.value !== "direct" && !diagIface()) runDiagReach(target.value, egress.value, ndOut);
-    else runDiagStream("all", target.value, egress.value, ndOut);
-  });
-  const chips = el("div", { style: "margin-top:12px" });
-  NETDIAG_PRESETS.forEach(grp => {
-    const row = el("div", { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px" },
-      el("span", { class: "hint", style: "min-width:104px" }, grp.cat));
-    grp.items.forEach(([label, host]) => row.appendChild(
-      el("button", { class: "btn", type: "button", style: "padding:3px 9px;font-size:11px", onclick: () => { target.value = host; } }, label)));
-    chips.appendChild(row);
-  });
-  view.appendChild(el("div", { class: "hint", style: "margin:24px 0 10px;border-top:1px solid var(--divider);padding-top:16px;font-weight:600;color:var(--ink-2)" }, "Tools — manual checks for a specific host or tunnel"));
+  target.addEventListener("keydown", e => { if (e.key === "Enter") runDiagAll(target.value, ndOut); });
+  const advanced = el("details", { class: "nd-advanced", style: "margin-top:14px" },
+    el("summary", { style: "cursor:pointer;color:var(--ink-2);font-size:13px;user-select:none" }, "Advanced — one tool, one exit (ping · traceroute · DNS · reachability)"),
+    el("div", { class: "field", style: "margin:12px 0 0;max-width:260px" }, el("label", {}, "Egress"), egress),
+    btnRow);
   view.appendChild(el("div", { class: "card" },
     el("div", { class: "card-title", style: "margin-bottom:8px" }, "Network tools"),
-    el("div", { class: "hint", style: "margin-bottom:12px" }, "Ping, traceroute and DNS run on the WAN and stream their output live. Pick a tunnel to test HTTP(S) reachability through it. Results stay here when you switch tabs."),
+    el("div", { class: "hint", style: "margin-bottom:12px" }, "Type a host, IP or URL and test whether it's reachable through every exit at once — WAN, each tunnel, and your routing groups."),
     el("div", { style: "display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap" },
-      el("div", { class: "field", style: "margin:0;min-width:160px" }, el("label", {}, "Egress"), egress),
-      el("div", { class: "field", style: "margin:0;flex:1;min-width:220px" }, el("label", {}, "Target"), target)),
-    btnRow, chips, ndOut));
+      el("div", { class: "field", style: "margin:0;flex:1;min-width:240px" }, el("label", {}, "Target"), target),
+      testAll),
+    advanced, ndOut));
   if (state.diag) renderDiagOutput(ndOut); // restore a prior / in-flight result
 
   // Log analysis — paste a log (or load sing-box's) -> known-error cards.
@@ -2311,7 +2639,7 @@ function renderReachMatrix(out, r) {
   out.appendChild(table);
   const wan = rows.find(x => x.egress === "direct");
   if (wan && !wan.reachable) out.appendChild(el("div", { class: "hint", style: "margin-top:10px;color:var(--warn)" },
-    "WAN (direct) failed too — tunnel tests route through sing-box; is it running?"));
+    "WAN (direct) failed too — the router itself can't reach this target; check the uplink/DNS."));
 }
 
 function renderDiagResult(out, r) {
@@ -2356,13 +2684,16 @@ const SERVER_OPT_NAME = { "amneziawg": "AmneziaWG", "vless-reality": "VLESS-Real
 async function renderServer(view) {
   view.appendChild(el("div", { class: "block-head" },
     el("div", {},
-      el("div", { class: "ttl" }, "Init Server"),
-      el("div", { class: "desc" }, "Provision and manage your VPN servers over SSH. WakeRoute installs what you pick, auto-adds the client to Connections and tests it — keep several servers for redundancy, and harden fresh ones with key-only login.")),
+      el("div", { class: "ttl" }, "Set up Server"),
+      el("div", { class: "desc" }, "Provision and manage proxy servers over SSH. WakeRoute installs what you pick, auto-adds the client to Connections and tests it — keep several servers for redundancy, and harden fresh ones with key-only login.")),
     el("div", { class: "side" },
-      el("button", { class: "btn btn-primary", onclick: openAddServer }, "+ Add server"))));
+      el("button", { class: "btn btn-primary", title: "Provision a new remote server over SSH and add its client to Connections", onclick: openAddServer }, "+ Add server"))));
 
-  let servers = [];
-  try { servers = await api.get("/api/servers"); } catch (_) {}
+  // Let a fetch failure propagate to route()'s renderError (reconnect banner /
+  // inline error) instead of swallowing it — otherwise a daemon blip renders the
+  // reassuring "No servers yet" even when the user has servers that just failed to
+  // load. A genuine empty response (null/[]) still shows the empty state.
+  const servers = (await api.get("/api/servers")) || [];
 
   if (!servers.length) {
     view.appendChild(el("div", { class: "card" }, el("div", { class: "empty" },
@@ -2389,6 +2720,7 @@ function serverCard(sv) {
       el("div", { class: "acts" },
         el("button", { class: "btn btn-primary btn-sm", onclick: () => openProvision(sv) }, "Set up"),
         el("button", { class: "btn btn-sm", onclick: () => openHarden(sv) }, sv.hardened ? "Re-key" : "Secure"),
+        el("button", { class: "btn btn-sm", onclick: () => openVersions(sv) }, "Versions"),
         el("button", { class: "btn btn-danger btn-sm", onclick: () => delServer(sv) }, "Delete"))));
 }
 
@@ -2620,6 +2952,77 @@ async function openHarden(sv) {
   });
 }
 
+// openVersions — per-server binary version check + update (over SSH, creds not stored).
+// Reads sing-box (Reality core) + AmneziaWG versions, compares sing-box to its latest
+// GitHub release, and offers a gated per-binary update.
+async function openVersions(sv) {
+  const c = credsBlock(sv);
+  const con = smartConsole();
+  const results = el("div", { style: "margin-top:14px" });
+  const checkBtn = el("button", { class: "btn btn-primary" }, t("Check versions"));
+  modal({
+    title: t("Binary versions") + " — " + ((sv && (sv.name || sv.host)) || t("server")),
+    body: el("div", {}, c.node,
+      el("div", { class: "hint", style: "margin-top:6px" }, "Reads sing-box + AmneziaWG versions on the server over SSH and compares sing-box to its latest release. Updating restarts that service briefly and keeps a backup of the old binary on the server."),
+      con.node, results),
+    footer: checkBtn,
+  });
+  checkBtn.addEventListener("click", async () => {
+    const cr = c.get();
+    if (!cr.host || !cr.user) return toast("Host and SSH user are required", "err");
+    checkBtn.disabled = true; checkBtn.textContent = t("Checking…"); results.innerHTML = "";
+    try {
+      const r = await api.post("/api/server/check-versions", { server_id: sv && sv.id, ...cr });
+      con.run(r.job_id, v => {
+        checkBtn.disabled = false; checkBtn.textContent = t("Re-check");
+        if (v.ok && v.result) renderVersionTable(results, v.result.binaries, sv, c, con);
+        else toast("Version check failed — see console", "err");
+      });
+    } catch (e) { checkBtn.disabled = false; checkBtn.textContent = t("Check versions"); toast(e.message, "err"); }
+  });
+}
+
+function renderVersionTable(box, binaries, sv, c, con) {
+  box.innerHTML = "";
+  // Rendered on the job-done callback — AFTER route()/modal() i18nApply — so these
+  // strings must go through t() explicitly to localize (i18nApply won't revisit them).
+  if (!binaries || !binaries.length) { box.appendChild(el("div", { class: "hint" }, t("No managed binaries found on this server."))); return; }
+  const th = lbl => el("th", { style: "padding:8px 10px;text-align:left;border-bottom:1px solid var(--divider)" }, t(lbl));
+  const table = el("table", { class: "rm-table" },
+    el("thead", {}, el("tr", {}, th("Binary"), th("Installed"), th("Latest"), th(""))),
+    el("tbody", {}, ...binaries.map(b => {
+      const avail = !!b.update_available;
+      const latest = b.managed === "apt" ? t("apt-managed") : (b.latest || (b.latest_error ? t("unknown") : "—"));
+      const status = avail
+        ? el("span", { class: "badge", style: "background:var(--ok);color:#04240f" }, t("update → {0}", b.latest))
+        : (b.managed === "apt" ? el("span", { class: "hint" }, t("via apt"))
+          : el("span", { class: "pill muted" }, el("span", { class: "dot" }), b.latest_error ? t("check failed") : t("up to date")));
+      let act = null;
+      if (b.managed === "github" && avail) act = el("button", { class: "btn btn-primary btn-sm", onclick: () => updateBinary(sv, c, con, b, b.latest_tag || b.latest) }, t("Update"));
+      else if (b.managed === "apt") act = el("button", { class: "btn btn-sm", onclick: () => updateBinary(sv, c, con, b, "") }, t("apt upgrade"));
+      return el("tr", {},
+        el("td", { "data-label": "Binary" }, b.name),
+        el("td", { "data-label": "Installed" }, b.installed || "?"),
+        el("td", { "data-label": "Latest" }, latest),
+        el("td", { "data-label": "", class: "rm-r" }, el("div", { style: "display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap" }, status, act)));
+    })));
+  box.appendChild(table);
+}
+
+async function updateBinary(sv, c, con, b, version) {
+  const what = b.managed === "apt" ? (b.name + " via apt upgrade") : (b.name + " → " + version);
+  if (!confirm("Update " + what + " on " + (sv ? sv.host : "the server") + "?\n\nThe service will briefly restart. The old binary is backed up on the server as <path>.wakeroute.bak.")) return;
+  const cr = c.get();
+  if (!cr.host || !cr.user) return toast("Host and SSH user are required", "err");
+  try {
+    const r = await api.post("/api/server/update-binary", { server_id: sv && sv.id, ...cr, binary: b.key, version: version || "", confirm: true });
+    con.run(r.job_id, v => {
+      if (v.ok) toast(b.name + " updated" + (v.result && v.result.new_version ? " → " + v.result.new_version : ""), "ok");
+      else toast("Update failed — see console", "err");
+    });
+  } catch (e) { toast(e.message, "err"); }
+}
+
 /* ---------- Settings (M10) ---------- */
 function restartTag() { return el("span", { class: "tag-restart", title: t("Takes effect after the daemon restarts") }, t("↻ restart")); }
 
@@ -2679,6 +3082,19 @@ async function renderSettings(view) {
   const fsReboot = el("input", { type: "checkbox" }); fsReboot.checked = !!(cfg.failsafe && cfg.failsafe.auto_reboot);
   // Mode
   const demo = el("input", { type: "checkbox" }); demo.checked = !!cfg.demo;
+  // Security — Host allow-list (DNS-rebinding guard; one host per line, empty = allow any)
+  const allowedHosts = el("textarea", { placeholder: "192.168.1.1\nrouter.lan" });
+  allowedHosts.value = (cfg.allowed_hosts || []).join("\n");
+  // Routing mode (applies on the next Apply, not a restart)
+  const ROUTE_MODES = [
+    ["hybrid", t("Everything via WakeRoute (domain carve-outs work; general traffic slower / CPU-bound)")],
+    ["fast", t("Fast: general traffic bypasses WakeRoute (kernel fast-path) — IP carve-outs (calls/VoWiFi) still work; domain carve-outs OFF")],
+    ["tun", t("All traffic through sing-box (TUN)")],
+    ["mixed", t("Local proxy only, no gateway (mixed)")],
+    ["", t("Auto (derive from Gateway)")],
+  ];
+  const routeMode = el("select", {}, ...ROUTE_MODES.map(m => el("option", { value: m[0] }, m[1])));
+  routeMode.value = cfg.routing_mode || "";
 
   const save = el("button", { class: "btn btn-primary" }, t("Save settings"));
   const status = el("span", { class: "hint", style: "margin-right:12px" });
@@ -2691,12 +3107,14 @@ async function renderSettings(view) {
       ...cfg,
       listen: listen.value.trim(),
       demo: demo.checked,
+      routing_mode: routeMode.value,
       ports: { ui: +pUI.value || 0, clash: +pClash.value || 0, dns: +pDNS.value || 0, mixed: +pMixed.value || 0 },
       clash: { controller: clashCtl.value.trim(), secret: clashSec.value },
       singbox: { bin: sbBin.value.trim(), config: sbCfg.value.trim() },
       updater: { ...(cfg.updater || {}), mirrors },
       watchdog: { ...(cfg.watchdog || {}), notify_url: wdURL.value.trim() },
       failsafe: { ...(cfg.failsafe || {}), target: fsTarget.value.trim(), auto_reboot: fsReboot.checked },
+      allowed_hosts: allowedHosts.value.split("\n").map(s => s.trim()).filter(Boolean),
     };
     save.disabled = true; status.textContent = t("saving…");
     try {
@@ -2707,6 +3125,11 @@ async function renderSettings(view) {
     } catch (e) { status.textContent = ""; toast(e.message, "err"); }
     finally { save.disabled = false; }
   });
+
+  view.appendChild(el("div", { class: "card" },
+    el("div", { class: "card-title", style: "margin-bottom:8px" }, t("Routing mode")),
+    el("div", { class: "hint", style: "margin-bottom:10px" }, t("How LAN traffic is routed. «Fast» keeps your tunnels/carve-outs for IPs (calls, VoWiFi) but lets general traffic (downloads, games) take the kernel fast-path instead of the userspace proxy — much higher throughput. Takes effect on the next Apply.")),
+    field(t("Mode"), routeMode)));
 
   view.appendChild(el("div", { class: "card" },
     el("div", { class: "card-title", style: "margin-bottom:12px" }, t("Web panel")),
@@ -2748,6 +3171,11 @@ async function renderSettings(view) {
     el("div", { class: "card-title", style: "margin-bottom:10px" }, t("Mode")),
     el("label", { class: "check", style: "display:inline-flex" }, demo, el("span", {}, t("Demo mode (synthesize traffic when sing-box is absent)"))),
     el("div", { class: "hint", style: "margin-top:6px" }, restartTag(), t(" applies after restart"))));
+
+  view.appendChild(el("div", { class: "card" },
+    el("div", { class: "card-title", style: "margin-bottom:8px" }, t("Security"), restartTag()),
+    el("div", { class: "hint", style: "margin-bottom:10px" }, t("Host allow-list — one hostname or IP per line. When set, the panel only answers requests whose Host header matches one of these (a DNS-rebinding defense). Leave EMPTY to allow any host (the default). List every name/IP you use to reach the panel, or you will lock yourself out (recover by clearing it in config.json and restarting).")),
+    allowedHosts));
 
   const restartBtn = el("button", { class: "btn btn-danger" }, t("Restart service"));
   restartBtn.addEventListener("click", restartService);

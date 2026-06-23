@@ -26,27 +26,40 @@ import (
 	"time"
 )
 
-// Engine describes a managed core binary and where to get it.
+// Engine describes a managed core binary and where to get it. Role tells the UI how
+// the binary is actually used on THIS router so the Updater can foreground the ones
+// the router runs and tuck the rest away:
+//
+//	core         — the sing-box proxy core
+//	kernel-plugin— an engine driving a kernel iface (AmneziaWG)
+//	socks-plugin — a long-running chained-SOCKS engine (olcRTC)
+//	standalone   — a separate core wakeroute does NOT run here; sing-box covers the
+//	               protocol natively, so it's catalog-only (install only for a manual
+//	               setup). The UI files these under "Advanced".
 type Engine struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
 	Repo        string   `json:"repo"`     // GitHub "owner/name"
 	BinName     string   `json:"bin_name"` // installed filename
+	Role        string   `json:"role"`     // core | kernel-plugin | socks-plugin | standalone
 	VersionArgs []string `json:"-"`        // args that print the version
 	SourceOnly  bool     `json:"source_only"`
 	Note        string   `json:"note,omitempty"`
 }
 
+// RouterUsed reports whether the router actually runs this engine (vs catalog-only).
+func (e Engine) RouterUsed() bool { return e.Role != "" && e.Role != "standalone" }
+
 // Engines is the registry of cores wakeroute can manage.
 var Engines = []Engine{
-	{ID: "sing-box", Name: "sing-box", Repo: "SagerNet/sing-box", BinName: "sing-box", VersionArgs: []string{"version"}},
-	{ID: "mihomo", Name: "Mihomo (Clash.Meta)", Repo: "MetaCubeX/mihomo", BinName: "mihomo", VersionArgs: []string{"-v"}},
-	{ID: "xray", Name: "Xray-core", Repo: "XTLS/Xray-core", BinName: "xray", VersionArgs: []string{"version"}},
-	{ID: "hysteria", Name: "Hysteria 2", Repo: "apernet/hysteria", BinName: "hysteria", VersionArgs: []string{"version"}},
-	{ID: "dnscrypt-proxy", Name: "dnscrypt-proxy", Repo: "DNSCrypt/dnscrypt-proxy", BinName: "dnscrypt-proxy", VersionArgs: []string{"-version"}},
-	{ID: "amneziawg-go", Name: "AmneziaWG (userspace)", Repo: "amnezia-vpn/amneziawg-go", BinName: "amneziawg-go", SourceOnly: true,
+	{ID: "sing-box", Name: "sing-box", Repo: "SagerNet/sing-box", BinName: "sing-box", Role: "core", VersionArgs: []string{"version"}},
+	{ID: "mihomo", Name: "Mihomo (Clash.Meta)", Repo: "MetaCubeX/mihomo", BinName: "mihomo", Role: "standalone", VersionArgs: []string{"-v"}},
+	{ID: "xray", Name: "Xray-core", Repo: "XTLS/Xray-core", BinName: "xray", Role: "standalone", VersionArgs: []string{"version"}},
+	{ID: "hysteria", Name: "Hysteria 2", Repo: "apernet/hysteria", BinName: "hysteria", Role: "standalone", VersionArgs: []string{"version"}},
+	{ID: "dnscrypt-proxy", Name: "dnscrypt-proxy", Repo: "DNSCrypt/dnscrypt-proxy", BinName: "dnscrypt-proxy", Role: "standalone", VersionArgs: []string{"-version"}},
+	{ID: "amneziawg-go", Name: "AmneziaWG (userspace)", Repo: "amnezia-vpn/amneziawg-go", BinName: "amneziawg-go", Role: "kernel-plugin", SourceOnly: true,
 		Note: "No prebuilt releases; build from source on-device (the PPA is blocked in RU)."},
-	{ID: "olcrtc", Name: "olcRTC (WebRTC tunnel)", Repo: "alexsvl/olcrtc", BinName: "olcrtc", VersionArgs: []string{"version"},
+	{ID: "olcrtc", Name: "olcRTC (WebRTC tunnel)", Repo: "alexsvl/olcrtc", BinName: "olcrtc", Role: "socks-plugin", VersionArgs: []string{"version"},
 		Note: "Anti-whitelist WebRTC-over-meet tunnel (Jitsi/Telemost/WbStream). Pulled from the alexsvl/olcrtc fork, which daily auto-syncs upstream openlibrecommunity/olcrtc and publishes prebuilt `olcrtc-linux-<arch>` binaries (upstream ships none; the WebRTC stack is too heavy to build on the router)."},
 }
 
@@ -90,6 +103,10 @@ type Installed struct {
 var verRe = regexp.MustCompile(`\d+\.\d+\.\d+`)
 
 func parseVersion(s string) string { return verRe.FindString(s) }
+
+// ParseVersion extracts the first x.y.z from s (exported for cross-package reuse, e.g.
+// the Init Server panel formatting a remote `sing-box version` line). "" if none.
+func ParseVersion(s string) string { return parseVersion(s) }
 
 // Installed locates the binary (in BinDir or PATH) and runs its version command.
 func (u *Updater) Installed(e Engine) Installed {
@@ -214,6 +231,22 @@ func (u *Updater) release(ctx context.Context, e Engine, tag string) (Release, e
 // Install downloads the asset for u.Arch from the given release tag, verifies it
 // (when a digest is provided), extracts the binary, and installs it atomically.
 // Returns the installed tag.
+// enoughSpaceFor reports whether `avail` free bytes can safely hold a freshly-staged
+// binary of binSize (+ a same-size backup when withBackup) plus a small margin. When
+// the free space is unknown (known=false, e.g. the off-Linux build) it returns true —
+// never block on a stat we couldn't take. This guards the small router overlay
+// (~60 MB) against a swap that runs out of space mid-write and leaves a partial binary.
+func enoughSpaceFor(avail uint64, known bool, binSize int, withBackup bool) bool {
+	if !known {
+		return true
+	}
+	mult := uint64(1)
+	if withBackup {
+		mult = 2
+	}
+	return avail >= uint64(binSize)*mult+(2<<20) // + 2 MiB margin
+}
+
 func (u *Updater) Install(ctx context.Context, e Engine, tag string) (string, error) {
 	if e.SourceOnly {
 		return "", fmt.Errorf("%s has no prebuilt releases: %s", e.ID, e.Note)
@@ -242,9 +275,13 @@ func (u *Updater) Install(ctx context.Context, e Engine, tag string) (string, er
 	if err := os.MkdirAll(u.BinDir, 0o755); err != nil {
 		return "", err
 	}
+	if avail, ok := availBytes(u.BinDir); !enoughSpaceFor(avail, ok, len(bin), false) {
+		return "", fmt.Errorf("not enough free space to install %s in %s (~%d MiB free) — free some space and retry", e.ID, u.BinDir, avail>>20)
+	}
 	dst := filepath.Join(u.BinDir, e.BinName)
 	tmp := dst + ".new"
 	if err := os.WriteFile(tmp, bin, 0o755); err != nil {
+		_ = os.Remove(tmp) // don't leave a partial .new wasting the overlay
 		return "", err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
@@ -521,8 +558,15 @@ func (u *Updater) SelfUpdate(ctx context.Context, repo, tag, exePath string) (st
 		return "", fmt.Errorf("extract wakeroute-%s: %w", u.Arch, err)
 	}
 	dir := filepath.Dir(exePath)
+	// Pre-flight: the staged binary AND the .bak backup both land on exePath's
+	// filesystem. On the tiny router overlay a swap that runs out of space mid-write
+	// would otherwise leave a truncated binary — abort cleanly instead, untouched.
+	if avail, ok := availBytes(dir); !enoughSpaceFor(avail, ok, len(bin), true) {
+		return "", fmt.Errorf("not enough free space to self-update safely on %s (~%d MiB free, need ~%d MiB for the new binary + backup) — free some space and retry", dir, avail>>20, (uint64(len(bin))*2+(2<<20))>>20)
+	}
 	staged := filepath.Join(dir, ".wakeroute.new")
 	if err := os.WriteFile(staged, bin, 0o755); err != nil {
+		_ = os.Remove(staged) // don't leave a partial .wakeroute.new wasting the overlay
 		return "", err
 	}
 	// Sanity-run BEFORE swapping — refuse a binary that won't execute on this arch.
@@ -531,9 +575,13 @@ func (u *Updater) SelfUpdate(ctx context.Context, repo, tag, exePath string) (st
 		_ = os.Remove(staged)
 		return "", fmt.Errorf("staged wakeroute binary failed its sanity check (corrupt or wrong arch): %v", runErr)
 	}
-	// Back up the current binary on the same filesystem, then atomically swap.
+	// Back up the current binary on the same filesystem, then atomically swap. A
+	// half-written backup is worse than none (it poses as a valid rollback), so drop
+	// it on a write error rather than leaving a truncated .bak behind.
 	if cur, err := os.ReadFile(exePath); err == nil {
-		_ = os.WriteFile(exePath+".bak", cur, 0o755)
+		if werr := os.WriteFile(exePath+".bak", cur, 0o755); werr != nil {
+			_ = os.Remove(exePath + ".bak")
+		}
 	}
 	if err := os.Rename(staged, exePath); err != nil {
 		_ = os.Remove(staged)

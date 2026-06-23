@@ -44,6 +44,11 @@ type Zone struct {
 	Mark      uint32   // == the egress mark (denormalized for rendering)
 	V4        []string // IPv4 CIDRs (normalized, sorted)
 	V6        []string // IPv6 CIDRs
+	// Domains is populated only when Options.CollectDomainZones is set (the Keenetic ipset+
+	// dnsmasq plane): the list's domain entries, which dnsmasq resolves into the zone's kernel
+	// ipset at query-time (so an 81k-domain list costs ~0 standing RAM — never pre-resolved).
+	// Empty on the OpenWrt nft path (domains there are warned and handled by sing-box).
+	Domains []string
 }
 
 // Warning flags model content the IP-based Phase-1 compiler does not kernel-route.
@@ -52,14 +57,26 @@ type Warning struct {
 	Msg   string
 }
 
+// Flowtable is the optional Phase-1b flow-offload datapath: general (UNmarked) LAN↔WAN
+// flows are offloaded to the kernel/HW fast-path, while carve-out flows (any plan mark
+// set) are deliberately EXCLUDED so their per-packet fwmark/PBR (and thus the UDP calls
+// it carries) keep working. Lives in this plan's OWN nft table, so the existing
+// RenderNft/RenderTeardown snapshot/restore it under the fail-safe for free — we never
+// touch fw4's uci flow_offloading. See docs/ARCHITECTURE_NATIVE_FIRST.md "Phase 1a/1b".
+type Flowtable struct {
+	Devices []string // netdevs to offload (WAN uplink + LAN bridge); awg* tunnels excluded
+	HW      bool     // emit `flags offload` for hardware PPE offload (vs software only)
+}
+
 // Plan is the compiled kernel-routing plan for hybrid mode.
 type Plan struct {
-	Table    string   // nft table name (own table, coexists with fw4)
-	Mask     uint32   // fwmark mask owned by this plan
-	Egresses []Egress // sorted: wan first, then the rest by tag
-	Zones    []Zone   // sorted by name
-	BypassV4 []string // kernel endpoints' own server IPs → main table (anti-loop)
-	BypassV6 []string
+	Table     string   // nft table name (own table, coexists with fw4)
+	Mask      uint32   // fwmark mask owned by this plan
+	Egresses  []Egress // sorted: wan first, then the rest by tag
+	Zones     []Zone   // sorted by name
+	BypassV4  []string // kernel endpoints' own server IPs → main table (anti-loop)
+	BypassV6  []string
+	Flowtable *Flowtable // optional Phase-1b flow-offload (nil = no offload, the default)
 }
 
 // Options tune the marking/table scheme (defaults mirror the keen-pbr layout).
@@ -70,6 +87,18 @@ type Options struct {
 	TableBase int    // default 151 (first non-main routing table)
 	WANTable  int    // default 254 (main)
 	RulePref  int    // default 150 (base ip-rule priority)
+
+	// Phase 1b flow-offload (default off). Offload "" / "off" → no flowtable (current
+	// behaviour, byte-identical output). "sw" → software flowtable; "hw" → also `flags
+	// offload` (hardware PPE). Honored only when OffloadDevices is non-empty; the caller
+	// (server) supplies the WAN+LAN devices since the pure compiler must not probe the host.
+	Offload        string
+	OffloadDevices []string
+
+	// CollectDomainZones, when true, makes Compile gather a list/rule's domain entries into
+	// Zone.Domains (for the Keenetic dnsmasq-ipset plane) instead of warning-and-dropping them.
+	// Default false → the OpenWrt nft path is byte-identical (domains stay warnings).
+	CollectDomainZones bool
 }
 
 func (o *Options) withDefaults() {
@@ -158,16 +187,35 @@ func Compile(p *model.Profile, opt Options) (*Plan, []Warning, error) {
 
 	// Collect zones from IP-based rules + routing lists; track which egress tags are used.
 	usedEgress := map[string]struct{}{}
+	usedNames := map[string]bool{}
 	addZone := func(name, egTag string, cidrs []string, scope string) {
 		v4, v6, bad := classifyCIDRs(cidrs)
-		for _, b := range bad {
-			warn(scope, "skipped non-IP entry "+b+" (domain matching is Phase 2)")
+		var domains []string
+		if opt.CollectDomainZones {
+			domains = normalizeDomains(bad) // the non-IP entries are domains for dnsmasq
+		} else {
+			for _, b := range bad {
+				warn(scope, "skipped non-IP entry "+b+" (domain matching is Phase 2)")
+			}
 		}
-		if len(v4) == 0 && len(v6) == 0 {
+		if len(v4) == 0 && len(v6) == 0 && len(domains) == 0 {
 			return
 		}
+		// Disambiguate set names that collide after nftName() squashes non-alnum to '_'
+		// (e.g. routing-list ids "ru-services" and "ru_services" both → "list_ru_services").
+		// model.Validate only rejects EXACT-duplicate ids, so without this the rendered nft
+		// ruleset would declare the same set twice → `nft -f` rejects the whole load → Apply
+		// fails cryptically. Suffix the later collision so BOTH lists still kernel-route.
+		if usedNames[name] {
+			base := name
+			for i := 2; usedNames[name]; i++ {
+				name = fmt.Sprintf("%s_%d", base, i)
+			}
+			warn(scope, "kernel set name collided with another id → renamed to "+name)
+		}
+		usedNames[name] = true
 		usedEgress[egTag] = struct{}{}
-		plan.Zones = append(plan.Zones, Zone{Name: name, EgressTag: egTag, V4: v4, V6: v6})
+		plan.Zones = append(plan.Zones, Zone{Name: name, EgressTag: egTag, V4: v4, V6: v6, Domains: domains})
 	}
 
 	for i := range p.Rules {
@@ -201,11 +249,19 @@ func Compile(p *model.Profile, opt Options) (*Plan, []Warning, error) {
 		if rl.Source != "" {
 			warn(rl.ID, "remote rule-set ("+rl.Source+") not kernel-routed in Phase 1 (set population is Phase 2)")
 		}
-		if len(rl.Manual) == 0 {
+		// Kernel zone CIDRs = Manual ∪ CIDRCache (the last-good auto-refresh fetch). Both
+		// optional; classifyCIDRs in addZone dedups + collapses the union. CIDRCache is
+		// empty until the refresh loop (auto-refresh phase 4) populates it, so this is inert
+		// for hand-curated lists.
+		cidrs := rl.Manual
+		if len(rl.CIDRCache) > 0 {
+			cidrs = append(append(make([]string, 0, len(rl.Manual)+len(rl.CIDRCache)), rl.Manual...), rl.CIDRCache...)
+		}
+		if len(cidrs) == 0 {
 			continue
 		}
 		if k, _, ok := resolveEgress(rl.ID, rl.Outbound); ok && k != "" {
-			addZone("list_"+nftName(rl.ID), rl.Outbound, rl.Manual, rl.ID)
+			addZone("list_"+nftName(rl.ID), rl.Outbound, cidrs, rl.ID)
 		}
 	}
 
@@ -250,12 +306,34 @@ func Compile(p *model.Profile, opt Options) (*Plan, []Warning, error) {
 		plan.Zones[i].Mark = markByTag[plan.Zones[i].EgressTag]
 	}
 	sort.Slice(plan.Zones, func(i, j int) bool { return plan.Zones[i].Name < plan.Zones[j].Name })
+
+	// Phase 1b: opt-in flow-offload for general (unmarked) traffic. Requires the caller to
+	// supply the offload devices (WAN+LAN) — the pure compiler never probes the host. Off
+	// by default → Flowtable stays nil → RenderNft output is unchanged.
+	switch opt.Offload {
+	case "sw", "hw":
+		if len(opt.OffloadDevices) > 0 {
+			devs := append([]string(nil), opt.OffloadDevices...)
+			sort.Strings(devs)
+			plan.Flowtable = &Flowtable{Devices: devs, HW: opt.Offload == "hw"}
+		} else {
+			warn("offload", "flow-offload requested but no devices supplied — skipped")
+		}
+	case "", "off":
+		// no offload
+	default:
+		warn("offload", "unknown offload mode "+opt.Offload+" (want off|sw|hw) — skipped")
+	}
 	return plan, warns, nil
 }
 
-// classifyCIDRs normalizes IP/CIDR strings into sorted v4 + v6 CIDR lists; non-IP
-// entries (e.g. domains) are returned in `bad`.
+// classifyCIDRs normalizes IP/CIDR strings into sorted, OVERLAP-FREE v4 + v6 CIDR lists;
+// non-IP entries (e.g. domains) are returned in `bad`. Overlapping/contained prefixes are
+// collapsed (see collapsePrefixes): the nft `flags interval` sets RenderNft emits have NO
+// auto-merge, so two overlapping elements (e.g. a copy-pasted ASN dump with 77.88.0.0/16
+// AND 77.88.55.0/24) would make `nft -f` reject the WHOLE ruleset and fail Apply.
 func classifyCIDRs(in []string) (v4, v6, bad []string) {
+	var p4, p6 []netip.Prefix
 	seen4, seen6 := map[string]bool{}, map[string]bool{}
 	for _, s := range in {
 		s = strings.TrimSpace(s)
@@ -285,18 +363,83 @@ func classifyCIDRs(in []string) (v4, v6, bad []string) {
 		if pfx.Addr().Is6() {
 			if !seen6[pfx.String()] {
 				seen6[pfx.String()] = true
-				v6 = append(v6, pfx.String())
+				p6 = append(p6, pfx)
 			}
 		} else {
 			if !seen4[pfx.String()] {
 				seen4[pfx.String()] = true
-				v4 = append(v4, pfx.String())
+				p4 = append(p4, pfx)
 			}
 		}
 	}
-	sort.Strings(v4)
-	sort.Strings(v6)
+	for _, p := range collapsePrefixes(p4) {
+		v4 = append(v4, p.String())
+	}
+	for _, p := range collapsePrefixes(p6) {
+		v6 = append(v6, p.String())
+	}
 	return v4, v6, bad
+}
+
+// collapsePrefixes drops every prefix wholly contained in another and returns the minimal
+// disjoint set, sorted by address. CIDR prefixes are hierarchical (any two are either
+// disjoint or one contains the other — they never partially overlap), so removing the
+// contained ones leaves a set with no overlaps, which is exactly what an nft `flags
+// interval` set (without auto-merge) requires. Behaviour-preserving: the union of matched
+// addresses is unchanged, only redundant overlapping entries are removed. O(n²) but n is
+// small (a routing list, not a full geoip table).
+func collapsePrefixes(in []netip.Prefix) []netip.Prefix {
+	// Broadest (smallest Bits) first so any covering prefix is already kept before the
+	// prefixes it contains are examined.
+	sort.Slice(in, func(i, j int) bool {
+		if in[i].Bits() != in[j].Bits() {
+			return in[i].Bits() < in[j].Bits()
+		}
+		return in[i].Addr().Less(in[j].Addr())
+	})
+	var kept []netip.Prefix
+	for _, p := range in {
+		covered := false
+		for _, q := range kept {
+			if q.Bits() <= p.Bits() && q.Contains(p.Addr()) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			kept = append(kept, p)
+		}
+	}
+	sort.Slice(kept, func(i, j int) bool {
+		if kept[i].Addr() != kept[j].Addr() {
+			return kept[i].Addr().Less(kept[j].Addr())
+		}
+		return kept[i].Bits() < kept[j].Bits()
+	})
+	return kept
+}
+
+// normalizeDomains lowercases, trims, de-dups, and drops obvious non-domain noise (comments,
+// entries with spaces, leading wildcards) from the non-IP entries of a list, producing the
+// domain set for a dnsmasq `ipset=` directive. dnsmasq matches a domain and every subdomain,
+// so a leading "*." / "." is stripped (youtube.com already covers www.youtube.com).
+func normalizeDomains(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		s = strings.ToLower(strings.TrimSpace(s))
+		s = strings.TrimPrefix(s, "*.")
+		s = strings.TrimPrefix(s, ".")
+		if s == "" || strings.ContainsAny(s, " \t#!/") || !strings.Contains(s, ".") {
+			continue
+		}
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // nftName makes an id safe to embed in an nft identifier.

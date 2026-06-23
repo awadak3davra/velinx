@@ -13,6 +13,7 @@ import (
 
 	"wakeroute/internal/clash"
 	"wakeroute/internal/kb"
+	"wakeroute/internal/netdiag"
 	"wakeroute/internal/store"
 )
 
@@ -130,9 +131,17 @@ func (m *Monitor) record(id, name, kind string, state State, latency int, now in
 	}
 }
 
-// probe runs the Clash delay test through proxy id, using testURL (the per-tunnel
-// health target) when set, else the monitor's default.
-func (m *Monitor) probe(ctx context.Context, id, testURL string) (State, int) {
+// probe checks a target's reachability. A native interface-backed endpoint
+// (AmneziaWG/WireGuard nwgN — iface set) is NOT a Clash proxy, so it is probed by
+// pinging through that kernel interface; everything else uses the Clash delay test
+// through proxy id (testURL = the per-tunnel health target, else the default).
+func (m *Monitor) probe(ctx context.Context, id, testURL, iface string) (State, int) {
+	if iface != "" {
+		if alive, ms := netdiag.ReachableViaIface(ctx, iface, "1.1.1.1", 3); alive {
+			return Alive, ms
+		}
+		return Down, 0
+	}
 	if m.clash == nil {
 		return Unknown, 0
 	}
@@ -150,7 +159,7 @@ func (m *Monitor) probe(ctx context.Context, id, testURL string) (State, int) {
 	return Unknown, 0
 }
 
-type target struct{ id, name, kind, testURL string }
+type target struct{ id, name, kind, testURL, iface string }
 
 func (m *Monitor) targets() []target {
 	p := m.store.Profile()
@@ -161,7 +170,8 @@ func (m *Monitor) targets() []target {
 			if e.Health != nil {
 				u = e.Health.URL
 			}
-			t = append(t, target{e.ID, e.Name, "endpoint", u})
+			iface, _ := e.Params["interface"].(string) // native-interface endpoints (nwgN)
+			t = append(t, target{e.ID, e.Name, "endpoint", u, iface})
 		}
 	}
 	for _, g := range p.Groups {
@@ -169,7 +179,7 @@ func (m *Monitor) targets() []target {
 		if g.Test != nil {
 			u = g.Test.URL
 		}
-		t = append(t, target{g.ID, g.Name, "group", u})
+		t = append(t, target{g.ID, g.Name, "group", u, ""})
 	}
 	return t
 }
@@ -209,7 +219,7 @@ func (m *Monitor) tick(ctx context.Context) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			st, lat := m.probe(tctx, tg.id, tg.testURL)
+			st, lat := m.probe(tctx, tg.id, tg.testURL, tg.iface)
 			m.record(tg.id, tg.name, tg.kind, st, lat, now)
 		}(tg)
 	}
@@ -319,7 +329,7 @@ func (m *Monitor) ProbeOne(ctx context.Context, id string) View {
 	}
 	tctx, cancel := context.WithTimeout(ctx, time.Duration(m.timeoutMS)*time.Millisecond+5*time.Second)
 	defer cancel()
-	st, lat := m.probe(tctx, id, tgt.testURL)
+	st, lat := m.probe(tctx, id, tgt.testURL, tgt.iface)
 	m.record(id, tgt.name, tgt.kind, st, lat, nowMS())
 	return m.viewWithCause(id)
 }
@@ -341,6 +351,31 @@ func (m *Monitor) Snapshot() []View {
 		views = append(views, v)
 	}
 	m.mu.Unlock()
+	// A group selector can't be Clash-delay-probed, so derive its health from its members:
+	// alive if any member endpoint is alive (or a "direct"/WAN member, always reachable) —
+	// otherwise the dashboard shows a failover group as a misleading "down".
+	stateByID := make(map[string]string, len(views))
+	for _, v := range views {
+		stateByID[v.ID] = v.State
+	}
+	for _, g := range m.store.Profile().Groups {
+		alive := false
+		for _, mem := range g.Members {
+			if mem == "direct" || stateByID[mem] == string(Alive) {
+				alive = true
+				break
+			}
+		}
+		for i := range views {
+			if views[i].ID == g.ID {
+				if alive {
+					views[i].State, views[i].Handshake = string(Alive), "ok"
+				} else {
+					views[i].State, views[i].Handshake = string(Down), "failed"
+				}
+			}
+		}
+	}
 	// causeFor scans the whole engine log and is identical for every down target,
 	// so compute it once per snapshot rather than re-scanning per down endpoint.
 	var cause, fix string

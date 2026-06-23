@@ -19,6 +19,7 @@ import (
 	"wakeroute/internal/config"
 	"wakeroute/internal/core"
 	"wakeroute/internal/health"
+	"wakeroute/internal/platform"
 	"wakeroute/internal/server"
 	"wakeroute/internal/serverstore"
 	"wakeroute/internal/store"
@@ -59,6 +60,13 @@ func main() {
 	if *demo {
 		cfg.Demo = true
 	}
+
+	// Runtime platform detection (D-PLAT-2: one universal binary, behavior chosen at
+	// runtime rather than per-platform builds). Informational today — the OpenWrt apply
+	// path (pbr/nft + sing-box) is unchanged. On Keenetic the native-first backend
+	// (internal/keenetic implementing platform.RoutingBackend) is what the apply path will
+	// select here once it is platform-routed; the backend itself is built + validated.
+	log.Printf("platform: %s", platform.Detect())
 
 	hub := traffic.NewHub(300)
 	sb := core.New(cfg.SingBox.Bin, cfg.SingBox.Config)

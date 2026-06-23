@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"wakeroute/internal/version"
 )
@@ -28,6 +30,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.singbox != nil {
 		resp.SingBox.Available = s.singbox.Available()
 		resp.SingBox.Running = s.singbox.Running()
+	}
+	// Monitor mode: the daemon doesn't manage sing-box, so Running() stays false even
+	// when sing-box is up independently and serving the Clash API (the same API that
+	// feeds the live traffic / top-talkers). If we can reach it, the core IS running —
+	// report that so the UI stops showing a false "core not running" while live stats flow.
+	if !resp.SingBox.Running && s.clash != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
+		if _, err := s.clash.Proxies(ctx); err == nil {
+			resp.SingBox.Running = true
+			resp.SingBox.Available = true
+		}
+		cancel()
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

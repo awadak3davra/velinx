@@ -251,12 +251,39 @@ func (s *Store) UpsertRoutingList(rl model.RoutingList) error {
 	defer s.mu.Unlock()
 	for i := range s.prof.RoutingLists {
 		if s.prof.RoutingLists[i].ID == rl.ID {
+			// Keep the system-managed CIDRCache consistent with CIDRSource across a user
+			// edit:
+			//   • source CHANGED → the old cache is stale → drop it unconditionally (even
+			//     if the incoming struct still carries it, e.g. a UI GET→edit→PUT round-trip
+			//     that echoed back the old cidr_cache) — the refresh loop repopulates it;
+			//   • source UNCHANGED but the edit omitted the cache → preserve the existing
+			//     value the UI didn't send back.
+			switch {
+			case rl.CIDRSource != s.prof.RoutingLists[i].CIDRSource:
+				rl.CIDRCache = nil
+			case len(rl.CIDRCache) == 0:
+				rl.CIDRCache = s.prof.RoutingLists[i].CIDRCache
+			}
 			s.prof.RoutingLists[i] = rl
 			return s.saveLocked()
 		}
 	}
 	s.prof.RoutingLists = append(s.prof.RoutingLists, rl)
 	return s.saveLocked()
+}
+
+// SetRoutingListCache replaces a routing list's system-managed CIDRCache (the last-good
+// result of fetching its CIDRSource — see the auto-refresh loop). Atomic + persisted.
+func (s *Store) SetRoutingListCache(id string, cidrs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.prof.RoutingLists {
+		if s.prof.RoutingLists[i].ID == id {
+			s.prof.RoutingLists[i].CIDRCache = cidrs
+			return s.saveLocked()
+		}
+	}
+	return fmt.Errorf("routing list %q not found", id)
 }
 
 // DeleteRoutingList removes a routing list by ID.

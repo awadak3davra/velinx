@@ -65,6 +65,34 @@ func StreamPing(ctx context.Context, emit func(string), host, iface string, coun
 	streamCmd(ctx, emit, "ping", append(args, host)...)
 }
 
+var pingMsRe = regexp.MustCompile(`time[=<]([0-9.]+)`)
+
+// ReachableViaIface sends ONE ICMP echo to host bound to a kernel interface
+// (`ping -I <iface>`) and reports whether a reply came back + the round-trip ms.
+// This is how the health monitor probes native interface-backed endpoints
+// (AmneziaWG/WireGuard nwgN) that are NOT sing-box outbounds, so the Clash delay
+// test cannot see them. Returns (false,0) on a bad iface/target or no reply.
+func ReachableViaIface(ctx context.Context, iface, host string, timeoutS int) (bool, int) {
+	if !ValidIface(iface) || !ValidTarget(host) {
+		return false, 0
+	}
+	if timeoutS < 1 || timeoutS > 10 {
+		timeoutS = 3
+	}
+	// 3 echoes, alive if ANY replies — tolerant of single-packet loss (a 1-packet probe flaps).
+	out, err := exec.CommandContext(ctx, "ping", "-c", "3", "-W", strconv.Itoa(timeoutS), "-I", iface, host).CombinedOutput()
+	if err != nil {
+		return false, 0
+	}
+	ms := 0
+	if m := pingMsRe.FindStringSubmatch(string(out)); len(m) == 2 {
+		if f, e := strconv.ParseFloat(m[1], 64); e == nil {
+			ms = int(f)
+		}
+	}
+	return true, ms
+}
+
 // StreamTraceroute emits each hop line as it completes (up to maxHops). When iface
 // is valid the trace is bound to it (`traceroute -i <iface>`).
 func StreamTraceroute(ctx context.Context, emit func(string), host, iface string, maxHops int) {

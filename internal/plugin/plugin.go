@@ -43,6 +43,10 @@ func NativeConfig(e model.Endpoint, socksPort int) (string, string, error) {
 		return awgConfig(e), e.ID + ".conf", nil
 	case model.EngineOlcRTC:
 		return olcConfig(e, socksPort), e.ID + ".yaml", nil
+	case model.EngineNfqws:
+		// nfqws2 is argv-driven (no config file); the joined args are the "config" used for
+		// change detection, and start() spawns the process from nfqwsArgs(e) directly.
+		return strings.Join(nfqwsArgs(e), " "), e.ID + ".nfqws", nil
 	default:
 		return "", "", fmt.Errorf("no native config for engine %q", e.Engine)
 	}
@@ -177,7 +181,9 @@ type proc struct {
 	config   string // last rendered config (to detect changes)
 	cfgPath  string
 	iface    string        // AmneziaWG: the kernel interface we created (for teardown)
-	cmd      *exec.Cmd     // long-running (olcRTC)
+	binName  string        // engine binary to (re)resolve for a supervised long-running proc (olcRTC/nfqws2)
+	runArgs  []string      // argv after the binary, for (re)launch
+	cmd      *exec.Cmd     // long-running (olcRTC/nfqws2)
 	done     chan struct{} // closed when cmd exits (nil for one-shot awg-quick)
 	running  bool
 	needsBin bool
@@ -269,15 +275,24 @@ func (m *Manager) start(id string, s Spec) *proc {
 			p.needsBin = true
 			return p
 		}
-		cmd := exec.Command(bin, "-config", p.cfgPath) // exact flag confirmed on-device
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		if err := cmd.Start(); err != nil {
+		p.binName, p.runArgs = "olcrtc", []string{"-config", p.cfgPath} // exact flag confirmed on-device
+		if err := launchProc(p, bin); err != nil {
 			p.reason = "start olcrtc: " + err.Error()
 			return p
 		}
-		p.cmd, p.running, p.managed = cmd, true, true
-		p.done = make(chan struct{})
-		go func(c *exec.Cmd, done chan struct{}) { _ = c.Wait(); close(done) }(cmd, p.done)
+	case model.EngineNfqws:
+		bin, ok := m.resolve("nfqws2")
+		if !ok {
+			p.needsBin = true
+			return p
+		}
+		// nfqws2 listens on the NFQUEUE; the iptables divert that feeds it is the `desync` routing
+		// target (kernel-PBR), applied separately. Supervised long-running, like olcRTC.
+		p.binName, p.runArgs = "nfqws2", nfqwsArgs(s.Endpoint)
+		if err := launchProc(p, bin); err != nil {
+			p.reason = "start nfqws2: " + err.Error()
+			return p
+		}
 	case model.EngineAmneziaWG:
 		iface, err := m.awgUp(s.Endpoint, cfg)
 		if err != nil {
@@ -415,8 +430,8 @@ func pluginBackoffTicks(restarts int) int {
 	return pluginMaxCooldown
 }
 
-// Supervise restarts any long-running plugin process (olcRTC) that has crashed,
-// re-launching it from its already-written config file, with crash-loop backoff
+// Supervise restarts any long-running plugin process (olcRTC, nfqws2) that has crashed,
+// re-launching it from its stored binName + runArgs, with crash-loop backoff
 // (see pluginBackoffTicks) so a plugin that dies every tick is throttled rather
 // than relaunched ~20x/min (each relaunch would spam the router log). AmneziaWG
 // uses a one-shot `awg-quick up` (interface, not a process), so it is left to M7
@@ -425,8 +440,8 @@ func (m *Manager) Supervise() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, p := range m.procs {
-		// Only launched olcRTC procs are supervised here (AmneziaWG is one-shot;
-		// needs_binary / failed-initial-start procs were never managed).
+		// Only launched long-running procs (olcRTC/nfqws2) are supervised here (AmneziaWG is
+		// one-shot; needs_binary / failed-initial-start procs were never managed).
 		if !p.managed {
 			continue
 		}
@@ -444,36 +459,46 @@ func (m *Manager) Supervise() {
 		// surface the throttled state so the UI doesn't read it as merely idle.
 		if p.cooldown > 0 {
 			p.cooldown--
-			p.reason = fmt.Sprintf("olcrtc crash-looping; backing off (restart #%d)", p.restarts)
+			p.reason = fmt.Sprintf("%s crash-looping; backing off (restart #%d)", p.binName, p.restarts)
 			continue
 		}
-		m.relaunchOlc(p)
+		m.relaunchProc(p)
 	}
 }
 
-// relaunchOlc re-spawns a managed olcRTC proc from its on-disk config and arms the
-// next backoff window. A binary that has vanished degrades the proc to needs_binary
-// and drops it from supervision (a later re-Apply re-creates and re-resolves it);
-// a failed Start is throttled like a crash so it keeps retrying without log spam.
-func (m *Manager) relaunchOlc(p *proc) {
-	bin, ok := m.resolve("olcrtc")
+// launchProc spawns a supervised long-running engine process (bin + p.runArgs), wires the
+// exit-tracking goroutine, and marks the proc running+managed. Shared by olcRTC and nfqws2. On a
+// Start error it leaves the proc not-running (the caller sets reason) — never running on failure.
+func launchProc(p *proc, bin string) error {
+	cmd := exec.Command(bin, p.runArgs...)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	p.cmd, p.running, p.managed = cmd, true, true
+	p.done = make(chan struct{})
+	go func(c *exec.Cmd, done chan struct{}) { _ = c.Wait(); close(done) }(cmd, p.done)
+	return nil
+}
+
+// relaunchProc re-spawns a managed long-running proc (olcRTC/nfqws2) from its stored binName +
+// runArgs and arms the next backoff window. A binary that has vanished degrades the proc to
+// needs_binary and drops it from supervision (a later re-Apply re-creates and re-resolves it); a
+// failed Start is throttled like a crash so it keeps retrying without log spam.
+func (m *Manager) relaunchProc(p *proc) {
+	bin, ok := m.resolve(p.binName)
 	if !ok {
 		p.needsBin = true
 		p.managed = false
 		return
 	}
-	cmd := exec.Command(bin, "-config", p.cfgPath)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	p.restarts++
 	p.cooldown = pluginBackoffTicks(p.restarts)
-	if err := cmd.Start(); err != nil {
-		p.reason = "restart olcrtc: " + err.Error()
+	if err := launchProc(p, bin); err != nil {
+		p.reason = "restart " + p.binName + ": " + err.Error()
 		return
 	}
 	p.reason = ""
-	p.cmd, p.running = cmd, true
-	p.done = make(chan struct{})
-	go func(c *exec.Cmd, done chan struct{}) { _ = c.Wait(); close(done) }(cmd, p.done)
 }
 
 // resolve finds an engine binary in binDir, then on PATH.

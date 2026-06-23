@@ -545,10 +545,27 @@ func (s *Server) genOptionsWithPlan(p *model.Profile, c config.Config) (generato
 		TunMTU:      c.GatewayMTU,
 		TunAddr:     c.GatewayAddr,
 	}
-	if s.routingMode(c) != "hybrid" || p == nil {
+	mode := s.routingMode(c)
+	if (mode != "hybrid" && mode != "fast") || p == nil {
 		return opts, nil
 	}
-	plan, _, err := pbr.Compile(p, pbr.Options{})
+	// Phase 1b flow-offload applies to "fast" only: it accelerates the GENERAL kernel
+	// fast-path, which exists only in fast mode. In hybrid, general traffic transits the
+	// capture-all TUN (there is no LAN↔WAN flow to offload), so offload is left off there.
+	pbrOpts := pbr.Options{}
+	if mode == "fast" {
+		pbrOpts.Offload = c.Offload
+		devs := c.OffloadDevices
+		// Auto-discover the WAN+LAN devices when offload is requested without an explicit
+		// list. Gated so the host probe runs ONLY in the opt-in case (never in demo/tests):
+		// offload set + no devices given + not demo. The probe is best-effort (empty on a
+		// non-router host → Compile skips offload + warns).
+		if (c.Offload == "sw" || c.Offload == "hw") && len(devs) == 0 && !c.Demo {
+			devs = probeOffloadDevices()
+		}
+		pbrOpts.OffloadDevices = devs
+	}
+	plan, _, err := pbr.Compile(p, pbrOpts)
 	if err != nil {
 		// Fail-safe: never emit a half-hybrid config that excludes CIDRs nothing routes.
 		// Fall back to the non-hybrid (TUN) shape and return no plan — both planes agree
@@ -558,6 +575,17 @@ func (s *Server) genOptionsWithPlan(p *model.Profile, c config.Config) (generato
 		return opts, nil
 	}
 	opts.Hybrid = true
+	if mode == "fast" {
+		// "fast": no capture-all TUN. General LAN traffic stays on the kernel fast-path
+		// (no userspace-TUN tax → near-line-rate); ONLY the pbr kernel plane (IP/CIDR
+		// carve-outs like TG-calls/VoWiFi) steers LAN traffic via fwmark. Domain carve-outs
+		// are inactive for LAN here (no TUN to sniff them) — they'd only affect the local
+		// mixed-proxy inbound. No route_exclude needed (there is no TUN to exclude from);
+		// the plan is still returned so handleApply installs the kernel routes. Phase 1b
+		// will additionally enable HW flow-offload (excluding carve-out marks).
+		opts.TunEnabled = false
+		return opts, plan
+	}
 	opts.TunEnabled = true // hybrid always keeps the TUN, regardless of c.Gateway
 	// Exclude the CIDRs the kernel plane routes — every zone EXCEPT blackhole — plus
 	// the anti-loop bypass (peer server IPs). Block stays in the sing-box reject plane

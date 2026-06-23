@@ -14,6 +14,7 @@ import (
 	"wakeroute/internal/model"
 	"wakeroute/internal/netdiag"
 	"wakeroute/internal/serverstore"
+	"wakeroute/internal/updater"
 	"wakeroute/internal/util"
 )
 
@@ -459,6 +460,191 @@ func (s *Server) runLockdown(job *initserver.Job, b hardenReq) {
 	job.OK("password auth disabled, pubkey enforced")
 	_ = s.servers.Patch(b.ServerID, func(sv *serverstore.Server) { sv.Hardened = true; sv.LastJob = job.ID() })
 	job.Finish(true, map[string]any{"hardened": true})
+}
+
+// ---- per-server binary versions (check + update) ----
+
+// serverBinUpdateReq is a hardenReq (creds + server_id) plus the binary to update.
+type serverBinUpdateReq struct {
+	hardenReq
+	Binary  string `json:"binary"`  // singbox | awg
+	Version string `json:"version"` // target x.y.z (required for github-managed)
+	Confirm bool   `json:"confirm"` // explicit gate (update is destructive)
+}
+
+// handleServerCheckVersions probes a provisioned server's binary versions over SSH
+// (read-only) and compares the GitHub-managed ones to the latest release.
+func (s *Server) handleServerCheckVersions(w http.ResponseWriter, r *http.Request) {
+	var b hardenReq
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !s.resolveHardenTarget(&b) {
+		writeErr(w, http.StatusBadRequest, "host and SSH user are required")
+		return
+	}
+	job := s.jobs.New("check-versions", b.ServerID)
+	go s.runCheckVersions(job, b)
+	writeJSON(w, http.StatusOK, map[string]any{"job_id": job.ID()})
+}
+
+func (s *Server) runCheckVersions(job *initserver.Job, b hardenReq) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	job.Start("Read installed versions on " + b.Host)
+	if s.config().Demo {
+		time.Sleep(400 * time.Millisecond)
+		job.OK("read sing-box + AmneziaWG (simulated)")
+		job.Finish(true, map[string]any{"binaries": demoServerBinaries(), "arch": "x86_64"})
+		return
+	}
+	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key}
+	out, ran, err := initserver.Provision(ctx, creds, initserver.VersionCheckScript())
+	if !ran {
+		job.Fail("version check needs the ssh client on the router", "Install ssh (and sshpass for password auth), or check manually with `sing-box version`.")
+		job.Finish(false, nil)
+		return
+	}
+	if err != nil || !initserver.VerCheckRan(out) {
+		job.Output(tail(redactSecrets(out), 800))
+		job.Fail("couldn't read versions over SSH", "Verify the credentials and that the server is reachable.")
+		job.Finish(false, nil)
+		return
+	}
+	found := initserver.ExtractVersions(out)
+	binaries := s.resolveBinaryVersions(ctx, found)
+	if len(binaries) == 0 {
+		job.OK("no managed binaries found on the server")
+	} else {
+		job.OK(versionsSummary(binaries))
+	}
+	_ = s.servers.Patch(b.ServerID, func(sv *serverstore.Server) { sv.LastJob = job.ID() })
+	job.Finish(true, map[string]any{"binaries": binaries, "arch": found["arch"]})
+}
+
+// resolveBinaryVersions turns the raw probe markers into UI rows: parsed installed
+// version + (for GitHub-managed binaries) the latest release + an update flag.
+func (s *Server) resolveBinaryVersions(ctx context.Context, found map[string]string) []map[string]any {
+	rows := make([]map[string]any, 0, len(initserver.ServerBinaries))
+	for _, b := range initserver.ServerBinaries {
+		raw, ok := found[b.Key]
+		if !ok {
+			continue // not installed on this server
+		}
+		installed := updater.ParseVersion(raw)
+		if installed == "" {
+			installed = strings.TrimSpace(raw)
+		}
+		row := map[string]any{"key": b.Key, "name": b.Name, "managed": b.Managed, "installed": installed}
+		if b.Managed == "github" && b.Repo != "" {
+			if rel, err := s.updater.Latest(ctx, updater.Engine{Repo: b.Repo}); err == nil && rel.Tag != "" {
+				row["latest"] = updater.ParseVersion(rel.Tag)
+				row["latest_tag"] = rel.Tag
+				row["update_available"] = updater.Newer(raw, rel.Tag)
+			} else {
+				row["latest_error"] = "couldn't reach GitHub"
+			}
+		} else {
+			row["note"] = "managed by apt — Update runs an apt upgrade"
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// handleServerUpdateBinary updates one binary on a provisioned server over SSH.
+// DESTRUCTIVE (briefly restarts the endpoint) — gated behind an explicit confirm.
+func (s *Server) handleServerUpdateBinary(w http.ResponseWriter, r *http.Request) {
+	var b serverBinUpdateReq
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !s.resolveHardenTarget(&b.hardenReq) {
+		writeErr(w, http.StatusBadRequest, "host and SSH user are required")
+		return
+	}
+	if _, ok := initserver.UpdateScriptFor(b.Binary, b.Version); !ok {
+		writeErr(w, http.StatusBadRequest, "unknown binary")
+		return
+	}
+	if b.Binary == "singbox" && updater.ParseVersion(b.Version) == "" {
+		writeErr(w, http.StatusBadRequest, "a target version (x.y.z) is required for sing-box")
+		return
+	}
+	if !b.Confirm && !s.config().Demo {
+		writeErr(w, http.StatusBadRequest, "update must be explicitly confirmed")
+		return
+	}
+	job := s.jobs.New("update-binary", b.ServerID)
+	go s.runUpdateServerBinary(job, b)
+	writeJSON(w, http.StatusOK, map[string]any{"job_id": job.ID()})
+}
+
+func (s *Server) runUpdateServerBinary(job *initserver.Job, b serverBinUpdateReq) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	name := b.Binary
+	for _, sb := range initserver.ServerBinaries {
+		if sb.Key == b.Binary {
+			name = sb.Name
+		}
+	}
+	job.Start("Update " + name + " on " + b.Host)
+	if s.config().Demo {
+		time.Sleep(600 * time.Millisecond)
+		job.OK(name + " updated" + verSuffix(b.Version) + " (simulated)")
+		job.Finish(true, map[string]any{"binary": b.Binary, "new_version": updater.ParseVersion(b.Version)})
+		return
+	}
+	script, _ := initserver.UpdateScriptFor(b.Binary, b.Version)
+	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key}
+	job.Logf("the current binary is backed up as <path>.wakeroute.bak on the server before the swap")
+	out, ran, err := initserver.Provision(ctx, creds, script)
+	if !ran {
+		job.Fail("update needs the ssh client on the router", "Install ssh, or update the binary on the server manually.")
+		job.Finish(false, nil)
+		return
+	}
+	okUp, newVer := initserver.UpdateConfirmed(out)
+	if err != nil || !okUp {
+		job.Output(tail(redactSecrets(out), 1200))
+		job.Fail("the update did not confirm success", "The service may not have restarted; a .wakeroute.bak of the old binary is on the server. Review the output.")
+		job.Finish(false, nil)
+		return
+	}
+	job.OK(name + " → " + updater.ParseVersion(newVer))
+	_ = s.servers.Patch(b.ServerID, func(sv *serverstore.Server) { sv.LastJob = job.ID() })
+	job.Finish(true, map[string]any{"binary": b.Binary, "new_version": updater.ParseVersion(newVer)})
+}
+
+// versionsSummary is the one-line step result for a version check.
+func versionsSummary(binaries []map[string]any) string {
+	upd := 0
+	for _, b := range binaries {
+		if v, _ := b["update_available"].(bool); v {
+			upd++
+		}
+	}
+	if upd == 0 {
+		return fmt.Sprintf("%d binary(ies) checked — all up to date", len(binaries))
+	}
+	return fmt.Sprintf("%d binary(ies) checked — %d update(s) available", len(binaries), upd)
+}
+
+func verSuffix(v string) string {
+	if x := updater.ParseVersion(v); x != "" {
+		return " → " + x
+	}
+	return ""
+}
+
+func demoServerBinaries() []map[string]any {
+	return []map[string]any{
+		{"key": "singbox", "name": "sing-box", "managed": "github", "installed": "1.12.8", "latest": "1.12.17", "latest_tag": "v1.12.17", "update_available": true},
+		{"key": "awg", "name": "AmneziaWG", "managed": "apt", "installed": "1.0.20240306", "note": "managed by apt — Update runs an apt upgrade"},
+	}
 }
 
 // ---- helpers ----

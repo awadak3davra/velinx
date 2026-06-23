@@ -62,6 +62,32 @@ Then open `http://192.168.1.1:8088` (substitute your router's LAN address).
 make package                                   # same, on a Unix build host
 ```
 
+## Security
+
+`wakeroute` is a **router admin panel**: it binds `:8088` on all interfaces (so it is
+reachable from your LAN) and is **unauthenticated by design**. The trust boundary is the
+**LAN** — anyone who can already reach the router's LAN is treated as an operator, the same
+assumption stock router admin UIs make.
+
+> [!IMPORTANT]
+> **Do not expose `:8088` to the internet.** It has no login and returns secrets (keys,
+> credentials) to its own UI for editing. If you need remote access, reach the router over a
+> VPN, or front the panel with authentication + TLS (e.g. a reverse proxy) — the panel itself
+> assumes a trusted LAN.
+
+Within that model the daemon still hardens against the realistic LAN-adjacent attacks (a
+malicious page open in a LAN browser, request forgery, resource exhaustion):
+
+- **SSRF guard** on subscription fetches — a user-supplied URL can't be turned into a request
+  against the router's own control API, other LAN hosts, or cloud metadata.
+- **Same-origin (CSRF) guard** — state-changing requests with a cross-origin `Origin`/`Referer`
+  are rejected, so another site can't drive Apply / Rollback / Restart through your browser.
+- **Request-body cap** — bounds memory so one oversized request can't OOM a low-RAM router.
+- **Security headers + CSP** — `X-Frame-Options`/`frame-ancestors` (anti-clickjacking),
+  `nosniff`, `Referrer-Policy`, and `script-src 'self'` (anti-XSS).
+- **Optional Host allow-list** — set `allowed_hosts` in the config to pin which Host header
+  values are served (a DNS-rebinding defense); empty (the default) allows any.
+
 ## CI / Releases
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) runs on every push/PR: `go vet` + `go test -race`,

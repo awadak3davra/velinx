@@ -73,16 +73,41 @@ type Config struct {
 	GatewayAddr string `json:"gateway_address,omitempty"` // TUN host address/CIDR when gateway=true ("" → 172.19.0.1/30); not the LAN subnet (auto_route excludes it).
 	// RoutingMode selects the routing architecture (see docs/ARCHITECTURE_NATIVE_FIRST.md):
 	//   "" (default) → derive from Gateway (back-compat); "tun" → all traffic via the sing-box TUN;
-	//   "hybrid" → kernel PBR for WG/AmneziaWG/WAN/block + carve-outs, sing-box only for obfuscation
-	//   protocols (Reality/Hysteria2/TUIC/…); "mixed" → no TUN, sing-box mixed-proxy only.
-	RoutingMode  string       `json:"routing_mode,omitempty"`
-	Ports        Ports        `json:"ports"`
-	Clash        Clash        `json:"clash"`
-	SingBox      SingBox      `json:"singbox"`
-	Updater      Updater      `json:"updater"`
-	FailSafe     FailSafe     `json:"failsafe"`
-	Watchdog     Watchdog     `json:"watchdog"`
-	Subscription Subscription `json:"subscription"`
+	//   "hybrid" → capture-all TUN + kernel PBR for IP/CIDR carve-outs (general traffic still
+	//   transits the userspace TUN — domain carve-outs work but throughput is CPU-bound);
+	//   "fast" → like hybrid BUT with NO capture-all TUN: general traffic stays on the kernel
+	//   fast-path (no userspace tax → near-line-rate), only IP/CIDR carve-outs are kernel-PBR'd
+	//   (TG-calls/VoWiFi etc.); domain carve-outs are INACTIVE for LAN traffic in this mode
+	//   (no TUN to sniff them) — a Phase-2 DNS→nftset bridge would restore them. flow_offloading
+	//   is left as-is in Phase 1 (Phase 1b enables HW offload with carve-out-mark exclusion);
+	//   "mixed" → no TUN, sing-box mixed-proxy only (no kernel PBR).
+	RoutingMode string `json:"routing_mode,omitempty"`
+	// Offload enables Phase-1b kernel flow-offload for GENERAL traffic in "fast" mode (a
+	// no-op in other modes): "" / "off" (default) → none; "sw" → software flowtable; "hw"
+	// → also hardware PPE (`flags offload`). Carve-out flows (TG-calls/VoWiFi/RU — any
+	// owned fwmark) are EXCLUDED so their per-packet PBR, and the UDP calls it carries,
+	// keep working (see docs/ARCHITECTURE_NATIVE_FIRST.md "Phase 1a/1b"). Deploy-gated —
+	// validate TG/VoWiFi survive before relying on it.
+	Offload string `json:"offload,omitempty"`
+	// OffloadDevices are the netdevs flow-offload attaches to (the WAN uplink + LAN bridge,
+	// e.g. ["wan","br-lan"]); awg* tunnels are intentionally absent (carve-out traffic must
+	// not be offloaded). Empty → offload is skipped (a future auto-probe will fill these
+	// from the default route + br-lan).
+	OffloadDevices []string     `json:"offload_devices,omitempty"`
+	Ports          Ports        `json:"ports"`
+	Clash          Clash        `json:"clash"`
+	SingBox        SingBox      `json:"singbox"`
+	Updater        Updater      `json:"updater"`
+	FailSafe       FailSafe     `json:"failsafe"`
+	Watchdog       Watchdog     `json:"watchdog"`
+	Subscription   Subscription `json:"subscription"`
+	// AllowedHosts, when non-empty, restricts which Host header values the panel
+	// will serve (host-only, port-stripped, case-insensitive) — a DNS-rebinding
+	// defense (see docs/SECURITY.md). EMPTY (the default) allows any Host, so this
+	// changes nothing until an operator opts in by listing the names/IPs they use
+	// to reach the panel, e.g. ["192.168.2.1","10.0.0.30","router.lan"]. Misconfig
+	// locks out the UI (recoverable: clear it in config.json + restart).
+	AllowedHosts []string `json:"allowed_hosts,omitempty"`
 
 	path string // source file, used by Save()
 }

@@ -12,7 +12,7 @@
 <input type="checkbox" id="navtoggle" class="nav-toggle" aria-hidden="true">
 <label for="navtoggle" class="nav-scrim" aria-hidden="true"></label>
 <div class="app">
-  <aside class="sidebar" onclick="if(event.target.closest('.nav-item')){var t=document.getElementById('navtoggle');if(t)t.checked=false;}">
+  <aside class="sidebar">
     <div class="brand">
       <div class="logo">wr</div>
       <div>
@@ -21,7 +21,7 @@
       </div>
     </div>
     <div class="nav-item" data-page="dashboard"><span class="ico">▤</span> Dashboard</div>
-    <div class="nav-item" data-page="server"><span class="ico">⊕</span> Init Server</div>
+    <div class="nav-item" data-page="server"><span class="ico">⊕</span> Set up Server</div>
     <div class="nav-item" data-page="connections"><span class="ico">⇄</span> Connections</div>
     <div class="nav-item" data-page="failover"><span class="ico">⛃</span> Failover</div>
     <div class="nav-item" data-page="routing"><span class="ico">⋔</span> Routing</div>
@@ -48,6 +48,7 @@
 
 <div class="toasts" id="toasts"></div>
 <script src="i18n.js"></script>
+<script src="nav.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -17,6 +17,12 @@ const (
 	// NOT manage (e.g. a UCI/netifd-brought-up awg0/awg1). It becomes a sing-box
 	// `direct` outbound bound to params["interface"]; no tunnel is created.
 	EngineExternal Engine = "external"
+	// EngineNfqws is the DPI-desync engine (nfqws2): a long-running process on a
+	// netfilter NFQUEUE that mangles handshake packets in place so the DPI can't
+	// block them. Unlike every other engine it provides NO egress — traffic stays on
+	// the DIRECT path; the `desync` routing target installs the NFQUEUE divert
+	// separately. See docs/ARCHITECTURE_DESYNC.md.
+	EngineNfqws Engine = "nfqws"
 )
 
 // Protocol is the wire protocol of an endpoint.
@@ -135,8 +141,19 @@ type RoutingList struct {
 	Manual       []string `json:"manual,omitempty"`        // user-entered domains/IPs (inline rule-set)
 	Outbound     string   `json:"outbound"`                // route matched traffic here: endpoint/group id | "direct" | "block"
 	DownloadVia  string   `json:"download_via,omitempty"`  // outbound used to FETCH the URL (sing-box download_detour); "" = direct
-	RefreshHours int      `json:"refresh_hours,omitempty"` // remote update_interval in hours; 0 = default (24h)
+	RefreshHours int      `json:"refresh_hours,omitempty"` // remote update_interval in hours; 0 = default (24h); also the CIDRSource auto-refresh cadence
 	Enabled      bool     `json:"enabled"`
+	// CIDRSource auto-populates this list's KERNEL CIDRs from a feed so a hybrid/fast
+	// carve-out self-maintains instead of relying on a frozen Manual list. Scheme:
+	// "https://…"/"http://…" → a plain-text CIDR feed; "asn:13238,47541,…" → RIPEstat
+	// announced-prefixes per ASN. Distinct from Source (a sing-box domain rule_set, which
+	// is inactive for LAN traffic in fast mode). Empty → no auto-refresh. Cadence reuses
+	// RefreshHours. See docs/ARCHITECTURE_NATIVE_FIRST.md "RU / remote CIDR auto-refresh".
+	CIDRSource string `json:"cidr_source,omitempty"`
+	// CIDRCache is the last-good result of fetching CIDRSource (system-managed, persisted
+	// so a fetch failure or restart keeps the carve-out). The kernel zone = Manual ∪
+	// CIDRCache. Not user-edited; the refresh loop maintains it.
+	CIDRCache []string `json:"cidr_cache,omitempty"`
 }
 
 // Profile is the whole user configuration.

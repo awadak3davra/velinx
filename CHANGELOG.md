@@ -3,6 +3,33 @@
 All notable changes to WakeRoute are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0]
+
+### Added
+- **Keenetic kernel-PBR backend** — native iptables + ipset policy routing for KeeneticOS
+  routers (which ship no nftables), compiled from the same routing model as the OpenWrt path:
+  `hash:net` ipsets, mangle fwmark marking, per-list `ip rule`/`ip route` tables, a 1-minute
+  **load-independent failover cron** (RX-counter → WireGuard-handshake → ICMP liveness, with
+  miss-hysteresis so a transient probe miss can't flap a list onto the WAN), a `netfilter.d`
+  re-assert hook, and a scripted cutover/rollback that leaves the default path untouched.
+- **Summarise live connections by destination IP** — each remote IP groups the ports it used,
+  with per-port byte counts on hover.
+- **DPI-desync engine (nfqws2)** — supervised as a long-running plugin (groundwork for a
+  direct-path desync routing target).
+
+### Fixed
+- **Per-exit reachability test** now probes native kernel tunnels iface-bound
+  (`curl --interface`) instead of only through the proxy core, so AmneziaWG/WireGuard exits
+  report reachability correctly — with an **SSRF guard** (internal/metadata targets refused,
+  the resolved public IP pinned to defeat DNS-rebind) and IPv4 preference so a v6-first host
+  isn't a false negative.
+- **Monitor mode** — detect an independently-running proxy core via the Clash API, so the UI
+  no longer shows "core not running" while live traffic is flowing.
+- **Kernel-plane forwarding correctness** — NAT forwarded LAN traffic on every failover-member
+  tunnel; keep LAN/private-destination replies on the main routing table (so a re-marked reply
+  can't loop back out the tunnel); and wire a symmetric IPv6 datapath so a marked v6 packet
+  routes through the tunnel instead of leaking to the WAN.
+
 ## [0.2.0]
 
 ### Added
@@ -34,6 +61,25 @@ All notable changes to WakeRoute are documented here. This project adheres to
 
 ### Fixed
 - Numerous generator and config round-trip fixes.
+
+### Security
+- **Same-origin (CSRF) guard** — state-changing requests carrying a cross-origin
+  `Origin`/`Referer` are rejected, so another site open in a LAN browser can't drive
+  Apply / Rollback / Restart through the panel.
+- **Anti-clickjacking + hardening headers** on every response — `X-Frame-Options: DENY`
+  and a `frame-ancestors 'none'` CSP, plus `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy: no-referrer`.
+- **Content-Security-Policy `script-src 'self'`** — neutralises injected/reflected scripts
+  (the bundled UI loads only same-origin scripts).
+- **Request-body size cap** — bounds memory so one oversized request can't OOM a low-RAM
+  router and take the proxy core down with it.
+- **SSRF guard** on subscription fetches — a user-supplied URL can't be turned into a
+  request against the router's own control API, other LAN hosts or cloud metadata.
+- **Optional Host allow-list** (`allowed_hosts`, Settings → Security) — pin which Host
+  headers the panel serves, as a DNS-rebinding defense; empty (default) allows any.
+- See the **Security** section of the README for the trust model. The panel is
+  unauthenticated and LAN-trust by design — do not expose `:8088` to the internet without
+  fronting it with authentication + TLS.
 
 ## [0.1.0] — Initial public release
 

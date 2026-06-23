@@ -110,6 +110,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/routing/{id}", s.handleDeleteRoutingList)
 	mux.HandleFunc("GET /api/routing/catalog", s.handleRoutingCatalog)
 	mux.HandleFunc("GET /api/routing/status", s.handleRoutingStatus)
+	mux.HandleFunc("POST /api/routing/refresh", s.handleRoutingRefresh)
 	mux.HandleFunc("POST /api/generate", s.handleGenerate)
 	mux.HandleFunc("POST /api/apply", s.handleApply)
 	// Share / QR / subscription (export connections to client apps).
@@ -125,6 +126,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/watchdog", s.handleWatchdog)
 	mux.HandleFunc("GET /api/system", s.handleSystem)
 	mux.HandleFunc("GET /api/connections", s.handleConnections)
+	mux.HandleFunc("GET /api/conntrack", s.handleConntrack)
 	mux.HandleFunc("GET /api/exit-ip", s.handleExitIP)
 	mux.HandleFunc("GET /api/pbr/preview", s.handlePBRPreview)
 
@@ -149,6 +151,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/server/provision", s.handleServerProvision)
 	mux.HandleFunc("POST /api/server/harden/keys", s.handleServerHardenKeys)
 	mux.HandleFunc("POST /api/server/harden/lockdown", s.handleServerLockdown)
+	mux.HandleFunc("POST /api/server/check-versions", s.handleServerCheckVersions)
+	mux.HandleFunc("POST /api/server/update-binary", s.handleServerUpdateBinary)
 
 	// Config (Settings).
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
@@ -167,6 +171,10 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/api/clash/", s.clash.Proxy("/api/clash"))
 	}
 	mux.Handle("/", s.staticHandler())
-	// Outer-to-inner: access log (sees final status) -> gzip -> routes.
-	return logRequests(gzipMiddleware(mux))
+	// Outer-to-inner: Host allow-list (DNS-rebinding guard; opt-in, no-op when
+	// unset) -> security headers (set on every reply) -> access log (sees final
+	// status) -> gzip -> same-origin (CSRF) guard on mutating methods ->
+	// request-body size cap -> routes.
+	chain := securityHeaders(logRequests(gzipMiddleware(sameOriginGuard(limitBody(mux)))))
+	return hostAllowGuard(s.config().AllowedHosts, chain)
 }

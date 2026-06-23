@@ -49,14 +49,18 @@ var exitIPEchos = []string{
 	"https://icanhazip.com",
 }
 
-// handleExitIP returns the public IP the active proxy egresses from. Requires
-// sing-box running; degrades to {available:false} otherwise (e.g. demo / down /
-// all echoes unreachable) so the hero shows nothing rather than a stale/false IP.
+// handleExitIP returns the public IP the active proxy egresses from. It works
+// both when WakeRoute MANAGES sing-box (probe through the local mixed proxy) and
+// in MONITOR mode over an EXTERNALLY-managed core (Keenetic: the daemon's own
+// sing-box isn't running, but a live core answers the Clash API and the device's
+// default route IS the exit — so a DIRECT probe yields the real exit IP). Degrades
+// to {available:false} in demo or when no core is up.
 func (s *Server) handleExitIP(w http.ResponseWriter, r *http.Request) {
-	if s.singbox == nil || !s.singbox.Running() {
+	if s.config().Demo {
 		writeJSON(w, http.StatusOK, map[string]any{"available": false})
 		return
 	}
+	// Serve a fresh cached IP without any outbound call (and without the coreUp probe).
 	s.exitIP.mu.Lock()
 	if s.exitIP.ip != "" && time.Since(s.exitIP.at) < exitIPTTL {
 		ip, geo := s.exitIP.ip, s.exitIP.geo
@@ -66,10 +70,21 @@ func (s *Server) handleExitIP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.exitIP.mu.Unlock()
 
+	// Refresh requires a live proxy core: the daemon's own sing-box OR an external one.
+	if !s.coreUp() {
+		writeJSON(w, http.StatusOK, map[string]any{"available": false})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	mixed := s.config().Ports.Mixed
 	ip := lookupExitIP(ctx, mixed)
+	if ip == "" {
+		// Monitor mode (no local mixed proxy): probe DIRECTLY — the daemon's request
+		// follows the device's default route, which is the active exit tunnel.
+		ip = lookupExitIP(ctx, 0)
+	}
 	if ip == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"available": false})
 		return
@@ -81,6 +96,27 @@ func (s *Server) handleExitIP(w http.ResponseWriter, r *http.Request) {
 	s.exitIP.ip, s.exitIP.geo, s.exitIP.at = ip, geo, time.Now()
 	s.exitIP.mu.Unlock()
 	writeJSON(w, http.StatusOK, exitIPResponse(ip, geo, false))
+}
+
+// coreUp reports whether a proxy core is live: the daemon's OWN sing-box, or an
+// EXTERNALLY-managed one answering the Clash API (monitor mode, e.g. on Keenetic
+// where sing-box is run by the OS init, not WakeRoute). A 2s probe of the Clash
+// controller's /version is the cheapest liveness signal that an external core is up.
+func (s *Server) coreUp() bool {
+	if s.singbox != nil && s.singbox.Running() {
+		return true
+	}
+	ctrl := s.config().Clash.Controller
+	if ctrl == "" {
+		return false
+	}
+	cl := &http.Client{Timeout: 2 * time.Second}
+	resp, err := cl.Get("http://" + ctrl + "/version")
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 // exitIPResponse merges the cached IP + geo into the wire shape. The base fields
@@ -109,17 +145,20 @@ func exitIPResponse(ip string, geo exitGeo, cached bool) map[string]any {
 	return m
 }
 
-// lookupExitIP GETs an IP echo through the local mixed (HTTP) proxy port and
-// returns the first valid IP. Empty on any failure.
+// lookupExitIP GETs an IP echo and returns the first valid IP. With mixedPort>0 it
+// routes through the local mixed (HTTP) proxy; with mixedPort<=0 it goes DIRECT (the
+// daemon's request follows the device's default route — used in monitor mode where
+// the active core is external and there is no local mixed proxy). Empty on failure.
 func lookupExitIP(ctx context.Context, mixedPort int) string {
-	if mixedPort <= 0 {
-		return ""
+	transport := &http.Transport{}
+	if mixedPort > 0 {
+		pu, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", mixedPort))
+		if err != nil {
+			return ""
+		}
+		transport.Proxy = http.ProxyURL(pu)
 	}
-	pu, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", mixedPort))
-	if err != nil {
-		return ""
-	}
-	cl := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(pu)}, Timeout: 6 * time.Second}
+	cl := &http.Client{Transport: transport, Timeout: 6 * time.Second}
 	defer cl.CloseIdleConnections()
 	for _, echo := range exitIPEchos {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, echo, nil)

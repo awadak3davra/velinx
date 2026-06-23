@@ -577,6 +577,7 @@ var (
 	knownFlows     = map[string]bool{"xtls-rprx-vision": true}
 	knownSSPlugins = map[string]bool{"obfs-local": true, "v2ray-plugin": true}
 	knownTUICCC    = map[string]bool{"cubic": true, "new_reno": true, "bbr": true}
+	knownTUICRelay = map[string]bool{"native": true, "quic": true}
 	knownHy2Obfs   = map[string]bool{"salamander": true}
 	knownVMessSec  = map[string]bool{"auto": true, "none": true, "zero": true, "aes-128-gcm": true, "chacha20-poly1305": true}
 	knownPacketEnc = map[string]bool{"xudp": true, "packetaddr": true}
@@ -749,10 +750,11 @@ func outboundFor(e *model.Endpoint) (map[string]any, error) {
 		if cc := safeEnum(str(e.Params, "congestion_control"), knownTUICCC); cc != "" {
 			ob["congestion_control"] = cc
 		}
-		// udp_relay_mode (native|quic) is parsed by the importer, stored, and
-		// round-tripped by the exporter — but was dropped here, so a link asking
-		// for "quic" silently fell back to sing-box's "native" default.
-		if m := str(e.Params, "udp_relay_mode"); m != "" {
+		// udp_relay_mode (native|quic) is parsed by the importer, stored, and round-tripped by the
+		// exporter. Gate it through safeEnum like every other enum here: an unknown value (a typo or
+		// a hostile share-link ?udp_relay_mode=foo) would otherwise reach the shared singbox.json and
+		// be REJECTED by sing-box at decode, failing the whole config. Drop-don't-brick → native.
+		if m := safeEnum(str(e.Params, "udp_relay_mode"), knownTUICRelay); m != "" {
 			ob["udp_relay_mode"] = m
 		}
 		// heartbeat is a duration STRING ("10s") — a bare number or garbage makes

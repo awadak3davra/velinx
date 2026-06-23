@@ -48,18 +48,17 @@ func (s *Server) handleNetDiag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Tunnel: HTTP(S) reachability through the chosen outbound (needs sing-box).
-	if s.clash == nil {
-		writeErr(w, http.StatusServiceUnavailable, "sing-box is not running — start it to test through a tunnel")
-		return
-	}
+	// Tunnel / group: HTTP(S) reachability through the chosen exit. A kernel-interface
+	// exit is probed iface-bound (curl --interface); a sing-box-proxy exit goes via the
+	// Clash API. probeExit picks per exit type, so the (common) interface-backed exits
+	// no longer need sing-box to be running.
 	if _, ok := netdiag.TargetURL(body.Target); !ok {
 		writeErr(w, http.StatusBadRequest, "enter a valid host, IP or http(s) URL")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	reach := netdiag.ReachVia(ctx, s.clash, body.Target, body.Egress, 8000)
+	reach := s.probeExit(ctx, body.Target, body.Egress)
 	reach.Name = s.egressName(body.Egress)
 	writeJSON(w, http.StatusOK, reach)
 }
@@ -194,6 +193,64 @@ func (s *Server) egressIface(tag string) string {
 	return ""
 }
 
+// egressProbeIface resolves an egress tag to the kernel interface to bind an
+// iface-bound reachability probe to: an external endpoint's interface, a group's
+// first interface-backed member (recursively, so a failover group over tunnels
+// resolves to its primary tunnel), or "" for the WAN and for sing-box-proxy exits
+// (which have no interface and must be tested through sing-box via the Clash API).
+func (s *Server) egressProbeIface(tag string) string {
+	if tag == "" || tag == model.OutboundDirect {
+		return ""
+	}
+	prof := s.store.Profile()
+	return egressIfaceIn(&prof, tag, 0)
+}
+
+func egressIfaceIn(prof *model.Profile, tag string, depth int) string {
+	if depth > 8 { // cyclic / pathological group graph guard
+		return ""
+	}
+	for i := range prof.Endpoints {
+		if prof.Endpoints[i].ID == tag {
+			if !prof.Endpoints[i].Enabled {
+				return "" // a disabled endpoint isn't a live egress (mirrors validate.go's gating)
+			}
+			if iface, ok := prof.Endpoints[i].Params["interface"].(string); ok && netdiag.ValidIface(iface) {
+				return iface
+			}
+			return "" // sing-box-proxy endpoint: no interface
+		}
+	}
+	for i := range prof.Groups {
+		if prof.Groups[i].ID == tag {
+			for _, m := range prof.Groups[i].Members {
+				if iface := egressIfaceIn(prof, m, depth+1); iface != "" {
+					return iface
+				}
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// probeExit tests target's reachability through one exit, choosing the probe by
+// exit TYPE: an interface-backed exit (WAN, a kernel tunnel, or a group routed over
+// tunnels) gets an iface-bound HTTP(S) probe (curl --interface), because the Clash
+// API can only see sing-box outbounds — never kernel interfaces, which is why the
+// native tunnels used to always report "unreachable". A sing-box-proxy exit is
+// testable only through sing-box, so it falls back to the Clash delay probe.
+func (s *Server) probeExit(ctx context.Context, target, tag string) netdiag.Reach {
+	iface := s.egressProbeIface(tag)
+	if iface != "" || tag == "" || tag == model.OutboundDirect {
+		return netdiag.ReachViaIface(ctx, iface, target, 7000) // iface=="" → WAN, no binding
+	}
+	if s.clash != nil {
+		return netdiag.ReachVia(ctx, s.clash, target, tag, 7000)
+	}
+	return netdiag.Reach{Target: target, Egress: tag, LatencyMs: -1, Err: "no interface, and sing-box is not reachable"}
+}
+
 // handleNetDiagAll probes one target through every exit at once — WAN (direct)
 // plus each enabled tunnel and group — and returns a comparison so the user can
 // see which exit reaches a (possibly blocked) resource. All probes are HTTP(S)
@@ -211,11 +268,6 @@ func (s *Server) handleNetDiagAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "enter a valid host, IP or http(s) URL")
 		return
 	}
-	if s.clash == nil {
-		writeErr(w, http.StatusServiceUnavailable, "sing-box is not running — start it to test through tunnels")
-		return
-	}
-
 	type egress struct{ tag, name string }
 	egrs := []egress{{model.OutboundDirect, "WAN (direct)"}}
 	prof := s.store.Profile()
@@ -240,7 +292,7 @@ func (s *Server) handleNetDiagAll(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, e egress) {
 			defer wg.Done()
-			rc := netdiag.ReachVia(ctx, s.clash, body.Target, e.tag, 7000)
+			rc := s.probeExit(ctx, body.Target, e.tag)
 			rc.Name = e.name
 			results[i] = rc
 		}(i, e)

@@ -243,6 +243,129 @@ func ReachVia(ctx context.Context, d Delayer, target, egress string, timeoutMS i
 	return r
 }
 
+// ReachViaIface tests whether target's HTTP(S) endpoint is reachable when the probe
+// is BOUND to a kernel interface (`curl --interface <iface>`) — the iface-bound
+// analogue of ReachVia, for native interface-backed exits (AmneziaWG/WireGuard nwgN,
+// and kernel-PBR groups routed over them) that are NOT sing-box outbounds and so the
+// Clash delay test cannot see them at all. iface "" probes the WAN with no binding.
+// curl exits non-zero on a connection failure / timeout (→ unreachable); a completed
+// request (any HTTP status, incl. a 4xx block, proves the exit carried traffic and
+// the server answered → reachable). The iface and URL are guarded the same way the
+// rest of the package guards shell-bound input (ValidIface / TargetURL), and the argv
+// is exec'd directly (no shell).
+func ReachViaIface(ctx context.Context, iface, target string, timeoutMS int) Reach {
+	r := Reach{Target: target, Egress: iface, LatencyMs: -1}
+	if iface == "" {
+		r.Egress = "direct"
+	} else if !ValidIface(iface) {
+		r.Err = "invalid interface"
+		return r
+	}
+	u, ok := TargetURL(target)
+	if !ok {
+		r.Err = "invalid target — enter a host, IP or http(s) URL"
+		return r
+	}
+	r.URL = u
+	// SSRF guard: resolve the host, refuse internal targets (loopback / private /
+	// link-local / metadata), and PIN that vetted IP into curl with --resolve so curl
+	// can't re-resolve to an internal address (DNS-rebind). The probe runs curl as root
+	// through the router's main table, so without this the WAN exit could reach
+	// 127.0.0.1 (Clash/daemon), the LAN, or 169.254.169.254. Mirrors blockInternalDial.
+	pu, perr := url.Parse(u)
+	if perr != nil {
+		r.Err = "invalid target URL"
+		return r
+	}
+	host := pu.Hostname()
+	port := pu.Port()
+	if port == "" {
+		port = "443"
+		if pu.Scheme == "http" {
+			port = "80"
+		}
+	}
+	vip, verr := resolvePublic(ctx, host)
+	if verr != nil {
+		r.Err = verr.Error()
+		return r
+	}
+	if timeoutMS < 1000 || timeoutMS > 20000 {
+		timeoutMS = 8000
+	}
+	secs := strconv.Itoa((timeoutMS + 999) / 1000)
+	args := []string{
+		"-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
+		"--max-time", secs, "--connect-timeout", secs,
+		"--globoff",              // [] {} are literal — no request-flood expansion
+		"--proto", "=http,https", // never file://, scp://, etc.
+		"--resolve", host + ":" + port + ":" + vip, // pin the vetted IP (defeat DNS-rebind)
+		"-k", // a reachability probe accepts any HTTP status; a cert mismatch (bare IP / DPI block page) still proves the exit carried traffic
+	}
+	if iface != "" {
+		args = append(args, "--interface", iface)
+	}
+	args = append(args, u)
+	out, err := exec.CommandContext(ctx, "curl", args...).Output()
+	if err != nil {
+		// connection refused / timeout / TLS error → the exit can't reach the target.
+		r.Err = "unreachable via this exit"
+		return r
+	}
+	var code int
+	var sec float64
+	if _, e := fmt.Sscanf(strings.TrimSpace(string(out)), "%d %f", &code, &sec); e != nil || code == 0 {
+		r.Err = "no response"
+		return r
+	}
+	r.Reachable = true
+	r.LatencyMs = int(sec * 1000)
+	return r
+}
+
+// resolvePublic resolves host to its first PUBLIC IP, rejecting internal targets so
+// the iface-bound probe can't be turned into an SSRF against on-box or LAN services.
+// The returned literal IP is pinned into curl via --resolve so curl never re-resolves
+// (no DNS-rebind between this check and the request). IP-literal hosts resolve locally.
+func resolvePublic(ctx context.Context, host string) (string, error) {
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return "", fmt.Errorf("cannot resolve %s", host)
+	}
+	return pickPublic(ips)
+}
+
+// pickPublic returns the first PUBLIC IP, PREFERRING IPv4: the router and its tunnels
+// are v4-only, so pinning a v6 literal (which resolvers often list first — telegram
+// does) gives curl a target it cannot connect to, making EVERY exit falsely read
+// "unreachable". Falls back to a public v6 only when there is no public v4.
+func pickPublic(ips []net.IP) (string, error) {
+	var v6 string
+	for _, ip := range ips {
+		if isInternalAddr(ip) {
+			continue
+		}
+		if ip.To4() != nil {
+			return ip.String(), nil
+		}
+		if v6 == "" {
+			v6 = ip.String()
+		}
+	}
+	if v6 != "" {
+		return v6, nil
+	}
+	return "", fmt.Errorf("refusing to probe an internal/private address")
+}
+
+// isInternalAddr reports whether ip is one a reachability probe must refuse: loopback,
+// RFC1918/ULA private, link-local (incl. 169.254.169.254 metadata), or unspecified.
+// Mirrors server.blockInternalDial's predicate (the subscription-fetch dial guard).
+func isInternalAddr(ip net.IP) bool {
+	return ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
 // Run executes all three diagnostics with sane per-tool timeouts.
 func Run(ctx context.Context, host string) (Report, error) {
 	if !ValidTarget(host) {

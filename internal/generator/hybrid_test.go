@@ -175,6 +175,54 @@ func TestHybridMode(t *testing.T) {
 	}
 }
 
+// TestFastMode (RoutingMode="fast") is hybrid WITHOUT the capture-all TUN: general LAN
+// traffic stays on the kernel fast-path (the live Steam-throughput fix: 143→~595 Mbps),
+// so the generated config MUST NOT emit a tun inbound even though Hybrid=true — while the
+// kernel partition (pbr drops pure-IP kernel rules/outbounds) still applies. Guards
+// against a regression that re-couples Hybrid to the TUN (which would re-introduce the
+// userspace capture and cap throughput again).
+func TestFastMode(t *testing.T) {
+	p := hybridProfile()
+	// fast mode: server.genOptionsWithPlan sets Hybrid=true, TunEnabled=false, and no
+	// KernelExclude (there is no TUN to exclude CIDRs from).
+	res := gen_must(t, p, Options{MixedPort: 7890, TunEnabled: false, Hybrid: true})
+
+	// (a) THE point of fast: NO tun inbound — general bypasses sing-box.
+	if tun := gen_tunInbound(res); tun != nil {
+		t.Fatalf("fast mode must NOT emit a tun inbound (general must take the kernel fast-path), got: %v", tun)
+	}
+	if ins, _ := res.Config["inbounds"].([]map[string]any); len(ins) != 1 || ins[0]["type"] != "mixed" {
+		t.Fatalf("fast mode inbounds = %v, want exactly [mixed-in]", res.Config["inbounds"])
+	}
+
+	// (b) the hybrid kernel partition STILL applies: pure-IP kernel outbound omitted,
+	// the domain-referenced kernel outbound kept.
+	tags := gen_outboundTags(res)
+	if tags["k-awg"] {
+		t.Errorf("k-awg outbound must still be omitted in fast (pbr routes it): %v", tags)
+	}
+	if !tags["k-ext"] {
+		t.Errorf("k-ext outbound (domain-referenced) must be kept in fast: %v", tags)
+	}
+
+	// (c) no TUN ⟹ no sniff rule (sniff is TUN-only) and the pure-IP kernel rule is
+	// still dropped (pbr handles it).
+	rules := gen_routeRules(res)
+	for _, r := range rules {
+		if r["action"] == "sniff" {
+			t.Errorf("fast mode must NOT emit a sniff rule (no TUN to sniff): %v", rules)
+		}
+		if ips, _ := r["ip_cidr"].([]string); gen_sliceHas(ips, "10.0.0.0/8") {
+			t.Errorf("pure-IP kernel rule (10.0.0.0/8 → k-awg) must be dropped in fast: %v", r)
+		}
+	}
+
+	// (d) final stays direct.
+	if route, _ := res.Config["route"].(map[string]any); route["final"] != model.OutboundDirect {
+		t.Errorf("route.final = %v, want direct", route["final"])
+	}
+}
+
 // TestHybridDefaultUnchanged: with Hybrid:false (the default tun/mixed path), output
 // is the pre-Pass-3 shape — kernel outbounds present, no route_exclude, pure-IP kernel
 // rules present. Proves the hybrid branch is fully gated and changes nothing otherwise.
