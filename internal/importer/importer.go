@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"strconv"
@@ -613,11 +614,22 @@ func asString(v any) string {
 func asInt(v any, def int) int {
 	switch t := v.(type) {
 	case float64:
+		// Reject out-of-int-range floats (incl. NaN/Inf) rather than letting the
+		// int(t) conversion overflow into an implementation-defined value. A port /
+		// alter_id is small in practice, so anything beyond MaxInt32 is bogus.
+		if t < math.MinInt32 || t > math.MaxInt32 {
+			return def
+		}
 		return int(t)
 	case string:
 		return atoiDefault(t, def)
 	case json.Number:
 		if n, err := t.Int64(); err == nil {
+			// On 32-bit router arches int is 32-bit, so an int64 outside that range
+			// would overflow on the int(n) conversion. Clamp-reject to the default.
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return def
+			}
 			return int(n)
 		}
 	}

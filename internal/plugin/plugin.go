@@ -8,6 +8,7 @@ package plugin
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -345,13 +346,20 @@ func (m *Manager) awgUp(e model.Endpoint, cfgText string) (string, error) {
 	// a comma-joined argument ("inet prefix is expected"), so a dual-stack config
 	// (10.x/32 + fd00::x/128) would otherwise come up with NO address (broken).
 	for _, addr := range util.LocalAddrs(e.Params) {
-		_ = exec.Command(ipBin, "addr", "add", addr, "dev", iface).Run()
+		// The iface was just re-created (link del+add above), so a failure here is real —
+		// a missing address means a dead tunnel. Log it instead of swallowing it silently;
+		// don't abort, since a dual-stack config may legitimately add only one family.
+		if out, err := exec.Command(ipBin, "addr", "add", addr, "dev", iface).CombinedOutput(); err != nil {
+			log.Printf("wakeroute: awg %s: ip addr add %s failed: %v: %s", iface, addr, err, strings.TrimSpace(string(out)))
+		}
 	}
 	// MTU is stripped from the setconf input (awg setconf rejects it) but is a real
 	// ip-layer setting; apply it here like the address, or the tunnel uses the kernel
 	// default and over a constrained path large packets fragment/blackhole.
 	if mtu := numStr(e.Params["mtu"]); mtu != "" {
-		_ = exec.Command(ipBin, "link", "set", iface, "mtu", mtu).Run()
+		if out, err := exec.Command(ipBin, "link", "set", iface, "mtu", mtu).CombinedOutput(); err != nil {
+			log.Printf("wakeroute: awg %s: set mtu %s failed: %v: %s", iface, mtu, err, strings.TrimSpace(string(out)))
+		}
 	}
 	if out, err := exec.Command(ipBin, "link", "set", iface, "up").CombinedOutput(); err != nil {
 		_ = exec.Command(ipBin, "link", "del", iface).Run()
@@ -377,7 +385,12 @@ func awgStrip(conf string) string {
 
 func (m *Manager) stop(_ string, p *proc) {
 	if p.cmd != nil && p.cmd.Process != nil {
-		_ = p.cmd.Process.Kill()
+		// os.ErrProcessDone means the process already exited (e.g. crashed or was
+		// reaped by the supervise goroutine) — that's the benign expected case, not
+		// a failure worth logging.
+		if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("wakeroute: plugin kill (engine=%s iface=%s): %v", p.engine, p.iface, err)
+		}
 		if p.done != nil {
 			<-p.done // the exit-tracking goroutine owns Wait()
 		}

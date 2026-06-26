@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"wakeroute/internal/model"
 	"wakeroute/internal/pbr"
@@ -155,12 +156,33 @@ func (s *Server) handleConntrack(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// markExitResolver returns a func mapping a connmark to a human egress tag using the live
-// pbr plan (the same marks pbr assigns: 0 / WAN-bypass → "direct"; a tunnel mark → its
-// endpoint tag). Computed once per request. Until the pbr connmark-save ships, every conn
-// reads mark=0 → "direct", so the grouping is correct (just single-bucket) and lights up
-// per-exit automatically once `ct mark set meta mark` is deployed.
+// exitResolverTTL bounds how stale the cached connmark→exit-tag map may be. The map only
+// changes on Apply, so a few seconds is invisible; this turns a per-poll Profile()+Compile()
+// into at most one recompute per TTL while the Dashboard is polling /api/conntrack.
+const exitResolverTTL = 15 * time.Second
+
+// markExitResolver returns a cached func mapping a connmark to a human egress tag (built by
+// computeMarkExitResolver). It is recomputed at most once per exitResolverTTL instead of on
+// every /api/conntrack poll. The returned closure is read-only, so concurrent callers may
+// share it safely. (Marks: 0 / WAN-bypass → "direct"; a tunnel mark → its endpoint tag.)
 func (s *Server) markExitResolver() func(uint32) string {
+	now := time.Now().UnixMilli()
+	s.exitResolverMu.Lock()
+	defer s.exitResolverMu.Unlock()
+	if s.exitResolver != nil && now < s.exitResolverExp {
+		return s.exitResolver
+	}
+	r := s.computeMarkExitResolver()
+	s.exitResolver = r
+	s.exitResolverExp = now + exitResolverTTL.Milliseconds()
+	return r
+}
+
+// computeMarkExitResolver builds the connmark→egress-tag lookup from the live profile + pbr
+// plan (the expensive Profile() deep-clone + pbr.Compile() the cache above amortises). Until
+// the pbr connmark-save ships, every conn reads mark=0 → "direct", so the grouping is correct
+// (single-bucket) and lights up per-exit automatically once `ct mark set meta mark` is deployed.
+func (s *Server) computeMarkExitResolver() func(uint32) string {
 	p := s.store.Profile()
 	plan, _, err := pbr.Compile(&p, pbr.Options{})
 	if err != nil || plan == nil {

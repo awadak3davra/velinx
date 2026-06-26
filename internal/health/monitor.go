@@ -13,6 +13,7 @@ import (
 
 	"wakeroute/internal/clash"
 	"wakeroute/internal/kb"
+	"wakeroute/internal/model"
 	"wakeroute/internal/netdiag"
 	"wakeroute/internal/store"
 )
@@ -78,7 +79,18 @@ type Monitor struct {
 	testURL   string
 	interval  time.Duration
 	timeoutMS int
+
+	// causeFor scans the entire engine log on every call; since the derived cause
+	// is global (not per-endpoint) and changes slowly, cache it for a short TTL so a
+	// persistently-down target doesn't re-scan the whole log every tick/snapshot.
+	causeMu      sync.Mutex
+	causeTitle   string
+	causeFix     string
+	causeExpires int64 // unix ms; cache valid while nowMS() < causeExpires
 }
+
+// causeTTLms bounds how long a derived failure cause is reused before re-scanning.
+const causeTTLms int64 = 30_000
 
 // NewMonitor builds a Monitor probing every 10s with a 5s per-probe timeout.
 // In demo mode it synthesizes plausible per-tunnel stats (so the dashboard shows
@@ -162,7 +174,13 @@ func (m *Monitor) probe(ctx context.Context, id, testURL, iface string) (State, 
 type target struct{ id, name, kind, testURL, iface string }
 
 func (m *Monitor) targets() []target {
-	p := m.store.Profile()
+	return m.targetsFrom(m.store.Profile())
+}
+
+// targetsFrom derives the probe targets from an already-fetched profile so a
+// caller that also needs the profile (e.g. Snapshot's group derivation) does not
+// pay for a second deep-cloning store.Profile() on the same tick.
+func (m *Monitor) targetsFrom(p model.Profile) []target {
 	var t []target
 	for _, e := range p.Endpoints {
 		if e.Enabled {
@@ -336,7 +354,8 @@ func (m *Monitor) ProbeOne(ctx context.Context, id string) View {
 
 // Snapshot returns the current view for every active target.
 func (m *Monitor) Snapshot() []View {
-	tgs := m.targets()
+	p := m.store.Profile()
+	tgs := m.targetsFrom(p)
 	now := nowMS()
 	m.mu.Lock()
 	views := make([]View, 0, len(tgs))
@@ -358,7 +377,7 @@ func (m *Monitor) Snapshot() []View {
 	for _, v := range views {
 		stateByID[v.ID] = v.State
 	}
-	for _, g := range m.store.Profile().Groups {
+	for _, g := range p.Groups {
 		alive := false
 		for _, mem := range g.Members {
 			if mem == "direct" || stateByID[mem] == string(Alive) {
@@ -402,9 +421,24 @@ func (m *Monitor) viewWithCause(id string) View {
 	return v
 }
 
-// causeFor scans recent engine log lines (newest first) for a known error and
-// returns its title + fix; falls back to a generic timeout explanation.
+// causeFor returns the probable failure cause, reusing a recently-derived result
+// within causeTTLms so a persistently-down target does not re-scan the engine log
+// on every tick/snapshot. The cause is global (not per-target) so one entry suffices.
 func (m *Monitor) causeFor() (string, string) {
+	now := nowMS()
+	m.causeMu.Lock()
+	defer m.causeMu.Unlock()
+	if now < m.causeExpires {
+		return m.causeTitle, m.causeFix
+	}
+	title, fix := m.deriveCause()
+	m.causeTitle, m.causeFix, m.causeExpires = title, fix, now+causeTTLms
+	return title, fix
+}
+
+// deriveCause scans recent engine log lines (newest first) for a known error and
+// returns its title + fix; falls back to a generic timeout explanation.
+func (m *Monitor) deriveCause() (string, string) {
 	if m.logs != nil {
 		lines := m.logs.LogLines()
 		for i := len(lines) - 1; i >= 0; i-- {

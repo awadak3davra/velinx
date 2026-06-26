@@ -57,6 +57,13 @@ type Server struct {
 	etagOnce       sync.Once // computes the UI asset ETag lazily, once
 	etag           string
 	exitIP         exitIPState // cached public-exit-IP lookup for the Dashboard hero
+	// markExitResolver cache: the connmark→exit-tag map (Dashboard live-connections table) is
+	// derived from a full Profile() clone + pbr.Compile() that only changes on Apply, yet it was
+	// recomputed on EVERY /api/conntrack poll. Cache the resolver and recompute at most once per
+	// exitResolverTTL (a few seconds of staleness on a display label is harmless).
+	exitResolverMu  sync.Mutex
+	exitResolver    func(uint32) string
+	exitResolverExp int64 // unix-ms; recompute the mark→exit resolver after this
 
 	allowInternalFetch bool // test-only: skip the subscription-fetch SSRF dial guard so httptest (loopback) servers can be used
 }

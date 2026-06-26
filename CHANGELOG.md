@@ -3,6 +3,37 @@
 All notable changes to WakeRoute are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.2]
+
+### Added
+- **Flow-offload controls in Settings** — turn on the kernel/hardware fast path for general
+  (non-tunnel) traffic from the Routing-mode card: Off / Software / Hardware, with optional
+  device pinning (blank auto-detects the WAN uplink + LAN bridge). Your tunnel carve-outs
+  (calls, VoWiFi, blocked sites) are mark-routed and automatically excluded from the
+  flowtable, so they keep working while everything else gets the line-rate forwarding path.
+- **Flow-offload status check** in the Diagnostics health battery — shows whether the fast
+  path is active and flags the throughput left on the table when it is off.
+
+### Changed
+- **Design system** — spacing, typography and headings are now a documented token scale (a
+  4px spacing grid and a six-step type scale replacing ~14 ad-hoc font sizes), for a cleaner,
+  more consistent look across every page in both themes.
+- **Richer empty states** — first-run placeholders show a clear title plus a short how-to
+  hint instead of a single long sentence.
+
+### Fixed
+- The sidebar no longer shifts a few pixels between pages when the scrollbar appears or
+  disappears (the scrollbar gutter is now reserved).
+- The Add/Edit-connection form's Server/Port row no longer overflows on narrow phones.
+- Mobile polish — modals use dynamic viewport height (no clipping on landscape phones),
+  respect the safe-area inset, and meet the 44px touch-target minimum.
+- A boot-time config-generation failure is now logged instead of silently leaving routing
+  down with no trace after a reboot.
+
+### Accessibility
+- The reachability-matrix latency column conveys its quality with a non-color cue and a
+  screen-reader label, not color alone.
+
 ## [0.3.1]
 
 ### Added

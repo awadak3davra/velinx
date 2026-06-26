@@ -233,6 +233,10 @@ func (s *Server) SyncPlugins() {
 	opts, newPlan := s.genOptionsWithPlan(&p, c)
 	res, err := generator.Generate(&p, opts)
 	if err != nil {
+		// Boot path: a swallowed generate error here means the engine plugins + kernel PBR
+		// plane never come up after a reboot, with no trace of why. Log it (the watchdog /
+		// next Apply will retry); don't change the fail-soft behavior otherwise.
+		log.Printf("wakeroute: boot SyncPlugins skipped — config generation failed (tunnels/PBR not brought up): %v", err)
 		return
 	}
 	s.syncPluginsFor(res) // brings AmneziaWG/olcRTC interfaces UP first
@@ -307,8 +311,15 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// open must NOT overwrite the baseline with the interim (unconfirmed, maybe
 	// broken) config, or a later rollback would restore that instead of the last
 	// known-good config.
+	var backupErr, reloadErr, commitErr string
 	if !s.failsafe.Status().Pending {
-		_ = s.singbox.Backup()
+		// A failed Backup means the fail-safe has no rollback target — surface + log it
+		// (don't abort: the PBR-fail and connectivity paths below already degrade safely
+		// when there's no .bak, and the user may still want to apply).
+		if err := s.singbox.Backup(); err != nil {
+			backupErr = err.Error()
+			log.Printf("handleApply: backup (rollback snapshot) failed: %v — fail-safe may be unable to restore", err)
+		}
 		s.snapshotPBRBaseline()    // capture the pre-window kernel plan as the rollback target
 		s.snapshotPluginBaseline() // capture the pre-window engine-plugin specs too
 	}
@@ -320,13 +331,19 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	reloaded := false
 	if s.singbox.Running() {
-		if err := s.singbox.Reload(); err == nil {
+		if err := s.singbox.Reload(); err != nil {
+			reloadErr = err.Error()
+			log.Printf("handleApply: sing-box reload failed: %v", err)
+		} else {
 			reloaded = true
 		}
 	} else if s.singbox.Available() {
 		// Not running yet — bring it up so the new config takes effect (and the
 		// watchdog starts supervising it).
-		if err := s.singbox.Start(); err == nil {
+		if err := s.singbox.Start(); err != nil {
+			reloadErr = err.Error()
+			log.Printf("handleApply: sing-box start failed: %v", err)
+		} else {
 			reloaded = true
 		}
 	}
@@ -375,7 +392,10 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.Save {
-		_ = s.singbox.Commit()
+		if err := s.singbox.Commit(); err != nil {
+			commitErr = err.Error()
+			log.Printf("handleApply: commit (save baseline) failed: %v", err)
+		}
 		s.failsafe.Confirm()
 	} else {
 		s.armFailSafe()
@@ -392,6 +412,17 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	if pbrErr != nil {
 		resp["pbr_error"] = pbrErr.Error() // only on failure → non-hybrid/demo responses stay byte-identical
+	}
+	// Surface the previously-swallowed apply errors ONLY when present, so a successful
+	// apply keeps a byte-identical response (the UI + tests depend on the happy-path shape).
+	if backupErr != "" {
+		resp["backup_error"] = backupErr
+	}
+	if reloadErr != "" {
+		resp["reload_error"] = reloadErr
+	}
+	if commitErr != "" {
+		resp["commit_error"] = commitErr
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

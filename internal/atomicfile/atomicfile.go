@@ -6,6 +6,7 @@
 package atomicfile
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 )
@@ -55,8 +56,13 @@ func WriteSynced(path string, data []byte, perm os.FileMode) error {
 func SyncDir(dir string) {
 	d, err := os.Open(dir)
 	if err != nil {
+		// A durability failure is invisible if swallowed; log so a missing
+		// directory fsync (e.g. permission/IO error) shows up in the router log.
+		log.Printf("atomicfile: open dir %q for fsync: %v", dir, err)
 		return
 	}
-	_ = d.Sync()
+	if err := d.Sync(); err != nil {
+		log.Printf("atomicfile: fsync dir %q: %v", dir, err)
+	}
 	_ = d.Close()
 }

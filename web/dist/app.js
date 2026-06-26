@@ -18,6 +18,16 @@ function el(tag, props, ...kids) {
   return n;
 }
 
+// emptyState builds a richer empty placeholder — a bold title + an optional muted
+// how-to hint (and optional leading glyph) — replacing bare run-on sentences. A plain
+// string child still renders via .empty, so existing call sites stay unaffected.
+function emptyState(title, hint, glyph) {
+  return el("div", { class: "empty" },
+    glyph ? el("div", { class: "empty-ico" }, glyph) : null,
+    el("div", { class: "empty-title" }, title),
+    hint ? el("div", { class: "empty-hint" }, hint) : null);
+}
+
 /* ---------- a11y ---------- */
 // associateLabels wires each .field's sibling <label> to its single control via
 // for/id so screen readers announce form fields by name. The UI renders labels as
@@ -255,10 +265,25 @@ async function pollTraffic() {
   // Ask for only the last MAXG samples the graph renders, not the full 300 buffer.
   try { gdata = (await api.get("/api/traffic/recent?n=" + MAXG)).slice(-MAXG); drawGraph(); } catch (_) {}
 }
+// hex color (#rgb / #rrggbb) → "rgba(r,g,b,a)" for translucent graph fills.
+function rgba(hex, a) {
+  let h = (hex || "").replace("#", "");
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  const n = parseInt(h, 16);
+  return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + a + ")";
+}
 function drawGraph() {
   const c = graphCanvas;
   if (!c) return;
-  const ctx = c.getContext("2d"), W = c.width, H = c.height, pad = 6;
+  const ctx = c.getContext("2d"), pad = 6;
+  // Hi-DPI: size the backing store to the device pixel ratio, draw in CSS px.
+  const dpr = window.devicePixelRatio || 1;
+  const W = c.clientWidth || c.width, H = c.clientHeight || c.height;
+  c.width = W * dpr; c.height = H * dpr;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(dpr, dpr);
+  // Theme-aware download/upload colors (read from CSS vars, correct in light mode).
+  const cs = getComputedStyle(document.documentElement);
+  const rx = cs.getPropertyValue("--rx").trim(), tx = cs.getPropertyValue("--tx").trim();
   ctx.clearRect(0, 0, W, H);
   const ymaxEl = $("#g-ymax");
   if (!gdata.length) { if (ymaxEl) ymaxEl.textContent = "—"; return; }
@@ -278,8 +303,8 @@ function drawGraph() {
     for (let i = 0; i < n; i++) { const px = X(i), py = Y(gdata[i][key]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
     ctx.lineWidth = 2.5; ctx.strokeStyle = line; ctx.stroke();
   };
-  area("down", "#6C97C4", "rgba(108,151,196,.22)");
-  area("up", "#3FB871", "rgba(63,184,113,.22)");
+  area("down", rx, rgba(rx, .22));
+  area("up", tx, rgba(tx, .22));
   const last = gdata[n - 1];
   const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
   set("#g-up", fmtRate(last.up)); set("#g-down", fmtRate(last.down));
@@ -290,7 +315,15 @@ function drawGraph() {
 // is answered on its own row (Keenetic-style). Cheap: ≤40 samples, no library.
 function drawSpark(c, buf) {
   if (!c) return;
-  const ctx = c.getContext("2d"), W = c.width, H = c.height, pad = 2;
+  const ctx = c.getContext("2d"), pad = 2;
+  // Hi-DPI: size the backing store to the device pixel ratio, draw in CSS px.
+  const dpr = window.devicePixelRatio || 1;
+  const W = c.clientWidth || c.width, H = c.clientHeight || c.height;
+  c.width = W * dpr; c.height = H * dpr;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(dpr, dpr);
+  // Theme-aware download/upload colors.
+  const cs = getComputedStyle(document.documentElement);
+  const rx = cs.getPropertyValue("--rx").trim(), tx = cs.getPropertyValue("--tx").trim();
   ctx.clearRect(0, 0, W, H);
   if (!buf || !buf.length) return;
   let peak = 1;
@@ -304,8 +337,8 @@ function drawSpark(c, buf) {
     for (let i = 0; i < n; i++) { const px = X(i), py = Y(buf[i][key]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
     ctx.lineWidth = 1.5; ctx.strokeStyle = line; ctx.stroke();
   };
-  area("down", "#6C97C4", "rgba(108,151,196,.18)");
-  area("up", "#3FB871", "rgba(63,184,113,.18)");
+  area("down", rx, rgba(rx, .18));
+  area("up", tx, rgba(tx, .18));
 }
 // (traffic graph is driven by pollTraffic above, scheduled from init)
 
@@ -381,6 +414,7 @@ async function route() {
   graphCanvas = null;
   const view = $("#view");
   view.innerHTML = "";
+  pillGen++; // invalidate refreshPills' cached node lists — the page DOM is being rebuilt
   try { await page.render(view); associateLabels(view); } catch (e) { renderError(view, e); }
   i18nApply(view); // localize the freshly-rendered (English) page in place
 }
@@ -464,7 +498,7 @@ async function renderDashboard(view) {
 
   if (!subStacks.length) {
     card.appendChild(el("div", { class: "card-title", style: "margin:18px 0 4px" }, "Connections"));
-    card.appendChild(el("div", { class: "empty" }, "No connections yet. Add one under Connections."));
+    card.appendChild(emptyState("No connections yet", "Add one under Connections."));
   } else {
     subStacks.forEach(s => {
       card.appendChild(el("div", { class: "card-title", style: "margin:18px 0 4px" }, s.label));
@@ -964,7 +998,7 @@ async function renderConnections(view) {
 
   const card = el("div", { class: "card" });
   if (!state.profile.endpoints.length) {
-    card.appendChild(el("div", { class: "empty" }, "No connections. Paste a vless:// / hysteria2:// link or a WireGuard config to add one."));
+    card.appendChild(emptyState("No connections yet", "Paste a vless:// / hysteria2:// link or a WireGuard config to add one."));
   } else {
     state.profile.endpoints.forEach(e => {
       const tog = el("div", { class: "toggle" + (e.enabled ? " on" : ""), onclick: () => toggleEndpoint(e) });
@@ -1001,8 +1035,8 @@ async function renderFailover(view) {
   view.appendChild(head);
 
   if (!state.profile.groups.length) {
-    view.appendChild(el("div", { class: "card" }, el("div", { class: "empty" },
-      "No failover groups. Create one to auto-select the fastest working connection (urltest), like a router's backup-WAN stack.")));
+    view.appendChild(el("div", { class: "card" }, emptyState("No failover groups",
+      "Create one to auto-select the fastest working connection (urltest), like a router's backup-WAN stack.")));
     return;
   }
   const defRule = state.profile.rules.find(r => r.default);
@@ -1010,10 +1044,10 @@ async function renderFailover(view) {
     const isDefault = defRule && defRule.outbound === g.id;
     const card = el("div", { class: "card" });
     card.appendChild(el("div", { class: "card-head" },
-      el("div", {}, el("div", { class: "name", style: "font-size:16px" }, g.name,
+      el("div", { style: "min-width:0" }, el("div", { class: "name", style: "font-size:16px;min-width:0;word-break:break-word" }, g.name,
         el("span", { class: "badge" }, g.type),
         isDefault ? el("span", { class: "pill ok", style: "margin-left:6px" }, el("span", { class: "dot" }), "Default route") : null),
-        el("div", { class: "sub", style: "margin-top:4px" }, g.members.map(nameOf).join("  ▸  "))),
+        el("div", { class: "sub", style: "margin-top:4px;word-break:break-word;color:var(--ink-2)" }, g.members.map(nameOf).join("  ▸  "))),
       el("div", { class: "acts" },
         !isDefault ? el("button", { class: "btn btn-sm", onclick: () => setDefault(g) }, "Set as default route") : null,
         el("button", { class: "btn btn-danger btn-sm", onclick: () => delGroup(g) }, "Delete"))));
@@ -1096,7 +1130,7 @@ async function renderRouting(view) {
   const lists = state.profile.routing_lists || [];
   const card = el("div", { class: "card" });
   if (!lists.length) {
-    card.appendChild(el("div", { class: "empty" }, "No routing lists yet. Add a ready-made preset (or your own list) and point it at a tunnel — matching sites then go through the VPN, everything else stays direct."));
+    card.appendChild(emptyState("No routing lists yet", "Add a ready-made preset (or your own list) and point it at a tunnel — matching sites then go through the VPN, everything else stays direct."));
   } else {
     // Fixed-column grid so the per-row "Route via" / "Download via" dropdowns line up
     // in their own columns instead of flowing inline after variable-width source text
@@ -1284,16 +1318,45 @@ async function addPreset(p, back) {
 
 /* ---------- modal ---------- */
 function modal({ title, body, footer }) {
-  const back = el("div", { class: "modal-backdrop", onclick: e => { if (e.target === back) back.remove(); } });
-  const m = el("div", { class: "modal" },
+  // Remember what was focused so we can restore it when the modal closes (a11y).
+  const prevFocus = document.activeElement;
+  // close() centralizes teardown so every close path (Escape, backdrop click, ×,
+  // and any caller's back.remove()) detaches the keydown listener and restores
+  // focus — no leaked listener firing for a removed modal.
+  let closed = false;
+  // domRemove keeps a handle on the native Element.remove so close() can detach
+  // the node without recursing through our overridden back.remove (set below).
+  const domRemove = Element.prototype.remove;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener("keydown", onKey);
+    domRemove.call(back);
+    if (prevFocus && typeof prevFocus.focus === "function" && document.contains(prevFocus)) {
+      prevFocus.focus();
+    }
+  };
+  const onKey = e => { if (e.key === "Escape") { e.preventDefault(); close(); } };
+  const back = el("div", { class: "modal-backdrop", onclick: e => { if (e.target === back) close(); } });
+  const m = el("div", { class: "modal", tabindex: "-1", role: "dialog", "aria-modal": "true" },
     el("div", { class: "modal-head" }, el("div", { class: "card-title" }, title),
-      el("div", { class: "x", onclick: () => back.remove(), "aria-label": t("Close") }, "×")),
+      el("div", { class: "x", onclick: () => close(), "aria-label": t("Close") }, "×")),
     el("div", { class: "modal-body" }, body));
   if (footer) m.appendChild(el("div", { class: "modal-foot" }, footer));
   back.appendChild(m);
   i18nApply(m); // localize the modal's English content (titles, labels, hints, buttons)
   associateLabels(m); // wire form labels to their controls for screen readers
   document.body.appendChild(back);
+  document.addEventListener("keydown", onKey);
+  // Move focus into the modal: first focusable control, else the dialog container.
+  const focusable = m.querySelector(
+    'input:not([type=hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])');
+  (focusable || m).focus();
+  // Route every existing back.remove() call site through close() so they also
+  // detach the keydown listener and restore focus (close() de-dupes; the native
+  // removal happens via domRemove inside close). back.close is an explicit alias.
+  back.remove = close;
+  back.close = close;
   return back;
 }
 
@@ -1411,8 +1474,8 @@ function manualForm(ep) {
   const wrap = el("div", {},
     el("div", { class: "field" }, el("label", {}, "Name"), el("input", { type: "text", id: "f-name", value: ep.name || "" })),
     el("div", { style: "display:flex;gap:12px" },
-      el("div", { class: "field", style: "flex:2" }, el("label", {}, "Server"), el("input", { type: "text", id: "f-server", value: ep.server || "" })),
-      el("div", { class: "field", style: "flex:1" }, el("label", {}, "Port"), el("input", { type: "number", id: "f-port", value: ep.port || "" }))),
+      el("div", { class: "field", style: "flex:2;min-width:0" }, el("label", {}, "Server"), el("input", { type: "text", id: "f-server", value: ep.server || "" })),
+      el("div", { class: "field", style: "flex:1;min-width:0" }, el("label", {}, "Port"), el("input", { type: "number", id: "f-port", value: ep.port || "" }))),
     el("div", { class: "field" }, el("label", {}, "Protocol"), protoSel),
     dyn,
     el("div", { class: "field", style: "margin-top:12px" },
@@ -1883,25 +1946,47 @@ function paintCause(d, e) {
   // down tunnel reads as a one-glance diagnostic with actionable guidance right there.
   if (h.cause_fix) d.appendChild(el("div", { class: "cause-fix" }, "↳ " + h.cause_fix));
 }
+// refreshPills repaints on every ~5 s health tick. The set of [data-*] elements only
+// changes when the page DOM is rebuilt (route() bumps pillGen), so the six full-tree
+// querySelectorAll scans are cached here and reused across ticks — rebuilt lazily only
+// when the generation changes. Behavior is identical; just no repeated DOM scanning.
+let pillGen = 0;
+let pillCacheGen = -1;
+let pillCache = null;
+function pillNodes() {
+  if (pillCacheGen !== pillGen || !pillCache) {
+    pillCache = {
+      health: document.querySelectorAll("[data-health]"),
+      stats: document.querySelectorAll("[data-stats]"),
+      cause: document.querySelectorAll("[data-cause]"),
+      plugin: document.querySelectorAll("[data-plugin]"),
+      engine: document.querySelectorAll("[data-engine]"),
+      spark: document.querySelectorAll("[data-spark]"),
+    };
+    pillCacheGen = pillGen;
+  }
+  return pillCache;
+}
 function refreshPills() {
-  document.querySelectorAll("[data-health]").forEach(span => {
+  const c = pillNodes();
+  c.health.forEach(span => {
     const e = findEndpoint(span.getAttribute("data-health"));
     if (e) paintPill(span, e);
   });
-  document.querySelectorAll("[data-stats]").forEach(div => {
+  c.stats.forEach(div => {
     const e = findEndpoint(div.getAttribute("data-stats"));
     if (e) paintStats(div, e);
   });
-  document.querySelectorAll("[data-cause]").forEach(div => {
+  c.cause.forEach(div => {
     const e = findEndpoint(div.getAttribute("data-cause"));
     if (e) paintCause(div, e);
   });
-  document.querySelectorAll("[data-plugin]").forEach(span => {
+  c.plugin.forEach(span => {
     const e = findEndpoint(span.getAttribute("data-plugin"));
     if (e) paintPluginBadge(span, e);
   });
-  document.querySelectorAll("[data-engine]").forEach(t => paintEngineTile(t));
-  document.querySelectorAll("[data-spark]").forEach(c => drawSpark(c, sparkBuf[c.getAttribute("data-spark")]));
+  c.engine.forEach(t => paintEngineTile(t));
+  c.spark.forEach(cv => drawSpark(cv, sparkBuf[cv.getAttribute("data-spark")]));
   paintHero();
   paintConnections(); // live-refresh the connections table (no-op off the dashboard)
   paintSystem();      // live-refresh RAM/temp + compute real interface throughput rates
@@ -2015,7 +2100,7 @@ function selfUpdateCard() {
     body.innerHTML = "";
     const avail = !!s.update_available;
     const badge = avail
-      ? el("span", { class: "badge", style: "margin-left:8px;background:var(--ok);color:#04240f" }, "update → " + (s.latest || "?"))
+      ? el("span", { class: "badge badge-ok", style: "margin-left:8px" }, "update → " + (s.latest || "?"))
       : el("span", { class: "pill muted", style: "margin-left:8px" }, el("span", { class: "dot" }), s.error ? "check failed" : "up to date");
     body.appendChild(el("div", { class: "row-between" },
       el("div", {},
@@ -2108,19 +2193,19 @@ async function installVersion(e, version, btn) {
    server-side /api/healthcheck (clock skew + IPv6 leak the browser can't probe).
    Results live in state.hbat so they survive tab navigation; nothing runs until the
    family clicks Run (router-light). Worst row drives the banner; FAIL rows auto-expand. */
-const HC_ORDER = ["core", "internet", "tunnels", "censored", "exit", "time", "ipv6", "dns", "system", "log"];
+const HC_ORDER = ["core", "internet", "tunnels", "censored", "exit", "time", "ipv6", "dns", "offload", "system", "log"];
 const HC_LABEL = {
   core: "VPN core running", internet: "Internet works", tunnels: "VPN tunnels healthy",
   censored: "Blocked sites reachable", exit: "Exit IP",
   time: "Router clock is correct", ipv6: "No IPv6 leak", dns: "DNS is private",
-  system: "Router resources", log: "No engine errors",
+  offload: "Flow offload", system: "Router resources", log: "No engine errors",
 };
 const HC_DEEP = { connections: ["#connections", "Open Connections"], routing: ["#routing", "Open Routing"] };
 // CHECKS maps an id to its client-side thunk. time/ipv6/dns are NOT here — they fold
 // in from the backend /api/healthcheck call (see HC_BACKEND). This single map drives
 // BOTH the full battery run and a single-row re-check, so the two can never drift.
 const CHECKS = { core: chkCore, internet: chkInternet, tunnels: chkTunnels, censored: chkCensored, exit: chkExit, system: chkSystem, log: chkLog };
-const HC_BACKEND = ["time", "ipv6", "dns"];
+const HC_BACKEND = ["time", "ipv6", "dns", "offload"];
 
 function healthBatteryCard() {
   const card = el("div", { class: "card", id: "hbat" });
@@ -2641,11 +2726,19 @@ function renderReachMatrix(out, r) {
     el("thead", {}, el("tr", {}, th("Exit", "name"), th("Status", "status"), th("Latency", "latency", true))),
     el("tbody", {}, ...rows.map(x => {
       const ok = x.reachable, ms = ok ? x.latency_ms : null;
+      const band = ms == null ? null : ms < 150 ? "fast" : ms < 600 ? "moderate" : "slow";
       const latCls = ms == null ? "" : ms < 150 ? "lat-ok" : ms < 600 ? "lat-warn" : "lat-err";
+      // Color alone conveys latency quality, which is invisible to colorblind users. Add a
+      // tiny fixed-width leading glyph (monochrome-distinguishable: blank/"~"/"!") that differs
+      // by band plus an aria-label, without disturbing the tabular-nums right-alignment or sort.
+      const glyph = band === "moderate" ? "~" : band === "slow" ? "!" : ""; // fast = no glyph (baseline); fixed cue width keeps numbers aligned
+      const latCue = ms == null ? null : el("span", { class: "lat-cue", "aria-hidden": "true", style: "display:inline-block;width:1.1em;text-align:center" }, glyph);
+      const latText = ok ? (ms + " ms") : "—";
+      const latAria = ms == null ? latText : (ms + " ms, " + band);
       return el("tr", {},
         el("td", { "data-label": "Exit" }, x.name || x.egress),
         el("td", { "data-label": "Status" }, el("span", { class: "pill " + (ok ? "ok" : "err") }, el("span", { class: "dot" }), ok ? "reachable" : "unreachable")),
-        el("td", { "data-label": "Latency", class: "rm-r " + latCls, title: x.err || "" }, ok ? (ms + " ms") : "—"));
+        el("td", { "data-label": "Latency", class: "rm-r " + latCls, title: x.err || "", "aria-label": latAria }, latCue, latText));
     })));
   out.appendChild(table);
   const wan = rows.find(x => x.egress === "direct");
@@ -3005,7 +3098,7 @@ function renderVersionTable(box, binaries, sv, c, con) {
       const avail = !!b.update_available;
       const latest = b.managed === "apt" ? t("apt-managed") : (b.latest || (b.latest_error ? t("unknown") : "—"));
       const status = avail
-        ? el("span", { class: "badge", style: "background:var(--ok);color:#04240f" }, t("update → {0}", b.latest))
+        ? el("span", { class: "badge badge-ok" }, t("update → {0}", b.latest))
         : (b.managed === "apt" ? el("span", { class: "hint" }, t("via apt"))
           : el("span", { class: "pill muted" }, el("span", { class: "dot" }), b.latest_error ? t("check failed") : t("up to date")));
       let act = null;
@@ -3155,12 +3248,25 @@ async function renderSettings(view) {
   ];
   const routeMode = el("select", {}, ...ROUTE_MODES.map(m => el("option", { value: m[0] }, m[1])));
   routeMode.value = cfg.routing_mode || "";
+  // Flow offload (Phase 1b): accelerates GENERAL traffic in Fast mode. Carve-outs are
+  // mark-routed and auto-excluded from the flowtable, so they keep working. Devices blank
+  // => the daemon auto-probes the WAN uplink + LAN bridge.
+  const OFFLOAD_MODES = [
+    ["", t("Off (default)")],
+    ["sw", t("Software flow-offload")],
+    ["hw", t("Hardware offload (NIC/PPE) — fastest where supported")],
+  ];
+  const offloadSel = el("select", {}, ...OFFLOAD_MODES.map(m => el("option", { value: m[0] }, m[1])));
+  offloadSel.value = cfg.offload || "";
+  const offloadDevs = el("input", { type: "text", placeholder: t("auto-detect (leave blank)") });
+  offloadDevs.value = (cfg.offload_devices || []).join(" ");
 
   const save = el("button", { class: "btn btn-primary" }, t("Save settings"));
   const status = el("span", { class: "hint", style: "margin-right:12px" });
   const dirtyBadge = el("span", { class: "dirty-badge", style: "display:none" }, t("Unsaved changes"));
   const errBox = el("div", { class: "settings-errors" });
   let lastSavedRouteMode = cfg.routing_mode || "";
+  let lastSavedOffload = (cfg.offload || "") + "|" + ((cfg.offload_devices || []).join(" "));
 
   // collectSettings builds the saved config object from the live controls. Field
   // handling matches the server's expectations: the mirrors direct-first ""
@@ -3175,6 +3281,8 @@ async function renderSettings(view) {
       listen: listen.value.trim(),
       demo: demo.checked,
       routing_mode: routeMode.value,
+      offload: offloadSel.value,
+      offload_devices: offloadDevs.value.split(/[\s,]+/).map(s => s.trim()).filter(Boolean),
       ports: { ui: +pUI.value || 0, clash: +pClash.value || 0, dns: +pDNS.value || 0, mixed: +pMixed.value || 0 },
       clash: { controller: clashCtl.value.trim(), secret: clashSec.value },
       singbox: { bin: sbBin.value.trim(), config: sbCfg.value.trim() },
@@ -3232,11 +3340,15 @@ async function renderSettings(view) {
       const r = await api.put("/api/config", next);
       status.textContent = "";
       const routeModeChanged = (next.routing_mode || "") !== lastSavedRouteMode;
+      const offloadNow = (next.offload || "") + "|" + ((next.offload_devices || []).join(" "));
+      const offloadChanged = offloadNow !== lastSavedOffload;
       cfg = next;
       lastSavedRouteMode = next.routing_mode || "";
+      lastSavedOffload = offloadNow;
       baseline = JSON.stringify(collectSettings()); _settingsDirty = false; dirtyBadge.style.display = "none";
       toast(r.restart_needed ? t("Saved — restart WakeRoute for all changes to take effect.") : t("Saved."), "ok");
       if (routeModeChanged) toast(t("Routing mode changed — press Apply (top bar) to activate it."), "info");
+      else if (offloadChanged) toast(t("Flow offload changed — press Apply (top bar) to activate it."), "info");
     } catch (e) { status.textContent = ""; toast(e.message, "err"); }
     finally { save.disabled = false; }
   });
@@ -3244,7 +3356,11 @@ async function renderSettings(view) {
   view.appendChild(el("div", { class: "card" },
     el("div", { class: "card-title", style: "margin-bottom:8px" }, t("Routing mode")),
     el("div", { class: "hint", style: "margin-bottom:10px" }, t("How LAN traffic is routed. «Fast» keeps your tunnels/carve-outs for IPs (calls, VoWiFi) but lets general traffic (downloads, games) take the kernel fast-path instead of the userspace proxy — much higher throughput. Takes effect on the next Apply.")),
-    field(t("Mode"), routeMode)));
+    field(t("Mode"), routeMode),
+    el("div", { class: "hint", style: "margin:14px 0 10px" }, t("Flow offload accelerates general (non-tunnel) traffic via the kernel/hardware fast path in «Fast» mode. Your tunnel carve-outs (calls, VoWiFi, blocked sites) are mark-routed and automatically excluded from the flowtable, so they keep working. Enable «Hardware» only on routers whose NIC supports it. Leave devices blank to auto-detect the WAN + LAN interfaces. Takes effect on the next Apply.")),
+    el("div", { style: "display:flex;gap:12px;flex-wrap:wrap" },
+      el("div", { style: "flex:1;min-width:220px" }, field(t("Flow offload"), offloadSel)),
+      el("div", { style: "flex:1;min-width:220px" }, field(t("Offload devices"), offloadDevs)))));
 
   view.appendChild(el("div", { class: "card" },
     el("div", { class: "card-title", style: "margin-bottom:12px" }, t("Web panel")),

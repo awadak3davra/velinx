@@ -34,7 +34,7 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	// The checks are independent + each fans out to remote probes, so run them
 	// concurrently — sequential would risk blowing the request timeout.
-	checks := []func(context.Context) healthRow{clockSkewCheck, ipv6LeakCheck, dnsHealthCheck}
+	checks := []func(context.Context) healthRow{clockSkewCheck, ipv6LeakCheck, dnsHealthCheck, flowOffloadCheck}
 	rows := make([]healthRow, len(checks))
 	var wg sync.WaitGroup
 	for i, fn := range checks {
@@ -49,6 +49,7 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 func clockSkewCheck(ctx context.Context) healthRow {
 	row := healthRow{ID: "time", Label: "Router clock is correct"}
 	cl := &http.Client{Timeout: 6 * time.Second}
+	defer cl.CloseIdleConnections() // release pooled TCP conns (matches dohProbe) — no idle-conn buildup on the 256 MB router
 	var dateHdr string
 	for _, u := range []string{"https://www.cloudflare.com/", "https://www.google.com/generate_204"} {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, u, nil)
@@ -110,6 +111,7 @@ func ipv6LeakCheck(ctx context.Context) healthRow {
 	}
 	// Global v6 present — does raw v6 actually reach the internet (bypassing v4 tunnels)?
 	cl := &http.Client{Timeout: 6 * time.Second}
+	defer cl.CloseIdleConnections() // release pooled TCP conns (matches dohProbe) — no idle-conn buildup on the 256 MB router
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api6.ipify.org", nil)
 	resp, err := cl.Do(req)
 	if err != nil {
@@ -144,6 +146,63 @@ func ipv6HasGlobal(ifInet6 string) bool {
 		return true
 	}
 	return false
+}
+
+// flowOffloadCheck reports whether the kernel flow-offload fast path is enabled. On capable
+// hardware (e.g. the MediaTek PPE on MT7981) hardware offload can multiply routed throughput
+// and cut CPU; with it off, forwarding is bounded by the CPU. This is advisory only and reads
+// the fw4 (uci) firewall config — it never changes it. IMPORTANT: WakeRoute routes tunnel
+// carve-outs by firewall mark, so a flowtable must EXCLUDE marked connections; otherwise a
+// carve-out could be offloaded straight past the VPN (a leak). The fix text says so, to avoid
+// a naive flow_offloading_hw flip. Degrades to a warn off-OpenWrt.
+func flowOffloadCheck(_ context.Context) healthRow {
+	row := healthRow{ID: "offload", Label: "Flow offload (fast path)"}
+	b, err := os.ReadFile("/etc/config/firewall")
+	if err != nil {
+		row.Status, row.Summary = "warn", "can't read the firewall config (non-OpenWrt?)"
+		return row
+	}
+	sw, hw := parseOffloadConfig(string(b))
+	switch {
+	case sw && hw:
+		row.Status, row.Summary = "pass", "hardware flow offload enabled"
+		row.Detail = "general routed (non-tunnel) traffic uses the hardware fast path"
+	case sw:
+		row.Status, row.Summary = "pass", "software flow offload enabled"
+		row.Detail = "routed traffic uses the software fast path; hardware offload may give more throughput on capable NICs"
+	case hw && !sw:
+		row.Status, row.Summary = "warn", "hardware offload set but software offload is off"
+		row.Detail = "flow_offloading_hw has no effect unless flow_offloading is also enabled"
+		row.Fix = "Set firewall flow_offloading '1' as well so hardware offload can take effect."
+	default:
+		row.Status, row.Summary = "warn", "flow offload is off"
+		row.Detail = "general routed throughput is bounded by the CPU forwarding rate; the hardware fast path is unused"
+		row.Fix = "Enabling flow offload (hardware where supported) can greatly increase routed throughput and lower CPU. Because WakeRoute routes tunnel carve-outs by firewall mark, the flowtable must EXCLUDE marked connections so a carve-out isn't offloaded past the VPN — don't just flip flow_offloading_hw without that exclusion."
+	}
+	return row
+}
+
+// parseOffloadConfig reads the fw4 (uci) firewall text and reports whether software and
+// hardware flow offloading are enabled in the defaults section. Pure (no I/O) for testing;
+// accepts the common uci truthy spellings ('1'/true/on/yes, quoted or not).
+func parseOffloadConfig(cfg string) (sw, hw bool) {
+	for _, ln := range strings.Split(cfg, "\n") {
+		f := strings.Fields(ln)
+		if len(f) >= 3 && f[0] == "option" {
+			on := false
+			switch strings.Trim(f[2], "'\"") {
+			case "1", "true", "on", "yes":
+				on = true
+			}
+			switch f[1] {
+			case "flow_offloading":
+				sw = on
+			case "flow_offloading_hw":
+				hw = on
+			}
+		}
+	}
+	return sw, hw
 }
 
 // dnsHealthCheck probes whether encrypted DNS (DoH) is reachable from the router.

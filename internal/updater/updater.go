@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -87,10 +88,32 @@ func New(binDir, arch string, mirrors []string) *Updater {
 	if arch == "" {
 		arch = runtime.GOARCH // mipsle/mips/arm/arm64/amd64 line up with our tokens
 	}
+	mirrors = sanitizeMirrors(mirrors)
 	if len(mirrors) == 0 {
 		mirrors = []string{""}
 	}
 	return &Updater{BinDir: binDir, Arch: arch, Mirrors: mirrors, hc: &http.Client{}}
+}
+
+// sanitizeMirrors keeps only usable mirror prefixes: the "" sentinel (direct, no
+// mirror) and absolute http:// or https:// prefixes. A user-set mirror that isn't a
+// valid URL prefix is concatenated straight into download URLs, so an invalid one
+// (e.g. "ghproxy.com" with no scheme, or a "file://" path) would yield a malformed
+// or unsafe request — drop it with a log line instead, keeping the rest in order.
+func sanitizeMirrors(mirrors []string) []string {
+	out := make([]string, 0, len(mirrors))
+	for _, m := range mirrors {
+		if m == "" {
+			out = append(out, m) // direct (no mirror) sentinel — always valid
+			continue
+		}
+		if strings.HasPrefix(m, "http://") || strings.HasPrefix(m, "https://") {
+			out = append(out, m)
+			continue
+		}
+		log.Printf("updater: ignoring invalid mirror %q (must be an http:// or https:// prefix)", m)
+	}
+	return out
 }
 
 // Installed reports the on-disk state of an engine.
