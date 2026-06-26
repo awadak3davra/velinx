@@ -5,7 +5,7 @@
 **Run any modern VPN/proxy protocol on your router — from one clean web panel, with automatic failover.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-22a06b?style=flat-square)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.3.0-0097dc?style=flat-square)](../../releases/latest)
+[![Release](https://img.shields.io/badge/release-v0.3.1-0097dc?style=flat-square)](../../releases/latest)
 [![Go](https://img.shields.io/badge/go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white)](go.mod)
 [![Platforms](https://img.shields.io/badge/router-OpenWrt%20%C2%B7%20Keenetic%20%C2%B7%20Entware-151c28?style=flat-square)](#install)
 [![Arches](https://img.shields.io/badge/arch-mipsle%20%C2%B7%20mips%20%C2%B7%20arm%20%C2%B7%20arm64%20%C2%B7%20amd64-555?style=flat-square)](#install)
@@ -130,7 +130,7 @@ Single-arch, by hand:
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
-  -ldflags "-s -w -X wakeroute/internal/version.Version=0.3.0" \
+  -ldflags "-s -w -X wakeroute/internal/version.Version=0.3.1" \
   -o wakeroute-arm64 ./cmd/wakeroute
 ```
 
@@ -143,12 +143,13 @@ go run ./cmd/wakeroute --demo --listen 127.0.0.1:8088
 
 ---
 
-## 🆕 What's new in 0.3.0
+## 🆕 What's new in 0.3.1
 
-- **Keenetic kernel-PBR backend** — native `iptables` + `ipset` policy routing for KeeneticOS (which ships no nftables): `hash:net` ipsets, fwmark marking, per-list routing tables, a load-independent failover cron, and a scripted cutover/rollback that leaves your default route untouched.
+- **Settings backup & restore** — download/restore the whole config (secrets redacted by default) and a lock-out-safe **reset to defaults**. Secret fields are masked with a reveal toggle, client-side validation catches bad input before saving, and "restart needed" is now accurate (only real startup-time changes flag it). The Host allow-list is applied **per-request**, so a too-narrow list is recoverable from the UI without SSH.
+- **Keenetic kernel-PBR backend** *(0.3.0)* — native `iptables` + `ipset` policy routing for KeeneticOS (which ships no nftables): `hash:net` ipsets, fwmark marking, per-list routing tables, a load-independent failover cron, and a scripted cutover/rollback that leaves your default route untouched.
 - **Live connections grouped by destination IP**, with per-port byte counts.
 - **DPI-desync engine (nfqws)** supervised as a long-running plugin.
-- **Fixes** — iface-bound per-exit reachability testing (with an SSRF guard + IPv4 preference), monitor-mode core detection, and kernel-plane forwarding correctness (tunnel NAT, LAN-exclusion, and a symmetric IPv6 datapath). See the [changelog](CHANGELOG.md).
+- **Fixes** — iface-bound per-exit reachability testing (SSRF-guarded, IPv4-preferred), monitor-mode core detection, and kernel-plane forwarding correctness (tunnel NAT, LAN-exclusion, symmetric IPv6 datapath). See the [changelog](CHANGELOG.md).
 
 ---
 

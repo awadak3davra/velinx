@@ -12,7 +12,7 @@ import (
 // used to GET secrets, not just to POST.
 func TestHostAllowGuard(t *testing.T) {
 	mkHandler := func(allowed []string, reached *bool) http.Handler {
-		return hostAllowGuard(allowed, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		return hostAllowGuard(func() []string { return allowed }, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			*reached = true
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -66,11 +66,11 @@ func TestNormalizeHost(t *testing.T) {
 	cases := map[string]string{
 		"192.168.2.1:8088": "192.168.2.1",
 		"192.168.2.1":      "192.168.2.1",
-		"Router.LAN:8088":   "router.lan",
-		"ROUTER.LAN":        "router.lan",
-		"[::1]:8088":        "::1",
-		"[fe80::1]":         "fe80::1",
-		"  10.0.0.30  ":     "10.0.0.30",
+		"Router.LAN:8088":  "router.lan",
+		"ROUTER.LAN":       "router.lan",
+		"[::1]:8088":       "::1",
+		"[fe80::1]":        "fe80::1",
+		"  10.0.0.30  ":    "10.0.0.30",
 	}
 	for in, want := range cases {
 		if got := normalizeHost(in); got != want {

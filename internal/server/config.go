@@ -26,75 +26,188 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.config())
 }
 
-// handlePutConfig validates and saves a new configuration. Most changes take
-// effect on the next daemon restart (restart_needed).
+// handlePutConfig validates and saves a new configuration. The response reports
+// whether a daemon restart is required for the change to take effect (see
+// restartNeeded); hot fields apply on the next Apply or immediately.
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
+	in, err := decodeConfigBody(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	old := s.config() // snapshot BEFORE persist (cfgMu is non-reentrant) for the restart diff
+	if err := s.persistConfig(in); err != nil {
+		writeErr(w, http.StatusInternalServerError, "save failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "restart_needed": restartNeeded(old, *in)})
+}
+
+// decodeConfigBody decodes, reconciles, and validates a config request body,
+// returning a 400-worthy error for malformed JSON, a bad listen, or any value
+// that would not start (config.Validate). Shared by PUT and import.
+func decodeConfigBody(r *http.Request) (*config.Config, error) {
+	var in config.Config
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		return nil, fmt.Errorf("invalid JSON body")
+	}
+	if err := reconcileListen(&in); err != nil {
+		return nil, err
+	}
+	if err := in.Validate(); err != nil {
+		return nil, err
+	}
+	return &in, nil
+}
+
+// persistConfig applies in's user-settable fields onto the live config and saves
+// it durably, under cfgMu so it can't race subToken()/handleGetConfig() or the
+// config.json.tmp file.
+func (s *Server) persistConfig(in *config.Config) error {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	applyConfigFields(s.cfg, in)
+	return s.cfg.Save()
+}
+
+// reconcileListen forces Listen's port to equal Ports.UI so the two encodings of
+// the panel port can't diverge — editing the UI port in Settings MOVES the bind
+// (the documented escape from the lighttpd :8088 conflict). Listen keeps its
+// host/interface. A malformed Listen is rejected here, not at the next restart.
+func reconcileListen(in *config.Config) error {
+	host, _, err := net.SplitHostPort(in.Listen)
+	if err != nil {
+		return fmt.Errorf(`listen must be host:port (e.g. ":8088" or "192.168.1.1:8088")`)
+	}
+	in.Listen = net.JoinHostPort(host, strconv.Itoa(in.Ports.UI))
+	return nil
+}
+
+// applyConfigFields copies the user-settable exported fields from in onto dst,
+// preserving dst's unexported file path. Subscription is deliberately NOT copied:
+// its token is rotated through its own path, never the bulk Settings PUT, so a
+// Settings save can't invalidate a client's subscription URL.
+// TestApplyConfigFields_CopiesEveryExportedField fails if a new exported config
+// field is added without a copy line here (the silent-drop class that once hit
+// the gateway flag and the offload fields).
+func applyConfigFields(dst, in *config.Config) {
+	dst.Listen = in.Listen
+	dst.DataDir = in.DataDir
+	dst.Demo = in.Demo
+	dst.Gateway = in.Gateway
+	dst.GatewayMTU = in.GatewayMTU
+	dst.GatewayAddr = in.GatewayAddr
+	dst.RoutingMode = in.RoutingMode
+	dst.Offload = in.Offload
+	dst.OffloadDevices = in.OffloadDevices
+	dst.Ports = in.Ports
+	dst.Clash = in.Clash
+	dst.SingBox = in.SingBox
+	dst.Updater = in.Updater
+	dst.FailSafe = in.FailSafe
+	dst.Watchdog = in.Watchdog
+	dst.AllowedHosts = in.AllowedHosts
+	// NOT copied: Subscription (token protection — rotated via its own path).
+}
+
+// restartNeeded reports whether moving old->nw requires a daemon restart to take
+// effect. Only fields consumed at startup — the bind, the reserved ports, the
+// proxy-core wiring, and demo synthesis — need one; the rest (failsafe target,
+// watchdog URL, updater mirrors, routing_mode, and allowed_hosts now that the
+// host guard is evaluated per request) apply on the next Apply or immediately.
+func restartNeeded(old, nw config.Config) bool {
+	return old.Listen != nw.Listen ||
+		old.Ports != nw.Ports ||
+		old.SingBox != nw.SingBox ||
+		old.Clash != nw.Clash ||
+		old.Demo != nw.Demo
+}
+
+// validatePorts is retained as a thin wrapper over config.Ports.Validate for the
+// existing port-validation test; new code validates via config.Validate.
+func validatePorts(p config.Ports) error { return p.Validate() }
+
+// handleConfigExport returns the daemon config as a downloadable JSON attachment.
+// Secrets (clash secret, subscription token, watchdog webhook) are REDACTED by
+// default so a backup shared for support can't leak credentials; ?secrets=1
+// includes them for a full personal backup. Read-only.
+func (s *Server) handleConfigExport(w http.ResponseWriter, r *http.Request) {
+	cfg := s.config()
+	if r.URL.Query().Get("secrets") != "1" {
+		cfg = cfg.Redacted()
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "marshal failed: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="wakeroute-config.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// handleConfigImport replaces the daemon config from an uploaded backup. The body
+// is reconciled/validated exactly like PUT, and a secret still equal to the
+// redaction sentinel means "keep the current value" so importing a redacted
+// backup doesn't wipe secrets. Most changes need a restart.
+func (s *Server) handleConfigImport(w http.ResponseWriter, r *http.Request) {
 	var in config.Config
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if in.Listen == "" {
-		writeErr(w, http.StatusBadRequest, "listen address is required")
-		return
+	old := s.config()
+	// Un-redact: a sentinel secret means "unchanged" — don't persist the mask.
+	if in.Clash.Secret == config.RedactedMark {
+		in.Clash.Secret = old.Clash.Secret
 	}
-	if err := validatePorts(in.Ports); err != nil {
+	if in.Watchdog.NotifyURL == config.RedactedMark {
+		in.Watchdog.NotifyURL = old.Watchdog.NotifyURL
+	}
+	// Subscription is never applied (see applyConfigFields), so its sentinel is moot.
+	if err := reconcileListen(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Listen and Ports.UI both encode the panel's bind port; keep them from diverging so editing
-	// the UI port in Settings actually MOVES the bind (the documented escape from the lighttpd
-	// :8088 conflict) instead of silently no-opping. Ports.UI is authoritative for the port; Listen
-	// keeps its host/interface. Reject a malformed Listen here rather than letting ListenAndServe
-	// fail (log.Fatal) at the next restart.
-	host, _, splitErr := net.SplitHostPort(in.Listen)
-	if splitErr != nil {
-		writeErr(w, http.StatusBadRequest, `listen must be host:port (e.g. ":8088" or "192.168.1.1:8088")`)
+	if err := in.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	in.Listen = net.JoinHostPort(host, strconv.Itoa(in.Ports.UI))
-
-	// Apply exported fields to the live config (the unexported file path on
-	// s.cfg is preserved), then persist — under the config lock so we don't race
-	// subToken()/handleGetConfig() on the shared struct or the config.json.tmp file.
-	s.cfgMu.Lock()
-	s.cfg.Listen = in.Listen
-	s.cfg.DataDir = in.DataDir
-	s.cfg.Demo = in.Demo
-	s.cfg.Gateway = in.Gateway
-	s.cfg.GatewayMTU = in.GatewayMTU
-	s.cfg.GatewayAddr = in.GatewayAddr
-	s.cfg.RoutingMode = in.RoutingMode
-	s.cfg.Ports = in.Ports
-	s.cfg.Clash = in.Clash
-	s.cfg.SingBox = in.SingBox
-	s.cfg.Updater = in.Updater
-	s.cfg.FailSafe = in.FailSafe
-	s.cfg.Watchdog = in.Watchdog
-	s.cfg.AllowedHosts = in.AllowedHosts
-	err := s.cfg.Save()
-	s.cfgMu.Unlock()
-	if err != nil {
+	if err := s.persistConfig(&in); err != nil {
 		writeErr(w, http.StatusInternalServerError, "save failed: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "restart_needed": true})
+	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "restart_needed": restartNeeded(old, in)})
 }
 
-func validatePorts(p config.Ports) error {
-	ports := []struct {
-		name string
-		v    int
-	}{{"ui", p.UI}, {"clash", p.Clash}, {"dns", p.DNS}, {"mixed", p.Mixed}}
-	seen := map[int]string{}
-	for _, pp := range ports {
-		if pp.v < 1 || pp.v > 65535 {
-			return fmt.Errorf("port %s=%d is out of range (1-65535)", pp.name, pp.v)
+// handleConfigReset restores default settings while PRESERVING the fields that
+// keep the operator reachable: the bind (Listen + Ports.UI), the Host allow-list,
+// and the subscription token. Without that carve-out a reset could move the UI
+// port or strand the user with no way back into the panel. Most changes need a
+// restart.
+func (s *Server) handleConfigReset(w http.ResponseWriter, r *http.Request) {
+	old := s.config()
+	def := config.Default()
+	def.Listen = old.Listen
+	def.Ports.UI = old.Ports.UI
+	def.AllowedHosts = old.AllowedHosts
+	def.Subscription = old.Subscription // moot (Subscription not copied) but explicit
+	_ = reconcileListen(def)            // align Listen with the preserved UI port
+	// Reset is a recovery action, so it must always produce a VALID config. The only
+	// preserved user-data that could be invalid is AllowedHosts (e.g. a blank entry
+	// from a hand-edited config.json); if it makes the reset config invalid, drop it
+	// rather than refuse to reset. A final Validate guards against any other surprise.
+	if err := def.Validate(); err != nil {
+		def.AllowedHosts = nil
+		if err := def.Validate(); err != nil {
+			writeErr(w, http.StatusInternalServerError, "reset produced an invalid config: "+err.Error())
+			return
 		}
-		if other, ok := seen[pp.v]; ok {
-			return fmt.Errorf("ports %s and %s cannot both be %d", pp.name, other, pp.v)
-		}
-		seen[pp.v] = pp.name
 	}
-	return nil
+	if err := s.persistConfig(def); err != nil {
+		writeErr(w, http.StatusInternalServerError, "save failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "restart_needed": restartNeeded(old, *def)})
 }

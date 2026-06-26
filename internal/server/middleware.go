@@ -291,24 +291,33 @@ func limitBody(next http.Handler) http.Handler {
 // equal the attacker's own hostname, so only pinning Host to known names helps.
 // It applies to ALL methods — a rebinding attack could GET secrets, not just POST.
 //
-// An EMPTY list (the default) disables the guard with zero wrapping/per-request
-// cost, so behaviour is unchanged until an operator opts in (config allowed_hosts)
-// by listing the names/IPs they reach the panel by. A misconfigured list locks out
-// the UI; it is recoverable by clearing allowed_hosts in config.json + restarting.
-func hostAllowGuard(allowed []string, next http.Handler) http.Handler {
-	if len(allowed) == 0 {
-		return next
-	}
-	set := make(map[string]struct{}, len(allowed))
-	for _, h := range allowed {
-		if n := normalizeHost(h); n != "" {
-			set[n] = struct{}{}
-		}
-	}
-	if len(set) == 0 {
-		return next
-	}
+// An EMPTY list (the default) disables the guard with zero per-request cost, so
+// behaviour is unchanged until an operator opts in (config allowed_hosts) by
+// listing the names/IPs they reach the panel by.
+//
+// The list is read PER REQUEST through the accessor, not snapshotted once at
+// Handler-build time: a saved allow-list then takes effect immediately (no
+// restart), and — crucially — a too-narrow list that would lock you out is
+// recoverable straight from the live UI (clear allowed_hosts + Save), instead of
+// requiring an SSH edit of config.json + a restart. Building the set per request
+// is negligible (a handful of entries) and only happens when the list is set.
+func hostAllowGuard(allowed func() []string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		list := allowed()
+		if len(list) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		set := make(map[string]struct{}, len(list))
+		for _, h := range list {
+			if n := normalizeHost(h); n != "" {
+				set[n] = struct{}{}
+			}
+		}
+		if len(set) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if _, ok := set[normalizeHost(r.Host)]; !ok {
 			http.Error(w, "host not allowed", http.StatusForbidden)
 			return

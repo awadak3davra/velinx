@@ -225,7 +225,7 @@ function translateChrome() {
 
 /* ---------- restart the WakeRoute service ---------- */
 async function restartService() {
-  if (!confirm("Restart the WakeRoute service now?\nThe web panel will be unavailable for a few seconds while the init system brings it back.")) return;
+  if (!confirm(t("Restart the WakeRoute service now?\nThe web panel will be unavailable for a few seconds while the init system brings it back."))) return;
   try { await api.post("/api/service/restart"); }
   catch (e) { return toast(e.message, "err"); }
   toast("Restarting… the panel will reconnect when it's back.", "info");
@@ -992,9 +992,12 @@ async function delEndpoint(e) {
 
 async function renderFailover(view) {
   await loadProfile();
-  const head = el("div", { class: "row-between", style: "margin-bottom:16px" },
-    el("div", { class: "card-title" }, "Failover groups"),
-    el("button", { class: "btn btn-primary", title: "Create a failover group — pick members and traffic auto-switches to a healthy one", onclick: openNewGroup }, "+ New group"));
+  const head = el("div", { class: "block-head" },
+    el("div", {},
+      el("div", { class: "ttl" }, "Failover"),
+      el("div", { class: "desc" }, "Group your connections so traffic automatically switches to a healthy one when the active tunnel goes down.")),
+    el("div", { class: "side" },
+      el("button", { class: "btn btn-primary", title: "Create a failover group — pick members and traffic auto-switches to a healthy one", onclick: openNewGroup }, "+ New group")));
   view.appendChild(head);
 
   if (!state.profile.groups.length) {
@@ -1134,9 +1137,10 @@ async function paintRoutingStatus() {
 
 function routingRow(rl) {
   const tog = el("div", { class: "toggle" + (rl.enabled ? " on" : ""), onclick: () => toggleRoutingList(rl) });
+  const mcount = (rl.manual || []).length;
   const src = rl.source
     ? el("span", { class: "addr", title: rl.source }, "⛓ " + rlShortURL(rl.source))
-    : el("span", { class: "addr" }, (rl.manual || []).length + " manual entries");
+    : el("span", { class: "addr" }, mcount + " manual " + (mcount === 1 ? "entry" : "entries"));
   // Mutate rl in place (it IS the state.profile.routing_lists element) so the two
   // dropdowns compose: without this, the 2nd save spreads the stale closure and
   // reverts the 1st change, because saveRoutingList intentionally doesn't reload.
@@ -1966,6 +1970,10 @@ async function runSpeedtest(btn, out) {
 
 /* ---------- Updater (engine version manager) ---------- */
 async function renderUpdater(view) {
+  view.appendChild(el("div", { class: "block-head" },
+    el("div", {},
+      el("div", { class: "ttl" }, "Updater"),
+      el("div", { class: "desc" }, "Keep WakeRoute and its proxy engines up to date."))));
   view.appendChild(selfUpdateCard()); // WakeRoute self-update — at the top (fills async, non-blocking)
   let data;
   try { data = await api.get("/api/updater/engines"); }
@@ -2401,7 +2409,10 @@ const NETDIAG_PRESETS = [
 let diagWrap = null, diagOut = null;
 
 async function renderDiagnostics(view) {
-  view.appendChild(el("div", { class: "card-title", style: "margin-bottom:14px" }, "Diagnostics"));
+  view.appendChild(el("div", { class: "block-head" },
+    el("div", {},
+      el("div", { class: "ttl" }, "Diagnostics"),
+      el("div", { class: "desc" }, "Confirm everything is working, test reachability through each exit, and analyze engine logs for known errors."))));
   try { await loadProfile(); } catch (_) {} // ensure the egress dropdown lists current tunnels
   view.appendChild(healthBatteryCard()); // hero: one-click "Run all checks" battery + verdict + copy report
   if (state.hbat) paintBattery();        // restore a prior run across tab nav
@@ -3026,6 +3037,53 @@ async function updateBinary(sv, c, con, b, version) {
 /* ---------- Settings (M10) ---------- */
 function restartTag() { return el("span", { class: "tag-restart", title: t("Takes effect after the daemon restarts") }, t("↻ restart")); }
 
+// secretInput is a password-type field with a Show/Hide reveal toggle, for values
+// that shouldn't sit in plain sight on an unauthenticated LAN panel (the clash
+// secret, the watchdog webhook URL which commonly embeds a token). Returns the
+// input (read .value) plus the row to place in a .field.
+function secretInput(v, ph) {
+  const input = el("input", { type: "password", value: v == null ? "" : String(v), placeholder: ph || "", autocomplete: "off", spellcheck: "false" });
+  const toggle = el("button", { class: "btn btn-sm reveal", type: "button" }, t("Show"));
+  toggle.addEventListener("click", () => {
+    const show = input.type === "password";
+    input.type = show ? "text" : "password";
+    toggle.textContent = show ? t("Hide") : t("Show");
+  });
+  return { input, row: el("div", { class: "secret-row" }, input, toggle) };
+}
+
+// Settings client-side validation mirrors config.Validate on the server (which is
+// still the authority); it just catches the common foot-guns before a round-trip
+// (a blank port that becomes 0 → 400, a malformed listen, a non-URL webhook).
+function isHostPort(s) { const m = /^(.*):(\d{1,5})$/.exec(s || ""); return !!m && +m[2] >= 1 && +m[2] <= 65535; }
+function isHTTPUrl(s) { return /^https?:\/\//i.test(s || ""); }
+function normalizeHostJS(h) {
+  // Mirror the server's normalizeHost: strip :port and IPv6 brackets, lower-case.
+  // A bare IPv6 (multiple colons, no brackets) must NOT have its last group treated
+  // as a port, so only strip :port when there's exactly one colon.
+  h = String(h || "").trim().toLowerCase();
+  const m = h.match(/^\[(.+?)\](?::\d+)?$/); // [ipv6] or [ipv6]:port
+  if (m) return m[1];
+  if ((h.match(/:/g) || []).length === 1) h = h.replace(/:\d+$/, "");
+  return h;
+}
+function validateSettingsClient(next) {
+  const errs = [];
+  if (!isHostPort(next.listen)) errs.push(t("Listen must be host:port (for example :8088)."));
+  const pv = [next.ports.ui, next.ports.clash, next.ports.dns, next.ports.mixed];
+  if (pv.some(p => !(p >= 1 && p <= 65535))) errs.push(t("Every port must be between 1 and 65535."));
+  else if (new Set(pv).size !== pv.length) errs.push(t("The four ports must all be different."));
+  if (next.clash.controller && !isHostPort(next.clash.controller)) errs.push(t("Clash controller must be host:port."));
+  if (next.watchdog.notify_url && !isHTTPUrl(next.watchdog.notify_url)) errs.push(t("Webhook URL must start with http:// or https://."));
+  (next.updater.mirrors || []).filter(Boolean).forEach(m => { if (!isHTTPUrl(m)) errs.push(t("Updater mirror is not a URL: ") + m); });
+  return errs;
+}
+
+// Module-scoped so the single beforeunload guard (added once) can see the live
+// dirty state without re-binding on every Settings render.
+let _settingsDirty = false;
+let _settingsUnloadHooked = false;
+
 async function renderSettings(view) {
   let cfg;
   try { cfg = await api.get("/api/config"); }
@@ -3034,7 +3092,7 @@ async function renderSettings(view) {
   view.appendChild(el("div", { class: "block-head" },
     el("div", {},
       el("div", { class: "ttl" }, t("Settings")),
-      el("div", { class: "desc" }, t("Daemon configuration. Fields tagged ↻ take effect after WakeRoute restarts; the rest apply on the next Apply."))),
+      el("div", { class: "desc" }, t("Daemon configuration. Saving here stores these settings; the Apply button in the top bar regenerates routing — they are separate actions. Fields tagged ↻ take effect only after WakeRoute restarts."))),
     el("div", { class: "side" })));
 
   // Appearance — client-side prefs (theme + language persist in localStorage, not server config).
@@ -3066,7 +3124,8 @@ async function renderSettings(view) {
   const sbBin = txt(cfg.singbox && cfg.singbox.bin, "/opt/sbin/sing-box");
   const sbCfg = txt(cfg.singbox && cfg.singbox.config, "/opt/etc/wakeroute/singbox.json");
   const clashCtl = txt(cfg.clash && cfg.clash.controller, "127.0.0.1:9090");
-  const clashSec = txt(cfg.clash && cfg.clash.secret, "(optional)");
+  const clashSecF = secretInput(cfg.clash && cfg.clash.secret, t("optional"));
+  const clashSec = clashSecF.input;
   // Ports
   const pUI = num(cfg.ports && cfg.ports.ui), pClash = num(cfg.ports && cfg.ports.clash),
     pDNS = num(cfg.ports && cfg.ports.dns), pMixed = num(cfg.ports && cfg.ports.mixed);
@@ -3075,8 +3134,9 @@ async function renderSettings(view) {
   const directFirst = el("input", { type: "checkbox" }); directFirst.checked = mirrors0.includes("");
   const mirrorsTA = el("textarea", { placeholder: "https://ghproxy.net/\nhttps://mirror.ghproxy.com/" });
   mirrorsTA.value = mirrors0.filter(m => m !== "").join("\n");
-  // Watchdog
-  const wdURL = txt(cfg.watchdog && cfg.watchdog.notify_url, "https://… webhook (optional, blank = off)");
+  // Watchdog (webhook may embed a token → masked)
+  const wdURLF = secretInput(cfg.watchdog && cfg.watchdog.notify_url, "https://… (optional, blank = off)");
+  const wdURL = wdURLF.input;
   // Fail-safe (Apply rollback)
   const fsTarget = txt(cfg.failsafe && cfg.failsafe.target, "1.1.1.1");
   const fsReboot = el("input", { type: "checkbox" }); fsReboot.checked = !!(cfg.failsafe && cfg.failsafe.auto_reboot);
@@ -3098,12 +3158,19 @@ async function renderSettings(view) {
 
   const save = el("button", { class: "btn btn-primary" }, t("Save settings"));
   const status = el("span", { class: "hint", style: "margin-right:12px" });
+  const dirtyBadge = el("span", { class: "dirty-badge", style: "display:none" }, t("Unsaved changes"));
+  const errBox = el("div", { class: "settings-errors" });
+  let lastSavedRouteMode = cfg.routing_mode || "";
 
-  save.addEventListener("click", async () => {
+  // collectSettings builds the saved config object from the live controls. Field
+  // handling matches the server's expectations: the mirrors direct-first ""
+  // sentinel, clash.secret kept verbatim (untrimmed), ports coerced to numbers,
+  // allowed_hosts split + trimmed + de-blanked.
+  function collectSettings() {
     const mirrors = [];
     if (directFirst.checked) mirrors.push("");
     mirrorsTA.value.split("\n").map(s => s.trim()).filter(Boolean).forEach(m => mirrors.push(m));
-    const next = {
+    return {
       ...cfg,
       listen: listen.value.trim(),
       demo: demo.checked,
@@ -3116,12 +3183,60 @@ async function renderSettings(view) {
       failsafe: { ...(cfg.failsafe || {}), target: fsTarget.value.trim(), auto_reboot: fsReboot.checked },
       allowed_hosts: allowedHosts.value.split("\n").map(s => s.trim()).filter(Boolean),
     };
+  }
+
+  // Dirty tracking: baseline the controls now, flag any divergence so the user
+  // gets an "Unsaved changes" cue and a guard against losing edits on reload/close.
+  let baseline = JSON.stringify(collectSettings());
+  const markDirty = () => {
+    _settingsDirty = JSON.stringify(collectSettings()) !== baseline;
+    dirtyBadge.style.display = _settingsDirty ? "" : "none";
+  };
+  // #view persists across renders (innerHTML is cleared, not the element), so drop
+  // any prior render's delegated handler before re-adding to avoid accumulation.
+  if (view._wrDirty) { view.removeEventListener("input", view._wrDirty); view.removeEventListener("change", view._wrDirty); }
+  view._wrDirty = markDirty;
+  view.addEventListener("input", markDirty);
+  view.addEventListener("change", markDirty);
+  if (!_settingsUnloadHooked) {
+    _settingsUnloadHooked = true;
+    // Fires only while ON Settings with unsaved edits (in-app nav re-fetches config,
+    // so leaving simply discards — the badge is the warning there).
+    window.addEventListener("beforeunload", e => {
+      if (_settingsDirty && (location.hash || "#dashboard").slice(1) === "settings") { e.preventDefault(); e.returnValue = ""; }
+    });
+  }
+
+  save.addEventListener("click", async () => {
+    const next = collectSettings();
+    const errs = validateSettingsClient(next);
+    // Lock-out guard: a non-empty allow-list that omits the host you're using now
+    // would 403 you on the next request — block and offer to add it.
+    const here = normalizeHostJS(location.hostname);
+    const lockedOut = next.allowed_hosts.length && here && !next.allowed_hosts.map(normalizeHostJS).includes(here);
+    errBox.innerHTML = "";
+    errs.forEach(m => errBox.appendChild(el("div", { class: "err-row" }, m)));
+    if (lockedOut) {
+      const addBtn = el("button", { class: "btn btn-sm", type: "button" }, t("Add current host") + " (" + location.hostname + ")");
+      addBtn.addEventListener("click", () => {
+        allowedHosts.value = (allowedHosts.value.trim() ? allowedHosts.value.trim() + "\n" : "") + location.hostname;
+        markDirty(); errBox.innerHTML = "";
+      });
+      errBox.appendChild(el("div", { class: "err-row" }, t("The host you are using is not in the allow-list — you would lock yourself out.")));
+      errBox.appendChild(addBtn);
+    }
+    if (errs.length || lockedOut) { errBox.scrollIntoView({ block: "nearest" }); return; }
+
     save.disabled = true; status.textContent = t("saving…");
     try {
       const r = await api.put("/api/config", next);
       status.textContent = "";
+      const routeModeChanged = (next.routing_mode || "") !== lastSavedRouteMode;
       cfg = next;
+      lastSavedRouteMode = next.routing_mode || "";
+      baseline = JSON.stringify(collectSettings()); _settingsDirty = false; dirtyBadge.style.display = "none";
       toast(r.restart_needed ? t("Saved — restart WakeRoute for all changes to take effect.") : t("Saved."), "ok");
+      if (routeModeChanged) toast(t("Routing mode changed — press Apply (top bar) to activate it."), "info");
     } catch (e) { status.textContent = ""; toast(e.message, "err"); }
     finally { save.disabled = false; }
   });
@@ -3142,7 +3257,7 @@ async function renderSettings(view) {
       el("div", { style: "flex:1;min-width:220px" }, field(t("sing-box config"), sbCfg, true))),
     el("div", { style: "display:flex;gap:12px;flex-wrap:wrap" },
       el("div", { style: "flex:1;min-width:220px" }, field(t("Clash controller"), clashCtl)),
-      el("div", { style: "flex:1;min-width:220px" }, field(t("Clash secret"), clashSec)))));
+      el("div", { style: "flex:1;min-width:220px" }, field(t("Clash secret"), clashSecF.row)))));
 
   view.appendChild(el("div", { class: "card" },
     el("div", { class: "card-title", style: "margin-bottom:12px" }, t("Ports"), restartTag()),
@@ -3158,7 +3273,7 @@ async function renderSettings(view) {
   view.appendChild(el("div", { class: "card" },
     el("div", { class: "card-title", style: "margin-bottom:8px" }, t("Watchdog alerts")),
     el("div", { class: "hint", style: "margin-bottom:10px" }, t("Optional webhook POSTed {\"text\":\"…\"} on each sing-box crash-restart (e.g. a WGBot endpoint). Leave blank to disable.")),
-    field(t("Notify webhook URL"), wdURL)));
+    field(t("Notify webhook URL"), wdURLF.row)));
 
   view.appendChild(el("div", { class: "card" },
     el("div", { class: "card-title", style: "margin-bottom:8px" }, t("Fail-safe")),
@@ -3177,6 +3292,47 @@ async function renderSettings(view) {
     el("div", { class: "hint", style: "margin-bottom:10px" }, t("Host allow-list — one hostname or IP per line. When set, the panel only answers requests whose Host header matches one of these (a DNS-rebinding defense). Leave EMPTY to allow any host (the default). List every name/IP you use to reach the panel, or you will lock yourself out (recover by clearing it in config.json and restarting).")),
     allowedHosts));
 
+  // Backup & restore — download/upload the whole config + reset to defaults.
+  const includeSecrets = el("input", { type: "checkbox" });
+  const downloadBtn = el("button", { class: "btn", type: "button" }, t("Download backup"));
+  downloadBtn.addEventListener("click", () => {
+    const a = el("a", { href: "/api/config/export" + (includeSecrets.checked ? "?secrets=1" : ""), download: "wakeroute-config.json" });
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+  const fileInput = el("input", { type: "file", accept: "application/json,.json", style: "display:none" });
+  const restoreBtn = el("button", { class: "btn", type: "button" }, t("Restore from file…"));
+  restoreBtn.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", async () => {
+    const f = fileInput.files && fileInput.files[0];
+    if (!f) return;
+    let parsed;
+    try { parsed = JSON.parse(await f.text()); }
+    catch { fileInput.value = ""; return toast(t("That file is not valid JSON."), "err"); }
+    if (!confirm(t("Restore settings from this backup? It replaces your current settings (they are validated first)."))) { fileInput.value = ""; return; }
+    try {
+      const r = await api.post("/api/config/import", parsed);
+      toast(r.restart_needed ? t("Restored — restart WakeRoute to apply.") : t("Restored."), "ok");
+      route();
+    } catch (e) { toast(e.message, "err"); }
+    finally { fileInput.value = ""; }
+  });
+  const resetBtn = el("button", { class: "btn btn-danger", type: "button" }, t("Reset to defaults"));
+  resetBtn.addEventListener("click", async () => {
+    if (!confirm(t("Reset settings to defaults? Your panel address, UI port, host allow-list and subscription token are kept; everything else returns to defaults."))) return;
+    try {
+      const r = await api.post("/api/config/reset", {});
+      toast(r.restart_needed ? t("Reset to defaults — restart WakeRoute to apply.") : t("Reset to defaults."), "ok");
+      route();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  view.appendChild(el("div", { class: "card" },
+    el("div", { class: "card-title", style: "margin-bottom:8px" }, t("Backup & restore")),
+    el("div", { class: "hint", style: "margin-bottom:12px" }, t("Download all settings as a file, restore from a backup, or reset to defaults. Secrets are left out of a backup unless you tick “Include secrets”.")),
+    el("div", { style: "display:flex;gap:10px;flex-wrap:wrap;align-items:center" },
+      downloadBtn,
+      el("label", { class: "check", style: "display:inline-flex" }, includeSecrets, el("span", {}, t("Include secrets"))),
+      restoreBtn, fileInput, resetBtn)));
+
   const restartBtn = el("button", { class: "btn btn-danger" }, t("Restart service"));
   restartBtn.addEventListener("click", restartService);
   view.appendChild(el("div", { class: "card" },
@@ -3184,7 +3340,10 @@ async function renderSettings(view) {
     el("div", { class: "hint", style: "margin-bottom:12px" }, t("Restart the whole WakeRoute daemon (panel + proxy core). The web panel drops for a few seconds while the init system brings it back; this page reconnects automatically. (Not available in the demo.)")),
     restartBtn));
 
-  view.appendChild(el("div", { class: "row-between", style: "margin-top:4px" }, el("div"), el("div", { style: "display:flex;align-items:center" }, status, save)));
+  view.appendChild(errBox);
+  view.appendChild(el("div", { class: "row-between", style: "margin-top:4px" }, el("div"),
+    el("div", { style: "display:flex;align-items:center" }, dirtyBadge, status, save)));
+  _settingsDirty = false; dirtyBadge.style.display = "none";
 }
 
 /* ---------- data ---------- */

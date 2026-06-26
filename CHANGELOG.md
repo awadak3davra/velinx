@@ -3,6 +3,32 @@
 All notable changes to WakeRoute are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1]
+
+### Added
+- **Settings backup & restore** — download the whole configuration as a file (secrets
+  redacted by default, included only on request), restore it from a backup, or reset to
+  defaults. Reset keeps your panel address, UI port, host allow-list and subscription
+  token, so it can never lock you out.
+
+### Changed
+- **Settings page** — secret fields (Clash secret, watchdog webhook) are masked with a
+  reveal toggle; client-side validation catches a bad listen/port/URL before saving; an
+  unsaved-changes guard; and a clearer split between **Save** (store config) and **Apply**
+  (regenerate routing), with a prompt to Apply after a routing-mode change.
+- **Accurate "restart needed"** — saving reports a restart only when a startup-time field
+  actually changed (bind / ports / proxy core / demo); hot fields apply without one.
+- **Host allow-list is now hot** — a saved allow-list takes effect on the next request (no
+  restart), and a too-narrow one is recoverable straight from the UI instead of via SSH.
+
+### Fixed
+- Config validation (`listen`/`clash` host:port, port range + uniqueness, routing-mode and
+  offload enums, webhook URL) is enforced fail-closed by the API and warned-only at load.
+- Persist the `offload` / `offload_devices` fast-mode settings the config API used to drop.
+
+### Security
+- Config export redacts the Clash secret, subscription token and watchdog webhook by default.
+
 ## [0.3.0]
 
 ### Added

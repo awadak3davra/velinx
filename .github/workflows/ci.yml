@@ -114,8 +114,11 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, Linux, X64]
     steps:
+      # cache:false like every other job — this job builds EXTERNAL clones (awg/olc),
+      # so there is nothing in this repo for setup-go to cache, and a stale module-cache
+      # tarball on the self-hosted runner was failing the restore (tar exit 2).
       - uses: actions/setup-go@v6
-        with: { go-version: '1.26' }   # olcRTC go.mod requires go 1.26.3; amneziawg-go builds on it too
+        with: { go-version: '1.26', cache: false }   # olcRTC go.mod requires go 1.26.3; amneziawg-go builds on it too
       - name: amneziawg-go binary cross-builds (arm64)
         run: |
           set -euo pipefail

@@ -157,6 +157,9 @@ func (s *Server) Handler() http.Handler {
 	// Config (Settings).
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handlePutConfig)
+	mux.HandleFunc("GET /api/config/export", s.handleConfigExport)
+	mux.HandleFunc("POST /api/config/import", s.handleConfigImport)
+	mux.HandleFunc("POST /api/config/reset", s.handleConfigReset)
 	mux.HandleFunc("POST /api/service/restart", s.handleServiceRestart)
 
 	// Engine version manager (Updater) + WakeRoute self-update.
@@ -176,5 +179,7 @@ func (s *Server) Handler() http.Handler {
 	// status) -> gzip -> same-origin (CSRF) guard on mutating methods ->
 	// request-body size cap -> routes.
 	chain := securityHeaders(logRequests(gzipMiddleware(sameOriginGuard(limitBody(mux)))))
-	return hostAllowGuard(s.config().AllowedHosts, chain)
+	// Read AllowedHosts per request (not a boot snapshot) so a saved list applies
+	// immediately and a too-narrow one stays fixable from the live UI.
+	return hostAllowGuard(func() []string { return s.config().AllowedHosts }, chain)
 }

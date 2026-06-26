@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 
 	"wakeroute/internal/atomicfile"
 )
@@ -145,6 +149,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	c.path = path
+	// Warn (don't fail) on a config that looks unstartable: a tolerated-but-odd
+	// file must never brick boot, but surfacing the problem in the log lets the
+	// operator fix it in Settings instead of debugging a silent failure later.
+	if verr := c.Validate(); verr != nil {
+		log.Printf("wakeroute: config %s has problems (using it anyway; fix in Settings): %v", path, verr)
+	}
 	return c, nil
 }
 
@@ -158,4 +168,110 @@ func (c *Config) Save() error {
 		return err
 	}
 	return atomicfile.Write(c.path, data, 0o600)
+}
+
+// validRoutingModes / validOffloads are the accepted enum values (see the
+// RoutingMode / Offload field docs). Empty means "unset/default" and is allowed.
+var (
+	validRoutingModes = map[string]bool{"": true, "tun": true, "hybrid": true, "fast": true, "mixed": true}
+	validOffloads     = map[string]bool{"": true, "off": true, "sw": true, "hw": true}
+)
+
+// Validate checks the config for self-consistency and obviously-unstartable
+// values. It is PERMISSIVE on empty optional fields (empty == unset/default), so
+// a minimal config is always valid. Two callers: Load() logs the result as a
+// warning (a tolerated file must never brick boot) and the Settings PUT/import
+// handlers fail closed (the UI must not persist a config that would not start).
+func (c *Config) Validate() error {
+	if c.Listen == "" {
+		return errors.New("listen address is required")
+	}
+	if err := c.Ports.Validate(); err != nil {
+		return err
+	}
+	if !validHostPort(c.Listen) {
+		return fmt.Errorf("listen %q must be host:port (e.g. \":8088\")", c.Listen)
+	}
+	if c.Clash.Controller != "" && !validHostPort(c.Clash.Controller) {
+		return fmt.Errorf("clash controller %q must be host:port", c.Clash.Controller)
+	}
+	if !validRoutingModes[c.RoutingMode] {
+		return fmt.Errorf("routing_mode %q must be one of tun, hybrid, fast, mixed (or empty for auto)", c.RoutingMode)
+	}
+	if !validOffloads[c.Offload] {
+		return fmt.Errorf("offload %q must be one of off, sw, hw (or empty)", c.Offload)
+	}
+	if c.GatewayMTU != 0 && (c.GatewayMTU < 576 || c.GatewayMTU > 9000) {
+		return fmt.Errorf("gateway_mtu %d is out of range (576-9000, or 0 for default)", c.GatewayMTU)
+	}
+	if c.GatewayAddr != "" {
+		if _, _, err := net.ParseCIDR(c.GatewayAddr); err != nil {
+			return fmt.Errorf("gateway_address %q must be a CIDR (e.g. 172.19.0.1/30)", c.GatewayAddr)
+		}
+	}
+	if c.Watchdog.NotifyURL != "" && !isHTTPURL(c.Watchdog.NotifyURL) {
+		return fmt.Errorf("watchdog notify_url %q must start with http:// or https://", c.Watchdog.NotifyURL)
+	}
+	for _, h := range c.AllowedHosts {
+		if strings.TrimSpace(h) == "" {
+			return errors.New("allowed_hosts entries must not be blank")
+		}
+	}
+	return nil
+}
+
+// Validate checks the reserved port block: each in range (1-65535) and all
+// distinct (the daemon binds all four, so a clash would fail at startup).
+func (p Ports) Validate() error {
+	named := []struct {
+		name string
+		v    int
+	}{{"ui", p.UI}, {"clash", p.Clash}, {"dns", p.DNS}, {"mixed", p.Mixed}}
+	seen := map[int]string{}
+	for _, pp := range named {
+		if pp.v < 1 || pp.v > 65535 {
+			return fmt.Errorf("port %s=%d is out of range (1-65535)", pp.name, pp.v)
+		}
+		if other, ok := seen[pp.v]; ok {
+			return fmt.Errorf("ports %s and %s cannot both be %d", pp.name, other, pp.v)
+		}
+		seen[pp.v] = pp.name
+	}
+	return nil
+}
+
+// RedactedMark replaces secret values in an exported/displayed config. The import
+// path treats a field still equal to this sentinel as "leave the current secret
+// unchanged", so a redacted backup round-trips without wiping credentials.
+const RedactedMark = "***"
+
+// Redacted returns a copy with secrets masked — the clash secret, the
+// subscription token, and the watchdog webhook URL (which commonly embeds a
+// token) — for a backup that is safe to share. Empty secrets stay empty.
+func (c Config) Redacted() Config {
+	if c.Clash.Secret != "" {
+		c.Clash.Secret = RedactedMark
+	}
+	if c.Subscription.Token != "" {
+		c.Subscription.Token = RedactedMark
+	}
+	if c.Watchdog.NotifyURL != "" {
+		c.Watchdog.NotifyURL = RedactedMark
+	}
+	return c
+}
+
+// validHostPort reports whether s is "host:port" / ":port" with a port in
+// 1-65535 (host may be empty for a bind-any address).
+func validHostPort(s string) bool {
+	_, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return false
+	}
+	p, err := strconv.Atoi(port)
+	return err == nil && p >= 1 && p <= 65535
+}
+
+func isHTTPURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }

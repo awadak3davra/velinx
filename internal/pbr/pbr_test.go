@@ -195,14 +195,14 @@ func TestCompile_Warnings(t *testing.T) {
 
 func TestClassifyCIDRs(t *testing.T) {
 	v4, v6, bad := classifyCIDRs([]string{
-		"198.51.100.0/24",    // aggregate
-		"198.51.100.77",    // bare IP → /32, CONTAINED in the /16 → collapsed away
-		"198.51.100.0/24",    // exact dup → dropped
-		"8.8.8.8",          // bare IP → /32, disjoint → kept (normalization still works)
+		"198.51.100.0/24", // aggregate
+		"198.51.100.77",   // bare IP → /32, CONTAINED in the /16 → collapsed away
+		"198.51.100.0/24", // exact dup → dropped
+		"8.8.8.8",         // bare IP → /32, disjoint → kept (normalization still works)
 		"2001:db8::/32",   // v6 aggregate
 		"2001:db8:0:e::1", // v6 /128 CONTAINED in the /32 → collapsed away
-		"2606:4700::1111",  // disjoint v6 /128 → kept
-		"example.com", "",  // bad / empty
+		"2606:4700::1111", // disjoint v6 /128 → kept
+		"example.com", "", // bad / empty
 	})
 	// Bare IP normalized to /32 and kept when disjoint; the aggregate stays while the
 	// contained /32 and the exact dup are collapsed away (overlap-free for the nft set).
