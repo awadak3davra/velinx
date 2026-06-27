@@ -1,12 +1,32 @@
 package generator
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"wakeroute/internal/model"
+)
+
+// wgTestPrivKey and wgTestPubKey are valid 32-byte WireGuard base64 keys used
+// in unit tests. endpointFor validates that keys decode to exactly 32 bytes;
+// the short placeholder keys ("k", "p", "priv==") used before the [64] fix
+// no longer satisfy that check and have been replaced with these constants.
+var (
+	wgTestPrivKey = base64.StdEncoding.EncodeToString([]byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+		0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+	}) // "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+	wgTestPubKey = base64.StdEncoding.EncodeToString([]byte{
+		0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+		0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+		0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+		0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+	}) // "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="
 )
 
 // generator_singBoxEndpoint builds a minimal valid sing-box endpoint of the
@@ -215,6 +235,34 @@ func TestOutboundTUIC(t *testing.T) {
 	}
 }
 
+// TestOutboundTUICUDPMutualExclusion: sing-box FATALs on a TUIC outbound carrying BOTH
+// udp_over_stream and udp_relay_mode ("udp_over_stream is conflict with udp_relay_mode"),
+// which bricks the whole shared singbox.json on apply. The generator must emit exactly one —
+// udp_over_stream wins when set. (Real bug found via on-device `wakeroute gen | sing-box check`.)
+func TestOutboundTUICUDPMutualExclusion(t *testing.T) {
+	const tuicUUID = "11111111-2222-3333-4444-555555555555"
+	// Both set -> udp_over_stream wins, udp_relay_mode dropped (no conflict).
+	ob := generator_genOne(t, generator_singBoxEndpoint("tuic-x", model.ProtoTUIC, map[string]any{
+		"uuid": tuicUUID, "password": "p", "udp_over_stream": true, "udp_relay_mode": "quic",
+	}))
+	if ob["udp_over_stream"] != true {
+		t.Fatalf("udp_over_stream = %v, want true", ob["udp_over_stream"])
+	}
+	if v, ok := ob["udp_relay_mode"]; ok {
+		t.Fatalf("udp_relay_mode must be omitted when udp_over_stream is set (sing-box conflict), got %v", v)
+	}
+	// Only udp_relay_mode -> kept, no udp_over_stream key emitted.
+	ob2 := generator_genOne(t, generator_singBoxEndpoint("tuic-y", model.ProtoTUIC, map[string]any{
+		"uuid": tuicUUID, "password": "p", "udp_relay_mode": "native",
+	}))
+	if ob2["udp_relay_mode"] != "native" {
+		t.Fatalf("udp_relay_mode = %v, want native", ob2["udp_relay_mode"])
+	}
+	if _, ok := ob2["udp_over_stream"]; ok {
+		t.Fatalf("udp_over_stream must be absent when unset")
+	}
+}
+
 // TestOutboundTUICDefaultsALPN: TUIC runs over QUIC/HTTP3 and REQUIRES a TLS ALPN.
 // Without one the config passes sing-box check but every connection fails at runtime
 // ("tls: no application protocol"), so the generator must default it to ["h3"]; an
@@ -281,6 +329,27 @@ func TestOutboundTUICExtraParams(t *testing.T) {
 	}
 }
 
+// TestOutboundTUICHeartbeatNonPositive: time.ParseDuration ACCEPTS non-positive
+// durations ("0s", "-5s", "-0s"), but sing-box rejects "heartbeat must be > 0" at
+// config decode — which would brick the whole shared singbox.json on apply. The
+// generator must drop a non-positive heartbeat (drop-don't-brick) while still
+// emitting a valid positive one.
+func TestOutboundTUICHeartbeatNonPositive(t *testing.T) {
+	uuid := "11111111-2222-3333-4444-555555555555"
+	// Non-positive durations parse but must NOT be emitted.
+	for _, bad := range []string{"0s", "-5s", "-0s", "0", "-1h"} {
+		eb := generator_singBoxEndpoint("tuic-hb0", model.ProtoTUIC, map[string]any{"uuid": uuid, "password": "p", "heartbeat": bad})
+		if obb := generator_genOne(t, eb); obb["heartbeat"] != nil {
+			t.Errorf("non-positive heartbeat %q must be dropped, got %v", bad, obb["heartbeat"])
+		}
+	}
+	// A valid positive duration is still emitted.
+	eg := generator_singBoxEndpoint("tuic-hbok", model.ProtoTUIC, map[string]any{"uuid": uuid, "password": "p", "heartbeat": "10s"})
+	if ob := generator_genOne(t, eg); ob["heartbeat"] != "10s" {
+		t.Errorf("positive heartbeat = %v, want 10s", ob["heartbeat"])
+	}
+}
+
 // generator_wgEndpoint generates a profile holding the single native-WireGuard
 // endpoint e, round-trips the config JSON, asserts WG is NOT emitted as an
 // outbound, and returns the produced top-level endpoint map for e.ID (from
@@ -322,8 +391,8 @@ func generator_wgEndpoint(t *testing.T, e model.Endpoint) (map[string]any, *Resu
 // full-tunnel allowed_ips.
 func TestOutboundWireGuard(t *testing.T) {
 	e := generator_singBoxEndpoint("wg-1", model.ProtoWireGuard, map[string]any{
-		"private_key":     "priv==",
-		"peer_public_key": "peerpub==",
+		"private_key":     wgTestPrivKey,
+		"peer_public_key": wgTestPubKey,
 		"pre_shared_key":  "psk==",
 		"local_address":   []string{"10.0.0.2/32"},
 		"reserved":        []int{1, 2, 3},
@@ -333,7 +402,7 @@ func TestOutboundWireGuard(t *testing.T) {
 	if ep["type"] != "wireguard" {
 		t.Fatalf("type = %v, want wireguard", ep["type"])
 	}
-	if ep["private_key"] != "priv==" {
+	if ep["private_key"] != wgTestPrivKey {
 		t.Fatalf("private_key = %v", ep["private_key"])
 	}
 	// Interface address (was the outbound's local_address) — an array of CIDRs.
@@ -349,7 +418,7 @@ func TestOutboundWireGuard(t *testing.T) {
 	if pe["address"] != "example.com" || pe["port"] != 443 {
 		t.Fatalf("peer address:port = %v:%v, want example.com:443", pe["address"], pe["port"])
 	}
-	if pe["public_key"] != "peerpub==" {
+	if pe["public_key"] != wgTestPubKey {
 		t.Fatalf("peer public_key = %v", pe["public_key"])
 	}
 	if pe["pre_shared_key"] != "psk==" {
@@ -376,8 +445,8 @@ func TestOutboundWireGuard(t *testing.T) {
 // still carries the mandatory full-tunnel allowed_ips).
 func TestOutboundWireGuardMinimal(t *testing.T) {
 	e := generator_singBoxEndpoint("wg-2", model.ProtoWireGuard, map[string]any{
-		"private_key":     "priv2",
-		"peer_public_key": "pub2",
+		"private_key":     wgTestPrivKey,
+		"peer_public_key": wgTestPubKey,
 	})
 	ep, _ := generator_wgEndpoint(t, e)
 	if _, ok := ep["address"]; ok {
@@ -390,8 +459,8 @@ func TestOutboundWireGuardMinimal(t *testing.T) {
 	if _, ok := pe["reserved"]; ok {
 		t.Fatalf("reserved should be absent: %v", pe["reserved"])
 	}
-	if pe["public_key"] != "pub2" {
-		t.Fatalf("peer public_key = %v, want pub2", pe["public_key"])
+	if pe["public_key"] != wgTestPubKey {
+		t.Fatalf("peer public_key = %v, want wgTestPubKey", pe["public_key"])
 	}
 	if _, ok := pe["allowed_ips"].([]string); !ok {
 		t.Fatalf("allowed_ips must always be present on the peer: %v", pe["allowed_ips"])
@@ -407,7 +476,7 @@ func TestOutboundWireGuardMinimal(t *testing.T) {
 // JSON round-trip through the store.
 func TestOutboundWireGuardKeepalive(t *testing.T) {
 	e := generator_singBoxEndpoint("wg-ka", model.ProtoWireGuard, map[string]any{
-		"private_key": "k", "peer_public_key": "p",
+		"private_key": wgTestPrivKey, "peer_public_key": wgTestPubKey,
 		"persistent_keepalive": float64(25),
 	})
 	ep, _ := generator_wgEndpoint(t, e)
@@ -422,13 +491,13 @@ func TestOutboundWireGuardKeepalive(t *testing.T) {
 // large packets (e.g. WARP needs 1280). float64 covers a JSON store round-trip.
 func TestOutboundWireGuardMTU(t *testing.T) {
 	e := generator_singBoxEndpoint("wg-mtu", model.ProtoWireGuard, map[string]any{
-		"private_key": "k", "peer_public_key": "p", "mtu": float64(1280),
+		"private_key": wgTestPrivKey, "peer_public_key": wgTestPubKey, "mtu": float64(1280),
 	})
 	ep, _ := generator_wgEndpoint(t, e)
 	if ep["mtu"] != 1280 {
 		t.Fatalf("endpoint mtu = %v (%T), want 1280 (int)", ep["mtu"], ep["mtu"])
 	}
-	e2 := generator_singBoxEndpoint("wg-nomtu", model.ProtoWireGuard, map[string]any{"private_key": "k", "peer_public_key": "p"})
+	e2 := generator_singBoxEndpoint("wg-nomtu", model.ProtoWireGuard, map[string]any{"private_key": wgTestPrivKey, "peer_public_key": wgTestPubKey})
 	ep2, _ := generator_wgEndpoint(t, e2)
 	if _, ok := ep2["mtu"]; ok {
 		t.Fatalf("mtu should be omitted when unset, got %v", ep2["mtu"])
@@ -441,7 +510,7 @@ func TestOutboundWireGuardMTU(t *testing.T) {
 // endpoint tags are referenceable exactly like outbound tags.
 func TestEndpointsTopLevelKey(t *testing.T) {
 	wg := generator_singBoxEndpoint("wg-ep", model.ProtoWireGuard, map[string]any{
-		"private_key": "k", "peer_public_key": "p", "local_address": []string{"10.0.0.2/32"},
+		"private_key": wgTestPrivKey, "peer_public_key": wgTestPubKey, "local_address": []string{"10.0.0.2/32"},
 	})
 	vless := generator_singBoxEndpoint("vl", model.ProtoVLESS, map[string]any{"uuid": "u"})
 	p := &model.Profile{
@@ -468,6 +537,83 @@ func TestEndpointsTopLevelKey(t *testing.T) {
 	route := res.Config["route"].(map[string]any)
 	if route["final"] != wg.ID {
 		t.Fatalf("route.final = %v, want the WG endpoint tag %q", route["final"], wg.ID)
+	}
+}
+
+// --- Bug [64]: WireGuard invalid base64 key guard ---------------------------
+
+// TestWireGuardInvalidPrivKey asserts that endpointFor returns an error (and
+// Generate propagates it) when the WireGuard private_key is not valid 32-byte
+// base64. This prevents sing-box from receiving garbage that it would reject
+// with a FATAL "decode private key" error at config check time, which would
+// block the entire apply for all endpoints sharing the same singbox.json.
+func TestWireGuardInvalidPrivKey(t *testing.T) {
+	for _, bad := range []string{"", "notbase64!!!", "dG9vc2hvcnQ=", "priv=="} {
+		e := generator_singBoxEndpoint("wg-badpriv", model.ProtoWireGuard, map[string]any{
+			"private_key":     bad,
+			"peer_public_key": wgTestPubKey,
+		})
+		p := &model.Profile{
+			Endpoints: []model.Endpoint{e},
+			Rules:     []model.Rule{{ID: "def", Default: true, Outbound: model.OutboundDirect}},
+		}
+		_, err := Generate(p, Options{MixedPort: 7890})
+		if err == nil {
+			t.Errorf("bad private_key %q: expected Generate to return error, got nil", bad)
+		}
+	}
+}
+
+// TestWireGuardInvalidPeerPubKey asserts that endpointFor returns an error when
+// the peer_public_key is not valid 32-byte base64, even if private_key is good.
+func TestWireGuardInvalidPeerPubKey(t *testing.T) {
+	for _, bad := range []string{"", "notbase64!!!", "dG9vc2hvcnQ=", "peerpub=="} {
+		e := generator_singBoxEndpoint("wg-badpub", model.ProtoWireGuard, map[string]any{
+			"private_key":     wgTestPrivKey,
+			"peer_public_key": bad,
+		})
+		p := &model.Profile{
+			Endpoints: []model.Endpoint{e},
+			Rules:     []model.Rule{{ID: "def", Default: true, Outbound: model.OutboundDirect}},
+		}
+		_, err := Generate(p, Options{MixedPort: 7890})
+		if err == nil {
+			t.Errorf("bad peer_public_key %q: expected Generate to return error, got nil", bad)
+		}
+	}
+}
+
+// TestWireGuardValidKeyVariants confirms that both padded (StdEncoding) and
+// raw (no-pad, RawStdEncoding) 32-byte base64 WireGuard keys are accepted by
+// endpointFor — the WG key spec does not mandate padding, and real-world .conf
+// files and links use both forms.
+func TestWireGuardValidKeyVariants(t *testing.T) {
+	key32 := []byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+		0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+	}
+	padded := base64.StdEncoding.EncodeToString(key32) // padded "...A="
+	raw := base64.RawStdEncoding.EncodeToString(key32) // no-pad "...A"
+	for _, enc := range []string{padded, raw} {
+		e := generator_singBoxEndpoint("wg-validenc", model.ProtoWireGuard, map[string]any{
+			"private_key":     enc,
+			"peer_public_key": enc,
+		})
+		p := &model.Profile{
+			Endpoints: []model.Endpoint{e},
+			Rules:     []model.Rule{{ID: "def", Default: true, Outbound: model.OutboundDirect}},
+		}
+		res, err := Generate(p, Options{MixedPort: 7890})
+		if err != nil {
+			t.Errorf("key encoding %q: Generate returned unexpected error: %v", enc, err)
+			continue
+		}
+		eps, _ := res.Config["endpoints"].([]map[string]any)
+		if len(eps) != 1 {
+			t.Errorf("key encoding %q: want 1 endpoint, got %d", enc, len(eps))
+		}
 	}
 }
 

@@ -2,8 +2,17 @@ package initserver
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// sbVerRe extracts a bare dotted version (x.y.z) and nothing else. UpdateSingBoxScript
+// embeds ONLY this match into the remote shell, so a crafted version such as
+// "1.2.3$(reboot)" or "1.2.3`id`" can never carry shell metacharacters into the %q'd
+// VER= assignment (or the ${VER} download URL). Defense in depth: the HTTP handler also
+// requires a parseable version, but the script builder must be safe for ANY caller — a
+// digits-and-dots match cannot contain a shell-special character.
+var sbVerRe = regexp.MustCompile(`\d+\.\d+\.\d+`)
 
 // ServerBinary identifies a binary wakeroute can version-check (and update) on a
 // PROVISIONED server over SSH. Unlike the router's local engine Updater, these run on
@@ -26,16 +35,18 @@ var ServerBinaries = []ServerBinary{
 }
 
 // VersionCheckScript probes the installed version of each managed binary that is
-// present on the server, plus the server arch. It is read-only (no apt/network/mutate)
-// and prints WR_* markers the daemon parses. Absent binaries are simply skipped.
+// present on the server, plus the server arch and the curl availability needed for
+// binary updates. It is read-only (no apt/network/mutate) and prints WR_* markers
+// the daemon parses. Absent binaries are simply skipped.
 func VersionCheckScript() string {
 	return `#!/bin/sh
 echo "WR_ARCH=$(uname -m 2>/dev/null)"
+if command -v curl >/dev/null 2>&1; then echo "WR_CURL=1"; else echo "WR_CURL=0"; fi
 if command -v sing-box >/dev/null 2>&1; then
   echo "WR_INSTALLED_SINGBOX=$(sing-box version 2>/dev/null | head -n1)"
 fi
-if dpkg-query -W -f='${Version}' amneziawg >/dev/null 2>&1; then
-  echo "WR_INSTALLED_AWG=$(dpkg-query -W -f='${Version}' amneziawg 2>/dev/null)"
+if _AWG_VER=$(dpkg-query -W -f='${Version}' amneziawg 2>/dev/null) && [ -n "$_AWG_VER" ]; then
+  echo "WR_INSTALLED_AWG=$_AWG_VER"
 elif command -v awg >/dev/null 2>&1; then
   echo "WR_INSTALLED_AWG=$(awg --version 2>/dev/null | head -n1)"
 fi
@@ -43,15 +54,19 @@ echo "WR_VERCHECK_DONE=1"
 `
 }
 
-// ExtractVersions parses the WR_INSTALLED_<MARKER> + WR_ARCH markers into a map keyed
-// by ServerBinary.Key plus an "arch" entry (raw `uname -m`). Missing binaries are
-// absent from the map (the probe only prints markers for binaries it found).
+// ExtractVersions parses the WR_INSTALLED_<MARKER> + WR_ARCH + WR_CURL markers into a
+// map keyed by ServerBinary.Key plus "arch" (raw `uname -m`) and "curl" ("0"/"1").
+// Missing binaries are absent from the map (the probe only prints markers it found).
 func ExtractVersions(output string) map[string]string {
 	out := map[string]string{}
 	for _, ln := range strings.Split(output, "\n") {
 		ln = strings.TrimSpace(ln)
 		if v, ok := strings.CutPrefix(ln, "WR_ARCH="); ok {
 			out["arch"] = strings.TrimSpace(v)
+			continue
+		}
+		if v, ok := strings.CutPrefix(ln, "WR_CURL="); ok {
+			out["curl"] = strings.TrimSpace(v)
 			continue
 		}
 		for _, b := range ServerBinaries {
@@ -72,6 +87,11 @@ func VerCheckRan(output string) bool { return strings.Contains(output, "WR_VERCH
 // arch itself, backs up the current binary, swaps atomically, restarts the service,
 // and prints WR_UPDATE_OK=<new version> on success. DESTRUCTIVE (brief endpoint drop).
 func UpdateSingBoxScript(version string) string {
+	// Sanitize: embed ONLY the extracted x.y.z, never the raw caller string, so no shell
+	// metacharacters can reach the remote VER= assignment / download URL (command-injection
+	// guard). An input with no valid x.y.z yields "" → the script's own `[ -n "$VER" ]`
+	// guard aborts cleanly.
+	clean := sbVerRe.FindString(version)
 	return fmt.Sprintf(`#!/bin/sh
 set -e
 log(){ echo "[wakeroute-update] $*"; }
@@ -84,21 +104,33 @@ case "$(uname -m)" in
   *) echo "WR_UPDATE_ERR=unsupported arch $(uname -m)"; exit 1;;
 esac
 URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${A}.tar.gz"
-TMP=$(mktemp -d); cd "$TMP"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+cd "$TMP"
 log "downloading $URL"
-curl -fsSL "$URL" -o sb.tgz || { echo "WR_UPDATE_ERR=download failed"; rm -rf "$TMP"; exit 1; }
+curl -fsSL "$URL" -o sb.tgz || { echo "WR_UPDATE_ERR=download failed"; exit 1; }
 tar -xzf sb.tgz
 BIN=$(find . -type f -name sing-box | head -n1)
-[ -n "$BIN" ] || { echo "WR_UPDATE_ERR=binary not in archive"; rm -rf "$TMP"; exit 1; }
+[ -n "$BIN" ] || { echo "WR_UPDATE_ERR=binary not in archive"; exit 1; }
 DST=$(command -v sing-box || echo /usr/local/bin/sing-box)
 cp -f "$DST" "$DST.wakeroute.bak" 2>/dev/null || true
 install -m 0755 "$BIN" "$DST"
 ( systemctl restart sing-box 2>/dev/null || service sing-box restart 2>/dev/null ) || true
-sleep 1
-echo "WR_UPDATE_OK=$("$DST" version 2>/dev/null | head -n1)"
-rm -rf "$TMP"
+sleep 2
+# Confirm the SERVICE actually came back up — not merely that the new binary prints a
+# version. A version bump whose config the new sing-box rejects would otherwise leave the
+# endpoint DEAD while we report success. If it is not up, roll back to the backup binary,
+# restart, and report the failure so the VPS keeps working.
+if systemctl is-active --quiet sing-box 2>/dev/null || pgrep -x sing-box >/dev/null 2>&1; then
+  echo "WR_UPDATE_OK=$("$DST" version 2>/dev/null | head -n1)"
+else
+  log "sing-box did not come back up after update — rolling back"
+  if [ -f "$DST.wakeroute.bak" ]; then install -m 0755 "$DST.wakeroute.bak" "$DST" || true; fi
+  ( systemctl restart sing-box 2>/dev/null || service sing-box restart 2>/dev/null ) || true
+  echo "WR_UPDATE_ERR=sing-box did not restart after update; rolled back to the previous binary"
+  exit 1
+fi
 log "done"
-`, version)
+`, clean)
 }
 
 // UpdateAWGScript upgrades the apt-managed AmneziaWG packages and reports the new

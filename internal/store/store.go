@@ -4,9 +4,11 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 
@@ -25,7 +27,16 @@ type Store struct {
 func Open(path string) (*Store, error) {
 	s := &Store{path: path}
 	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	// Treat a missing OR empty/whitespace-only file identically: start from an empty
+	// profile and rewrite a valid file. An existing zero-length / whitespace-only file
+	// is the canonical power-loss / jffs2 / overlayfs artifact on a router; it reads as
+	// (nil, nil), would otherwise reach json.Unmarshal([]byte{}) → "unexpected end of
+	// JSON input" → the daemon refuses to boot. A genuinely-corrupt NON-empty file
+	// still falls through to the parse error below.
+	if errors.Is(err, os.ErrNotExist) || (err == nil && len(bytes.TrimSpace(data)) == 0) {
+		if err == nil {
+			log.Printf("wakeroute: profile %s is empty; recreating empty profile", path)
+		}
 		return s, s.saveLocked()
 	}
 	if err != nil {
@@ -43,28 +54,42 @@ func Open(path string) (*Store, error) {
 // would alias those arrays — a data race. Endpoint/Group/Rule values are
 // immutable once stored (writers replace whole elements, never mutate in place),
 // so cloning the top-level slices is sufficient.
+//
+// INVARIANT (per-field): the INNER slices/maps of each element — Endpoint.Params (map),
+// TLS/Transport, RoutingList.Manual/CIDRCache, Rule.Domain/IPCIDR/Port — are deliberately
+// SHARED BY REFERENCE with the stored copy (a deep clone on every poll would be wasteful on
+// a router). This is race-safe ONLY because every writer replaces a whole element ([i]=e) or
+// a whole field header ([i].CIDRCache=…) under the write lock and NEVER appends-in-place to
+// or writes into a shared inner slice/map. A future writer that mutates an inner field in
+// place would silently race every lock-free reader (generator/monitor) holding a prior copy.
 func (s *Store) Profile() model.Profile {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	p := s.prof
-	p.Endpoints = append([]model.Endpoint(nil), s.prof.Endpoints...)
-	p.Groups = append([]model.Group(nil), s.prof.Groups...)
+	p.Endpoints = append([]model.Endpoint{}, s.prof.Endpoints...)
+	p.Groups = append([]model.Group{}, s.prof.Groups...)
 	// Group.Members is compacted IN PLACE by removeString (DeleteEndpoint/DeleteGroup
 	// pruning), so it must be cloned too — a shallow Group copy still aliases the
 	// members backing array, which a lock-free reader (generator/monitor) would race.
 	for i := range p.Groups {
-		p.Groups[i].Members = append([]string(nil), s.prof.Groups[i].Members...)
+		p.Groups[i].Members = append([]string{}, s.prof.Groups[i].Members...)
 	}
-	p.Rules = append([]model.Rule(nil), s.prof.Rules...)
+	p.Rules = append([]model.Rule{}, s.prof.Rules...)
 	// RoutingLists is compacted IN PLACE by DeleteRoutingList (kept[:0]) and may be
 	// appended to by UpsertRoutingList, so a shallow copy would alias the backing
 	// array a lock-free reader (generator) races on — clone it like the others.
-	p.RoutingLists = append([]model.RoutingList(nil), s.prof.RoutingLists...)
+	p.RoutingLists = append([]model.RoutingList{}, s.prof.RoutingLists...)
 	return p
 }
 
-// Replace swaps the whole profile (used by bulk import / subscription sync).
+// Replace swaps the whole profile (used by bulk import / subscription sync / backup
+// restore). It VALIDATES the incoming profile first, so a bad set (dangling outbound,
+// cyclic group, duplicate/empty id) can never overwrite a good, working profile and break
+// the next Apply — every caller can rely on this as the store-layer gate (defense in depth).
 func (s *Store) Replace(p model.Profile) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.prof = p

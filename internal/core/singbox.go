@@ -122,6 +122,39 @@ func (s *SingBox) Start() error {
 		s.desired = true
 		return nil
 	}
+	return s.startLocked()
+}
+
+// StartIfDesiredDead (re)starts the core only when it is still DESIRED but not
+// alive, entirely under mu — so a concurrent Stop() (which clears desired and
+// kills the process) can't be overtaken by a stale Alive() read in the watchdog.
+// This closes the TOCTOU where the watchdog read Desired()=true before an
+// intentional native-only Stop() and Alive()=false after it, then resurrected a
+// redundant sing-box TUN core over the kernel-PBR datapath.
+//
+// It NEVER promotes desired from false→true: it only acts when the core is
+// ALREADY desired. Setting desired=true is reserved for the explicit user/boot
+// Start(). Returns whether it actually (re)started the process.
+func (s *SingBox) StartIfDesiredDead() (started bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.desired || s.aliveLocked() {
+		// Either deliberately Stopped (desired=false) or already up — not a crash
+		// the watchdog should act on.
+		return false, nil
+	}
+	if err := s.startLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// startLocked spawns sing-box and installs the exit-tracking goroutine. The
+// caller MUST hold s.mu. It is the shared spawn path for Start() and
+// StartIfDesiredDead(); it sets desired=true ONLY on a successful spawn (so a
+// missing/failed binary never leaves the watchdog looping — same contract as the
+// original Start()).
+func (s *SingBox) startLocked() error {
 	if !s.Available() {
 		// Nothing to supervise (e.g. demo with no binary) — don't mark desired,
 		// or the watchdog would loop on a process it can never start.
@@ -181,10 +214,12 @@ func (s *SingBox) Stop() error {
 	// Wait briefly for a clean exit, then force-kill. On Windows (demo) Signal is
 	// unsupported and returns an error, so we fall straight through to Kill.
 	if err := cmd.Process.Signal(syscall.SIGTERM); err == nil && done != nil {
+		grace := time.NewTimer(stopGrace)
 		select {
 		case <-done:
+			grace.Stop()
 			return nil
-		case <-time.After(stopGrace):
+		case <-grace.C:
 		}
 	}
 	err := cmd.Process.Kill()
@@ -292,6 +327,13 @@ func (s *SingBox) Commit() error {
 // .bak (rollback target), .good (baseline), and the live config itself on
 // Restore — so a power loss mid-write must not leave a torn/zero-length config
 // that won't start. That is exactly what atomicfile guards against on a router.
+//
+// CALLER INVARIANT: Backup/Restore/Commit must be called under the SAME lock that
+// serializes config writes (the server's applyMu — held by handleApply, the fail-safe
+// rollback, and RollbackNow). atomicfile stages to "<dst>.tmp", which on Restore is the
+// very path handleApply also stages to, so a caller that runs these lock-free would race
+// that staging file and could rename a half-written config over the live one. Every
+// current caller holds applyMu; keep it that way.
 func copyFile(src, dst string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {

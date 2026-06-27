@@ -65,6 +65,8 @@ type Server struct {
 	exitResolver    func(uint32) string
 	exitResolverExp int64 // unix-ms; recompute the mark→exit resolver after this
 
+	subStatus subRefreshStatus // last subscription auto-refresh outcome (for the Settings card)
+
 	allowInternalFetch bool // test-only: skip the subscription-fetch SSRF dial guard so httptest (loopback) servers can be used
 }
 
@@ -78,9 +80,10 @@ func New(cfg *config.Config, hub *traffic.Hub, cl *clash.Client, sb *core.SingBo
 	// Crash-restart supervision for sing-box (and best-effort the engine plugins).
 	wd := watchdog.New("sing-box", sb)
 	wd.SetPluginSupervisor(s.plugins.Supervise)
-	if u := cfg.Watchdog.NotifyURL; u != "" {
-		wd.SetNotify(makeWebhookNotifier(u))
-	}
+	// Route crash-restart alerts through s.alert so they read the CURRENT NotifyURL (a
+	// Settings change is honored, not frozen at startup) and share one notifier path with
+	// the fail-safe rollback/reboot alerts. No-op when no URL is configured.
+	wd.SetNotify(s.alert)
 	s.watchdog = wd
 	return s
 }
@@ -100,6 +103,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/health/test/{id}", s.handleHealthTest)
 	mux.HandleFunc("/api/traffic/recent", s.handleTrafficRecent)
 	mux.HandleFunc("/api/traffic/stream", s.handleTrafficStream)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	// Profile API (M2b). Go 1.22 method+wildcard routing.
 	mux.HandleFunc("POST /api/import", s.handleImport)
@@ -124,6 +128,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/endpoints/{id}/export", s.handleEndpointExport)
 	mux.HandleFunc("POST /api/qr", s.handleQR)
 	mux.HandleFunc("GET /api/subscription/info", s.handleSubInfo)
+	mux.HandleFunc("POST /api/subscription/rotate", s.handleSubRotate)
+	mux.HandleFunc("POST /api/subscription/autorefresh", s.handleSubAutoRefresh)
+	mux.HandleFunc("POST /api/subscription/refresh", s.handleSubRefreshNow)
 	mux.HandleFunc("GET /api/sub/{token}", s.handleSubServe)
 	mux.HandleFunc("POST /api/apply/confirm", s.handleApplyConfirm)
 	mux.HandleFunc("POST /api/apply/rollback", s.handleApplyRollback)
@@ -136,6 +143,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/conntrack", s.handleConntrack)
 	mux.HandleFunc("GET /api/exit-ip", s.handleExitIP)
 	mux.HandleFunc("GET /api/pbr/preview", s.handlePBRPreview)
+	mux.HandleFunc("GET /api/pbr/status", s.handlePBRStatus)
+	mux.HandleFunc("POST /api/pbr/apply", s.handlePBRApply)
+	mux.HandleFunc("POST /api/pbr/teardown", s.handlePBRTeardown)
+	mux.HandleFunc("GET /api/vpn/discover", s.handleVPNDiscover)
+	mux.HandleFunc("POST /api/vpn/adopt", s.handleVPNAdopt)
+	mux.HandleFunc("GET /api/native/capabilities", s.handleNativeCapabilities)
 
 	// Diagnostics + error knowledgebase.
 	mux.HandleFunc("GET /api/diagnostics", s.handleDiagnostics)
@@ -144,6 +157,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/netdiag", s.handleNetDiag)
 	mux.HandleFunc("POST /api/netdiag/all", s.handleNetDiagAll)
 	mux.HandleFunc("GET /api/netdiag/stream", s.handleNetDiagStream)
+	mux.HandleFunc("POST /api/probe/tls", s.handleProbeTLS)
 	mux.HandleFunc("GET /api/kb", s.handleKB)
 
 	// Init Server (R8) — multi-server registry, options, job-based provisioning,
@@ -167,6 +181,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/config/export", s.handleConfigExport)
 	mux.HandleFunc("POST /api/config/import", s.handleConfigImport)
 	mux.HandleFunc("POST /api/config/reset", s.handleConfigReset)
+	// Whole-setup backup: download/restore profile+servers+routing knobs in one
+	// file (e.g. before a firmware reflash). Restore never auto-applies and never
+	// touches the access-critical config (see backup.go).
+	mux.HandleFunc("GET /api/backup", s.handleBackupExport)
+	mux.HandleFunc("POST /api/backup/restore", s.handleBackupRestore)
 	mux.HandleFunc("POST /api/service/restart", s.handleServiceRestart)
 
 	// Engine version manager (Updater) + WakeRoute self-update.

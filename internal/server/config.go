@@ -63,11 +63,50 @@ func decodeConfigBody(r *http.Request) (*config.Config, error) {
 // persistConfig applies in's user-settable fields onto the live config and saves
 // it durably, under cfgMu so it can't race subToken()/handleGetConfig() or the
 // config.json.tmp file.
+//
+// applyConfigFields MUTATES the shared live config in place, but Save() can fail
+// (full overlay / EROFS / IO). To avoid a memory/disk divergence — the live
+// daemon using the new values while config.json on disk still holds the old ones,
+// which a later reboot would silently revert to — we snapshot the live config
+// BEFORE applying and restore it if Save() fails. A failed Save then leaves the
+// live config UNCHANGED and consistent with the (atomically-untouched) disk file.
 func (s *Server) persistConfig(in *config.Config) error {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
+	snap := cloneConfig(s.cfg)
 	applyConfigFields(s.cfg, in)
-	return s.cfg.Save()
+	if err := s.cfg.Save(); err != nil {
+		*s.cfg = snap // roll back the in-memory mutation: keep memory == disk
+		return err
+	}
+	return nil
+}
+
+// cloneConfig returns a fully independent value copy of c suitable for restoring
+// the live config after a failed Save. The struct value-copy carries every value
+// field (and the unexported path); the reference fields that applyConfigFields
+// replaces — OffloadDevices, AllowedHosts, and Updater.Mirrors — are deep-copied
+// so the restored snapshot shares no backing array with c or with the incoming
+// request config. (applyConfigFields only REPLACES these slices, so a plain
+// value-copy would already restore correctly, but deep-copying keeps the snapshot
+// self-contained and immune to any future element-wise mutation.)
+func cloneConfig(c *config.Config) config.Config {
+	snap := *c
+	snap.OffloadDevices = cloneStrings(c.OffloadDevices)
+	snap.AllowedHosts = cloneStrings(c.AllowedHosts)
+	snap.Updater.Mirrors = cloneStrings(c.Updater.Mirrors)
+	return snap
+}
+
+// cloneStrings returns a copy of s with its own backing array, preserving nil
+// (so a round-tripped config marshals identically to the original).
+func cloneStrings(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, len(s))
+	copy(out, s)
+	return out
 }
 
 // reconcileListen forces Listen's port to equal Ports.UI so the two encodings of
@@ -193,7 +232,14 @@ func (s *Server) handleConfigReset(w http.ResponseWriter, r *http.Request) {
 	def.Ports.UI = old.Ports.UI
 	def.AllowedHosts = old.AllowedHosts
 	def.Subscription = old.Subscription // moot (Subscription not copied) but explicit
-	_ = reconcileListen(def)            // align Listen with the preserved UI port
+	// Preserve the Clash-API secret: it authenticates the daemon's own Clash client to the
+	// live (still-running, old-secret) sing-box, so regenerating it on reset would break the
+	// Dashboard/health views until the next Apply+restart. It's an internal secret (not a
+	// panel-access vector), so preserving it is invisible to the user and avoids that outage.
+	def.Clash.Secret = old.Clash.Secret
+	if err := reconcileListen(def); err != nil {
+		def.Listen = fmt.Sprintf(":%d", def.Ports.UI) // old listen was malformed; fall back to default host + preserved port
+	}
 	// Reset is a recovery action, so it must always produce a VALID config. The only
 	// preserved user-data that could be invalid is AllowedHosts (e.g. a blank entry
 	// from a hand-edited config.json); if it makes the reset config invalid, drop it

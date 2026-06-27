@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,6 +66,13 @@ type Watchdog struct {
 type Subscription struct {
 	// Token guards /api/sub/<token>. Auto-generated on first use if empty.
 	Token string `json:"token"`
+	// URL is the last imported subscription URL, kept so an opt-in periodic
+	// refresh can re-fetch it and ADD any newly-rotated endpoints. Empty when
+	// the user only ever pasted text (nothing to refresh).
+	URL string `json:"url,omitempty"`
+	// RefreshHours controls auto-refresh of URL: 0 = OFF (opt-in default); >0 =
+	// re-fetch every N hours and add new endpoints (never deletes).
+	RefreshHours int `json:"refresh_hours,omitempty"`
 }
 
 // Config is the full daemon configuration, persisted as JSON.
@@ -136,7 +144,16 @@ func Load(path string) (*Config, error) {
 	c.path = path
 
 	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	// Treat a missing OR empty/whitespace-only file identically: create defaults and
+	// rewrite a valid file. An existing zero-length / whitespace-only file is the
+	// canonical power-loss / jffs2 / overlayfs artifact on a router; it reads as
+	// (nil, nil), would otherwise reach json.Unmarshal([]byte{}) → "unexpected end
+	// of JSON input" → the daemon refuses to boot (panel brick — see atomicfile.go).
+	// A genuinely-corrupt NON-empty file still falls through to the parse error below.
+	if errors.Is(err, os.ErrNotExist) || (err == nil && len(bytes.TrimSpace(data)) == 0) {
+		if err == nil {
+			log.Printf("wakeroute: config %s is empty; recreating with defaults", path)
+		}
 		if err := c.Save(); err != nil {
 			return nil, fmt.Errorf("write default config: %w", err)
 		}

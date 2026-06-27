@@ -261,7 +261,11 @@ func Generate(p *model.Profile, opts Options) (*Result, error) {
 		}
 		if e.Protocol == model.ProtoWireGuard {
 			// Native sing-box WireGuard → top-level endpoint, not an outbound.
-			endpoints = append(endpoints, endpointFor(e))
+			ep, err := endpointFor(e)
+			if err != nil {
+				return nil, fmt.Errorf("endpoint %s: %w", e.ID, err)
+			}
+			endpoints = append(endpoints, ep)
 			continue
 		}
 		ob, err := outboundFor(e)
@@ -414,8 +418,19 @@ func routingFrom(p *model.Profile, hybrid bool) (sets []map[string]any, rules []
 		if rl.Source != "" {
 			tag := "rs-" + rl.ID
 			set := map[string]any{"tag": tag, "type": "remote", "url": rl.Source, "format": ruleSetFormat(rl)}
+			// A remote rule-set is fetched over its download_detour. Honor an explicit
+			// DownloadVia; otherwise default to direct so the list downloads over the WAN
+			// even before any tunnel route exists AND can't be blocked from refreshing by
+			// a down proxy that the list itself might route around (a chicken-and-egg
+			// fetch-through-the-thing-being-configured trap). This mirrors the geosite/
+			// geoip remote sets (geoRuleSets), which also fetch direct + cache via
+			// cache_file. An empty DownloadVia previously omitted the field (sing-box then
+			// fetches via the route's default outbound) — defaulting it to direct is the
+			// safer, always-reachable choice and keeps the auto-update self-healing.
 			if rl.DownloadVia != "" {
 				set["download_detour"] = canonicalOutbound(rl.DownloadVia)
+			} else {
+				set["download_detour"] = model.OutboundDirect
 			}
 			set["update_interval"] = refreshInterval(rl.RefreshHours)
 			sets = append(sets, set)
@@ -750,26 +765,29 @@ func outboundFor(e *model.Endpoint) (map[string]any, error) {
 		if cc := safeEnum(str(e.Params, "congestion_control"), knownTUICCC); cc != "" {
 			ob["congestion_control"] = cc
 		}
-		// udp_relay_mode (native|quic) is parsed by the importer, stored, and round-tripped by the
-		// exporter. Gate it through safeEnum like every other enum here: an unknown value (a typo or
-		// a hostile share-link ?udp_relay_mode=foo) would otherwise reach the shared singbox.json and
-		// be REJECTED by sing-box at decode, failing the whole config. Drop-don't-brick → native.
-		if m := safeEnum(str(e.Params, "udp_relay_mode"), knownTUICRelay); m != "" {
+		// udp_over_stream (UDP tunneled over a QUIC stream) and udp_relay_mode (native|quic) are
+		// MUTUALLY EXCLUSIVE in sing-box — emitting BOTH is a FATAL "udp_over_stream is conflict with
+		// udp_relay_mode" at config decode, which bricks the whole shared singbox.json. Emit exactly
+		// one: udp_over_stream wins when set; otherwise honor udp_relay_mode, gated through safeEnum so
+		// an unknown value (a typo or a hostile ?udp_relay_mode=foo) is dropped (drop-don't-brick).
+		if boolp(e.Params, "udp_over_stream") {
+			ob["udp_over_stream"] = true
+		} else if m := safeEnum(str(e.Params, "udp_relay_mode"), knownTUICRelay); m != "" {
 			ob["udp_relay_mode"] = m
 		}
 		// heartbeat is a duration STRING ("10s") — a bare number or garbage makes
 		// sing-box fail config decode, so only emit a value that parses as a
 		// duration (a malformed one is dropped rather than bricking the config).
+		// ParseDuration also ACCEPTS non-positive durations ("0s", "-5s"), but
+		// sing-box rejects "heartbeat must be > 0" at decode, so require >0 too
+		// (drop-don't-brick rather than failing the whole apply).
 		if hb := str(e.Params, "heartbeat"); hb != "" {
-			if _, err := time.ParseDuration(hb); err == nil {
+			if d, err := time.ParseDuration(hb); err == nil && d > 0 {
 				ob["heartbeat"] = hb
 			}
 		}
 		if boolp(e.Params, "zero_rtt_handshake") {
 			ob["zero_rtt_handshake"] = true
-		}
-		if boolp(e.Params, "udp_over_stream") {
-			ob["udp_over_stream"] = true
 		}
 	// NOTE: native WireGuard is NOT handled here. It is no longer a sing-box
 	// outbound (deprecated 1.11, removed 1.13); Generate routes ProtoWireGuard
@@ -902,6 +920,28 @@ func outboundFor(e *model.Endpoint) (map[string]any, error) {
 	return ob, nil
 }
 
+// validWGKey reports whether s is a valid WireGuard base64 key (32 bytes,
+// padded or raw). WireGuard keys are 32-byte values; standard base64 encodes
+// them as 44 chars with one trailing '=' pad, raw (no-pad) base64 gives 43
+// chars. Both encodings are accepted so a link-imported key (often padded) and
+// a .conf key (often raw) are treated identically. An empty string or a string
+// that does not decode to exactly 32 bytes returns false so callers can apply
+// drop-don't-brick rather than passing garbage to sing-box.
+func validWGKey(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding,
+		base64.URLEncoding, base64.RawURLEncoding,
+	} {
+		if b, err := enc.DecodeString(s); err == nil {
+			return len(b) == 32
+		}
+	}
+	return false
+}
+
 // endpointFor renders a native WireGuard endpoint in sing-box's top-level
 // `endpoints` schema (1.11+), the replacement for the removed `wireguard`
 // outbound. The endpoint carries the interface address + private key; the single
@@ -911,11 +951,25 @@ func outboundFor(e *model.Endpoint) (map[string]any, error) {
 // The tag equals the endpoint id, so existing route rules/groups that reference
 // it by tag keep working unchanged. AmneziaWG (EngineAmneziaWG) does NOT come
 // here — it is a chained-SOCKS plugin, handled in Generate's external-engine path.
-func endpointFor(e *model.Endpoint) map[string]any {
+//
+// Returns an error if the private key or the peer public key is not valid
+// WireGuard base64 (32-byte key) — sing-box fatals on "decode private key" for
+// an invalid key, blocking the entire apply for every other endpoint too. Callers
+// skip the offending endpoint (drop-don't-brick) rather than letting one bad key
+// take down the whole config.
+func endpointFor(e *model.Endpoint) (map[string]any, error) {
+	privKey := str(e.Params, "private_key")
+	if !validWGKey(privKey) {
+		return nil, fmt.Errorf("wireguard endpoint %q: private_key is not valid 32-byte base64 (%q)", e.ID, privKey)
+	}
+	peerPubKey := str(e.Params, "peer_public_key")
+	if !validWGKey(peerPubKey) {
+		return nil, fmt.Errorf("wireguard endpoint %q: peer_public_key is not valid 32-byte base64 (%q)", e.ID, peerPubKey)
+	}
 	peer := map[string]any{
 		"address":     e.Server,
 		"port":        e.Port,
-		"public_key":  str(e.Params, "peer_public_key"),
+		"public_key":  peerPubKey,
 		"allowed_ips": []string{"0.0.0.0/0", "::/0"},
 	}
 	if psk := str(e.Params, "pre_shared_key"); psk != "" {
@@ -929,15 +983,28 @@ func endpointFor(e *model.Endpoint) map[string]any {
 	}
 	// Keep the NAT mapping alive on an idle tunnel (seconds). Without it sing-box
 	// never sends keepalives and a peer behind NAT goes silent after the mapping
-	// expires — emit it when the imported config/link carried one.
-	if ka := intp(e.Params, "persistent_keepalive"); ka > 0 {
+	// expires — emit it when the imported config/link carried one. The typed
+	// per-tunnel control Endpoint.PersistentKeepalive (the Tunnels-page knob) wins
+	// when set (>0); a legacy import that only populated Params["persistent_keepalive"]
+	// still works as the fallback, so existing profiles are byte-identical.
+	if ka := e.PersistentKeepalive; ka > 0 {
 		peer["persistent_keepalive_interval"] = ka
+	} else if ka := intp(e.Params, "persistent_keepalive"); ka > 0 {
+		peer["persistent_keepalive_interval"] = ka
+	}
+	// A multi-[Peer] .conf (wg-quick mesh) is parsed into Params["peers"] — emit
+	// EVERY peer when that list holds MORE than one. A single-peer (or absent) list
+	// falls back to the single-peer entry built above, so the existing single-peer
+	// emission (including its catch-all allowed_ips and WARP reserved) is unchanged.
+	peerEntries := []map[string]any{peer}
+	if multi := wgPeers(e.Params); len(multi) > 1 {
+		peerEntries = multi
 	}
 	ep := map[string]any{
 		"type":        "wireguard",
 		"tag":         e.ID,
-		"private_key": str(e.Params, "private_key"),
-		"peers":       []map[string]any{peer},
+		"private_key": privKey,
+		"peers":       peerEntries,
 	}
 	// The endpoint interface address (was `local_address` on the outbound).
 	// sing-box requires it for a working tunnel; emit it when present.
@@ -946,11 +1013,110 @@ func endpointFor(e *model.Endpoint) map[string]any {
 	}
 	// MTU caps the interface packet size; dropping it falls back to the kernel
 	// default so large packets fragment/blackhole on a path that needs a smaller MTU
-	// (e.g. WARP at 1280). sing-box takes it on the endpoint.
-	if mtu := intp(e.Params, "mtu"); mtu > 0 {
+	// (e.g. WARP at 1280). sing-box takes it on the endpoint. The typed per-tunnel
+	// control Endpoint.MTU (the Tunnels-page knob) wins when set (>0); a legacy
+	// import that only populated Params["mtu"] still works as the fallback, so
+	// existing profiles emit a byte-identical endpoint.
+	if mtu := e.MTU; mtu > 0 {
+		ep["mtu"] = mtu
+	} else if mtu := intp(e.Params, "mtu"); mtu > 0 {
 		ep["mtu"] = mtu
 	}
-	return ep
+	return ep, nil
+}
+
+// wgPeers builds the sing-box endpoint `peers` array from a multi-[Peer]
+// Params["peers"] list (a wg-quick mesh .conf, parsed by importer.parseConf). It
+// tolerates both []map[string]any (the importer's shape) and []any of maps (the
+// shape a JSON round-trip through the store produces). Each entry reuses the same
+// field mapping as the single-peer path: address/port/public_key/pre_shared_key/
+// allowed_ips/persistent_keepalive_interval. A peer with no address is skipped (it
+// can't connect). Returns nil when no usable multi-peer list is present so the
+// caller falls back to the single-peer entry unchanged.
+func wgPeers(params map[string]any) []map[string]any {
+	raw, ok := params["peers"]
+	if !ok {
+		return nil
+	}
+	var list []map[string]any
+	switch v := raw.(type) {
+	case []map[string]any:
+		list = v
+	case []any:
+		for _, it := range v {
+			if m, ok := it.(map[string]any); ok {
+				list = append(list, m)
+			}
+		}
+	default:
+		return nil
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, p := range list {
+		addr := str(p, "server")
+		if addr == "" {
+			continue
+		}
+		// Skip peers whose public key is not a valid 32-byte WireGuard base64 key —
+		// sing-box fatals on "decode public key" for a bad key, which would block the
+		// entire apply for all other endpoints. Drop the peer rather than brick.
+		pubKey := str(p, "public_key")
+		if !validWGKey(pubKey) {
+			continue
+		}
+		peer := map[string]any{
+			"address":     addr,
+			"port":        intp(p, "port"),
+			"public_key":  pubKey,
+			"allowed_ips": []string{"0.0.0.0/0", "::/0"},
+		}
+		// Honor a per-peer AllowedIPs when the .conf scoped one (mesh peers usually
+		// carry distinct subnets); otherwise keep the catch-all default above.
+		if aips := anyToStrings(p["allowed_ips"]); len(aips) > 0 {
+			peer["allowed_ips"] = aips
+		}
+		if psk := str(p, "pre_shared_key"); psk != "" {
+			peer["pre_shared_key"] = psk
+		}
+		if ka := intp(p, "persistent_keepalive"); ka > 0 {
+			peer["persistent_keepalive_interval"] = ka
+		}
+		// `reserved` (WARP's 3 client-id bytes) is an endpoint-level param, not a
+		// per-peer one. Propagate it onto each peer so a single-peer config routed
+		// through this multi-peer path keeps its WARP bytes (parity with the legacy
+		// single-peer emission in endpointFor).
+		if r, ok := params["reserved"]; ok {
+			peer["reserved"] = r
+		}
+		out = append(out, peer)
+	}
+	return out
+}
+
+// anyToStrings coerces a Params value into a []string, tolerating both the
+// importer's native []string and the []any a JSON round-trip through the store
+// produces. Non-string elements and empty/whitespace entries are dropped.
+func anyToStrings(v any) []string {
+	var raw []string
+	switch t := v.(type) {
+	case []string:
+		raw = t
+	case []any:
+		for _, it := range t {
+			if s, ok := it.(string); ok {
+				raw = append(raw, s)
+			}
+		}
+	default:
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, s := range raw {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // transportCapable reports whether a protocol's sing-box outbound accepts a

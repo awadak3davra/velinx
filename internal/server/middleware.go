@@ -272,12 +272,16 @@ const maxRequestBody = 16 << 20
 // limitBody wraps r.Body in a MaxBytesReader so a read past maxRequestBody fails
 // instead of growing unbounded. The JSON handlers already surface a body-read
 // error as a 400, so legitimate traffic is unaffected and the cap is invisible
-// until something abusive hits it. Applied to every method: GET/stream handlers
-// don't read their body (Go discards it), and the Clash-proxy bodies are tiny.
+// until something abusive hits it. GET, HEAD, and OPTIONS are skipped: those
+// methods never carry a meaningful body, and Dashboard polls (GET /api/health,
+// GET /api/traffic, …) are the highest-frequency requests on a router, so
+// avoiding the per-request allocation + wrapper there is a worthwhile saving.
 func limitBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Body != nil {
-			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+			}
 		}
 		next.ServeHTTP(w, r)
 	})

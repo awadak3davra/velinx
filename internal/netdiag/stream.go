@@ -33,6 +33,13 @@ func streamCmd(ctx context.Context, emit func(string), name string, args ...stri
 	for sc.Scan() {
 		emit(sc.Text())
 	}
+	if err := sc.Err(); err != nil {
+		emit(name + ": output read error: " + err.Error())
+	}
+	// Close the read end so that if we stopped early (e.g. a >64 KiB line → ErrTooLong) the
+	// cmd's now-unread pipe writes unblock and the process is reaped immediately, rather than
+	// the Wait goroutine leaking until ctx is cancelled.
+	_ = pr.Close()
 }
 
 // validIfaceRe guards the interface name passed to `ping -I` / `traceroute -i`
@@ -67,6 +74,24 @@ func StreamPing(ctx context.Context, emit func(string), host, iface string, coun
 
 var pingMsRe = regexp.MustCompile(`time[=<]([0-9.]+)`)
 
+// parsePingMs extracts the round-trip latency (ms) from ping output, PREFERRING the summary
+// average (min/avg/max — over all echoes) and falling back to the first per-packet time=
+// (some busybox builds print no summary). Returns 0 when no latency is parseable (caller
+// treats the endpoint as alive-but-latency-unknown). Rounds rather than truncates.
+func parsePingMs(out string) int {
+	if m := reAvgUnix.FindStringSubmatch(out); len(m) == 2 {
+		if f, e := strconv.ParseFloat(m[1], 64); e == nil {
+			return int(f + 0.5)
+		}
+	}
+	if m := pingMsRe.FindStringSubmatch(out); len(m) == 2 {
+		if f, e := strconv.ParseFloat(m[1], 64); e == nil {
+			return int(f + 0.5)
+		}
+	}
+	return 0
+}
+
 // ReachableViaIface sends ONE ICMP echo to host bound to a kernel interface
 // (`ping -I <iface>`) and reports whether a reply came back + the round-trip ms.
 // This is how the health monitor probes native interface-backed endpoints
@@ -84,13 +109,7 @@ func ReachableViaIface(ctx context.Context, iface, host string, timeoutS int) (b
 	if err != nil {
 		return false, 0
 	}
-	ms := 0
-	if m := pingMsRe.FindStringSubmatch(string(out)); len(m) == 2 {
-		if f, e := strconv.ParseFloat(m[1], 64); e == nil {
-			ms = int(f)
-		}
-	}
-	return true, ms
+	return true, parsePingMs(string(out))
 }
 
 // StreamTraceroute emits each hop line as it completes (up to maxHops). When iface

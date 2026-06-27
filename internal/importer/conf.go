@@ -18,7 +18,12 @@ var awgKeysHex = []string{"i1", "i2", "i3", "i4", "i5"}
 // parseConf parses a WireGuard / AmneziaWG .conf (INI) into an endpoint.
 func parseConf(text string) (*model.Endpoint, error) {
 	iface := map[string]string{}
-	peer := map[string]string{}
+	// A .conf may carry MULTIPLE [Peer] sections (e.g. a wg-quick mesh config).
+	// Each [Peer] block starts a fresh map and is appended to peers; collapsing
+	// them to one map silently dropped every peer but the last. peer always points
+	// at the current block so the per-key cases below stay unchanged.
+	var peers []map[string]string
+	var peer map[string]string
 	cur := ""
 	for _, ln := range strings.Split(text, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -31,6 +36,8 @@ func parseConf(text string) (*model.Endpoint, error) {
 			continue
 		case "[peer]":
 			cur = "peer"
+			peer = map[string]string{}
+			peers = append(peers, peer)
 			continue
 		}
 		eq := strings.IndexByte(ln, '=')
@@ -51,11 +58,19 @@ func parseConf(text string) (*model.Endpoint, error) {
 				iface[key] = val
 			}
 		case "peer":
-			peer[key] = val
+			if peer != nil {
+				peer[key] = val
+			}
 		}
 	}
 
-	host, port := splitHostPort(peer["endpoint"])
+	if len(peers) == 0 {
+		return nil, errors.New("conf: missing [Peer] Endpoint")
+	}
+	// The FIRST peer drives the endpoint's primary Server/Port and the single-peer
+	// Params keys (backward-compat: existing single-peer readers/tests are unchanged).
+	first := peers[0]
+	host, port := splitHostPort(first["endpoint"])
 	if host == "" {
 		return nil, errors.New("conf: missing [Peer] Endpoint")
 	}
@@ -76,18 +91,48 @@ func parseConf(text string) (*model.Endpoint, error) {
 		Port:   port,
 		Params: map[string]any{
 			"private_key":     iface["privatekey"],
-			"peer_public_key": peer["publickey"],
+			"peer_public_key": first["publickey"],
 		},
 	}
-	if psk := peer["presharedkey"]; psk != "" {
+	if psk := first["presharedkey"]; psk != "" {
 		e.Params["pre_shared_key"] = psk
 	}
 	// PersistentKeepalive keeps the NAT/firewall UDP mapping alive on an idle
 	// tunnel; dropping it lets the mapping expire so the link silently dies until
 	// new traffic forces a re-handshake. The user's awg0/awg1 set it.
-	if ka := atoiDefault(peer["persistentkeepalive"], 0); ka > 0 {
+	if ka := atoiDefault(first["persistentkeepalive"], 0); ka > 0 {
 		e.Params["persistent_keepalive"] = ka
 	}
+	// Accumulate EVERY [Peer] as a structured list so the generator can emit all of
+	// them (a multi-peer mesh .conf otherwise collapsed to the last peer). Only keys
+	// present per peer are stored; single-peer configs still go through the legacy
+	// Params keys above (set from first), so existing readers are unaffected.
+	peerList := make([]map[string]any, 0, len(peers))
+	for _, p := range peers {
+		ph, pp := splitHostPort(p["endpoint"])
+		entry := map[string]any{}
+		if ph != "" {
+			entry["server"] = ph
+			if pp == 0 {
+				pp = 51820
+			}
+			entry["port"] = pp
+		}
+		if pk := p["publickey"]; pk != "" {
+			entry["public_key"] = pk
+		}
+		if psk := p["presharedkey"]; psk != "" {
+			entry["pre_shared_key"] = psk
+		}
+		if aips := splitCSV(p["allowedips"]); len(aips) > 0 {
+			entry["allowed_ips"] = aips
+		}
+		if ka := atoiDefault(p["persistentkeepalive"], 0); ka > 0 {
+			entry["persistent_keepalive"] = ka
+		}
+		peerList = append(peerList, entry)
+	}
+	e.Params["peers"] = peerList
 	if addr := iface["address"]; addr != "" {
 		e.Params["local_address"] = splitCSV(addr)
 	}

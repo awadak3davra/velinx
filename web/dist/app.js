@@ -121,6 +121,137 @@ if (window.matchMedia) {
 // i18n.js (window.WR_DICTS / WR_LANGS / WR_RTL), loaded before this file.
 const LANG_KEY = "wr-lang";
 const DICTS = window.WR_DICTS || {};
+// RU supplements for recently-added UI strings not yet in the generated i18n.js dict
+// (Native-support card, Set-up-Server picker, native-tunnel adoption). Additive only:
+// we fill missing keys, never override an existing translation. The canonical home for
+// these is .claude/i18n/dicts/ru.json → i18n.js; this merge keeps RU complete until the
+// dict is regenerated. English keys must match the rendered text EXACTLY.
+(function supplementRuDict() {
+  const add = {
+    // Native support card
+    "Native support": "Нативная поддержка",
+    "No capability data reported.": "Данные о возможностях отсутствуют.",
+    "Carried by the kernel / firmware — no sing-box needed": "Обрабатывается ядром / прошивкой — sing-box не нужен",
+    "NATIVE": "НАТИВНО",
+    "Native once this package is installed": "Станет нативным после установки этого пакета",
+    "Carried by the sing-box core": "Обрабатывается ядром sing-box",
+    "via sing-box": "через sing-box",
+    "Recommended installs": "Рекомендуемые установки",
+    "not built in": "не встроено",
+    "not enabled (firmware component)": "не включено (компонент прошивки)",
+    "Enable it in the Keenetic app (System → Component options) and reboot — it then routes natively.": "Включите его в приложении Keenetic (Система → Параметры компонентов) и перезагрузитесь — после этого трафик идёт нативно.",
+    "Copy command": "Скопировать команду",
+    // Subscription auto-refresh card
+    "Subscription auto-refresh": "Автообновление подписки",
+    "No imported subscription. Import a subscription URL under Connections to enable periodic auto-refresh.": "Подписка не импортирована. Импортируйте URL подписки в разделе «Соединения», чтобы включить периодическое автообновление.",
+    "Source: ": "Источник: ",
+    "Refresh now": "Обновить сейчас",
+    "Auto-refresh": "Автообновление",
+    "Every (hours)": "Каждые (часов)",
+    "Auto-refresh every {0} h": "Автообновление каждые {0} ч",
+    "Auto-refresh disabled": "Автообновление выключено",
+    "Refreshing…": "Обновление…",
+    "Refreshed — {0} new connection(s)": "Обновлено — {0} новых соединений",
+    "Last refreshed {0} (+{1} new)": "Обновлено {0} (+{1} новых)",
+    "Last refresh failed: ": "Последнее обновление не удалось: ",
+    "Never refreshed yet": "Ещё не обновлялось",
+    "just now": "только что",
+    "{0}m ago": "{0} мин назад",
+    "{0}h ago": "{0} ч назад",
+    "{0}d ago": "{0} дн назад",
+    "matched {0} log lines": "совпало строк лога: {0}",
+    "Could not load subscription info.": "Не удалось загрузить данные подписки.",
+    "present": "присутствует",
+    "not required": "не требуется",
+    // Native-only mode (sing-box intentionally absent — kernel plane carries everything)
+    "Native": "Нативный",
+    "Native-only mode — sing-box not required": "Только нативный режим — sing-box не требуется",
+    "Routed by the kernel plane (fast mode)": "Маршрутизация ядром (быстрый режим)",
+    "Every endpoint is kernel-native and traffic is routed by the kernel plane in fast mode, so the sing-box core is intentionally not running.":
+      "Все подключения нативны для ядра, и трафик маршрутизируется ядром в быстром режиме, поэтому ядро sing-box намеренно не запущено.",
+    // Detected native tunnels + adoption
+    "Detected native tunnels": "Обнаруженные нативные туннели",
+    "Tunnel has a recent handshake": "У туннеля недавнее рукопожатие",
+    "Configured but no recent handshake": "Настроен, но без недавнего рукопожатия",
+    "idle": "простаивает",
+    "Adopt as exit": "Принять как выход",
+    "Adopted": "Принят",
+    "Already added as a routing exit": "Уже добавлен как маршрутный выход",
+    "Add this OS-owned tunnel as a routing exit (added disabled — WakeRoute will not manage it)":
+      "Добавить этот туннель ОС как маршрутный выход (добавляется отключённым — WakeRoute не управляет им)",
+    "WakeRoute will ROUTE THROUGH the tunnel but does not manage it (the OS owns it). It is added disabled — enable it in Connections to start routing.":
+      "WakeRoute будет МАРШРУТИЗИРОВАТЬ ЧЕРЕЗ туннель, но не управляет им (туннель принадлежит ОС). Он добавляется отключённым — включите его в разделе «Подключения», чтобы начать маршрутизацию.",
+    "Adopted {0} — enable it in Connections to route through it":
+      "Принят {0} — включите его в разделе «Подключения», чтобы маршрутизировать через него",
+    // Set-up-Server option picker
+    "Recommended": "Рекомендуемые",
+    "Also available": "Также доступно",
+    "Available": "Доступно",
+    "— suggested defaults, hardest to detect": "— предлагаемые по умолчанию, труднее всего обнаружить",
+    "self-signed TLS": "самоподписанный TLS",
+    "Provisions with a self-signed TLS certificate": "Развёртывается с самоподписанным сертификатом TLS",
+    "Self-signed TLS": "Самоподписанный TLS",
+    " — the protocols tagged below provision with a self-signed certificate. That's fine for personal use; for active-probing resistance, bring your own domain + a real cert.":
+      " — отмеченные ниже протоколы развёртываются с самоподписанным сертификатом. Для личного использования это нормально; для устойчивости к активному зондированию используйте свой домен и настоящий сертификат.",
+    // Native VPNs section on the Connections page
+    "OS-managed tunnel — enable to use for routing": "Туннель под управлением ОС — включите для использования в маршрутизации",
+    "Native VPNs on this router": "Нативные VPN на этом роутере",
+    "Tunnels already managed by the OS — add them as routing exits without re-entering credentials.":
+      "Туннели, уже управляемые ОС — добавьте их как маршрутные выходы без повторного ввода учётных данных.",
+    "Already added": "Уже добавлен",
+    "Add as exit": "Добавить как выход",
+    "full tunnel": "полный туннель",
+    "Routes all traffic (0.0.0.0/0)": "Маршрутизирует весь трафик (0.0.0.0/0)",
+    "Active — recent handshake": "Активен — недавнее рукопожатие",
+    "No recent handshake": "Нет недавнего рукопожатия",
+    "Added! Enable it in Connections, then add routing lists.": "Добавлено! Включите в разделе «Подключения», затем добавьте списки маршрутизации.",
+    // Failover: active "Test all" + member re-sort by fresh latency
+    "Test all": "Проверить все",
+    "Actively re-test every member's latency, then sort best-first": "Активно перепроверить задержку каждого участника и отсортировать лучшие первыми",
+    "Testing…": "Проверка…",
+    "This group has no members to test": "В этой группе нет участников для проверки",
+    "Tested {0} members — {1} alive": "Проверено участников: {0} — активны: {1}",
+    // Failover: edit group + kill switch
+    "Edit": "Изменить",
+    "Edit group settings": "Изменить настройки группы",
+    "Edit failover group": "Изменить группу отказоустойчивости",
+    "Kill switch (drop when all members down)": "Аварийная блокировка (сбрасывать трафик, если все участники недоступны)",
+    "When on, traffic is dropped instead of falling back to the open WAN if every member is down — no leak to the unprotected internet.":
+      "Когда включено, трафик сбрасывается вместо возврата на открытый WAN, если все участники недоступны — без утечки в незащищённый интернет.",
+    "Saved {0}": "Сохранено: {0}",
+    // Per-tunnel link tuning (WireGuard / AmneziaWG)
+    "MTU": "MTU",
+    "e.g. 1420 — blank = auto": "напр. 1420 — пусто = авто",
+    "Persistent keepalive (s)": "Постоянный keepalive (с)",
+    "e.g. 25 — blank = off": "напр. 25 — пусто = выкл",
+    // Full backup (whole-setup export/restore — Settings)
+    "Full backup (everything)": "Полный бэкап (всё)",
+    "Download full backup": "Скачать полный бэкап",
+    "Restore full backup…": "Восстановить из полного бэкапа…",
+    "Save your whole setup — connections, failover groups, routing lists, saved servers and routing mode — to one file. Ideal before a firmware reflash or when moving to another WakeRoute. Restoring validates everything first and never applies on its own; you review it and press Apply.":
+      "Сохраните всю конфигурацию — подключения, группы отказоустойчивости, списки маршрутизации, сохранённые серверы и режим маршрутизации — в один файл. Удобно перед перепрошивкой или при переносе на другой WakeRoute. При восстановлении всё сначала проверяется и ничего не применяется автоматически; вы просматриваете и нажимаете «Применить».",
+    "The backup file contains your connection secrets (keys, passwords) — keep it private. Daemon access settings (panel port and host allow-list) are NOT changed by a restore.":
+      "Файл бэкапа содержит секреты подключений (ключи, пароли) — храните его в тайне. Настройки доступа к демону (порт панели и список разрешённых хостов) при восстановлении НЕ меняются.",
+    "That is not a WakeRoute full backup.": "Это не файл полного бэкапа WakeRoute.",
+    "Restore your whole setup from this backup? It replaces all connections, groups and routing lists (validated first). Nothing is applied automatically — review it, then press Apply. Your panel address and access settings are NOT changed.":
+      "Восстановить всю конфигурацию из этого бэкапа? Это заменит все подключения, группы и списки маршрутизации (сначала с проверкой). Ничего не применяется автоматически — просмотрите и нажмите «Применить». Адрес панели и настройки доступа НЕ меняются.",
+    "Restored {0} connections, {1} groups, {2} servers — review and press Apply to activate.":
+      "Восстановлено: подключений {0}, групп {1}, серверов {2} — просмотрите и нажмите «Применить» для активации.",
+    // Reality dest/SNI reachability probe (Check button next to the SNI field)
+    "Check": "Проверить",
+    "Checking…": "Проверка…",
+    "Enter an SNI to check": "Введите SNI для проверки",
+    "✓ reachable · TLS 1.3": "✓ доступен · TLS 1.3",
+    "reachable, but TLS {0} (Reality needs 1.3)": "доступен, но TLS {0} (Reality требует 1.3)",
+    "✗ unreachable: {0}": "✗ недоступен: {0}",
+    "✗ check failed: {0}": "✗ проверка не удалась: {0}",
+    "no response": "нет ответа",
+  };
+  try {
+    const ru = DICTS.ru || (DICTS.ru = {});
+    for (const k in add) if (ru[k] == null) ru[k] = add[k];
+  } catch (_) { /* WR_DICTS frozen or absent — fall back to English, never throw */ }
+})();
 const I18N_LANGS = window.WR_LANGS || [{ code: "en", name: "English" }];
 const RTL_LANGS = new Set(window.WR_RTL || ["ar", "fa"]);
 const hasDict = c => c === "en" || DICTS[c] != null;
@@ -343,12 +474,28 @@ function drawSpark(c, buf) {
 // (traffic graph is driven by pollTraffic above, scheduled from init)
 
 /* ---------- status pill ---------- */
+// isNativeOnly — true when the backend signals that sing-box is intentionally absent
+// because the live profile is native-only (DatapathNativeOnly: "fast" mode + every
+// endpoint kernel-native + nothing surviving into sing-box, so the kernel plane carries
+// everything). In that regime an absent core is BY DESIGN, not a fault, so the UI must
+// read it as a positive state, never a red "core down".
+//
+// The signal is read from /api/health's singbox.native_only (the natural place a backend
+// agent surfaces the verdict on the same payload the header pill already consumes). The
+// read is defensive: if the field is absent (older daemon / not yet wired) this returns
+// false and every existing "core not running" treatment stays byte-identical. The
+// Diagnostics battery additionally has an authoritative native_only row from
+// /api/healthcheck (nativeOnlyCheck) for the same verdict.
+function isNativeOnly(h) {
+  return !!(h && h.singbox && h.singbox.native_only);
+}
 function updateStatusPill() {
   const h = state.health, pill = $("#statuspill"), text = $("#statustext");
   if (!h) { pill.className = "pill err"; text.textContent = t("OFFLINE"); return; }
   if (h.demo) { pill.className = "pill"; pill.style.color = "var(--accent)"; pill.style.background = "var(--accent-tint)"; text.textContent = t("DEMO MODE"); return; }
   pill.style.color = ""; pill.style.background = "";
   if (h.singbox && h.singbox.running) { pill.className = "pill ok"; text.textContent = t("ONLINE"); }
+  else if (isNativeOnly(h)) { pill.className = "pill ok"; text.textContent = t("NATIVE"); }
   else { pill.className = "pill muted"; text.textContent = t("IDLE"); }
   $("#foot").textContent = "wakeroute " + (h.version || "");
 }
@@ -449,15 +596,42 @@ async function renderDashboard(view) {
   // live graph + per-tunnel stats only populate once sing-box is up.
   const hh = state.health || {};
   if (!hh.demo && !(hh.singbox && hh.singbox.running)) {
-    view.appendChild(el("div", { class: "card notice-core" },
-      el("span", { class: "notice-core-ico" }, "○"),
-      el("div", {},
-        el("b", {}, "Proxy core not running"),
-        el("div", { class: "hint", style: "margin-top:3px" },
-          eps.length
-            ? "sing-box isn't started — Apply a config to bring a tunnel up. Live stats appear once it's running."
-            : "Add a connection under Connections, then Apply — live stats appear once sing-box is running."))));
+    if (isNativeOnly(hh)) {
+      // Native-only mode: sing-box is intentionally absent (the kernel plane carries
+      // everything in fast mode). Read it as a positive state, not a "core down" alarm.
+      view.appendChild(el("div", { class: "card notice-core notice-core--ok" },
+        el("span", { class: "notice-core-ico", style: "color:var(--ok)" }, "✓"),
+        el("div", {},
+          el("b", {}, t("Native-only mode — sing-box not required")),
+          el("div", { class: "hint", style: "margin-top:3px" },
+            t("Every endpoint is kernel-native and traffic is routed by the kernel plane in fast mode, so the sing-box core is intentionally not running.")))));
+    } else {
+      view.appendChild(el("div", { class: "card notice-core" },
+        el("span", { class: "notice-core-ico" }, "○"),
+        el("div", {},
+          el("b", {}, "Proxy core not running"),
+          el("div", { class: "hint", style: "margin-top:3px" },
+            eps.length
+              ? "sing-box isn't started — Apply a config to bring a tunnel up. Live stats appear once it's running."
+              : "Add a connection under Connections, then Apply — live stats appear once sing-box is running."))));
+    }
   }
+
+  // PBR status row — best-effort; silently absent if server is old or mode != hybrid.
+  try {
+    const pbrSt = await api.get("/api/pbr/status");
+    if (pbrSt && pbrSt.mode === "hybrid") {
+      const pbrPill = pbrSt.installed && !pbrSt.stale
+        ? el("span", { class: "pill ok pill--dot" }, "active · " + pbrSt.zones + " zones")
+        : pbrSt.installed
+          ? el("span", { class: "pill warn" }, "stale — Apply to activate")
+          : el("span", { class: "pill muted" }, "not applied");
+      view.appendChild(el("div", { class: "card" },
+        el("div", { class: "row-between", style: "align-items:center;gap:var(--sp-3)" },
+          el("span", {}, "Kernel routing"),
+          pbrPill)));
+    }
+  } catch (_) {}
 
   // INTERNET card: live graph + connection stack (members of first group, else all endpoints).
   const card = el("div", { class: "card" });
@@ -522,7 +696,7 @@ async function renderDashboard(view) {
     tile("Endpoints", String(eps.length), eps.filter(e => e.enabled).length + " enabled"),
     tile("Failover groups", String(groups.length), groups.length ? "configured" : "none"),
     engTile,
-    tile("Mode", state.health.demo ? "Demo" : (state.health.singbox && state.health.singbox.running ? "Live" : "Idle"), "v" + (state.health.version || ""))));
+    tile("Mode", hh.demo ? "Demo" : (hh.singbox && hh.singbox.running ? "Live" : (isNativeOnly(hh) ? t("Native") : "Idle")), "v" + (hh.version || ""))));
 
   view.appendChild(talkersCard());
   view.appendChild(connectionsCard());
@@ -555,7 +729,12 @@ function bestAliveMember(members) {
 }
 function computeVerdict() {
   const h = state.health || {};
-  if (!h.demo && !(h.singbox && h.singbox.running)) return { level: "offline", ico: "○", word: "OFFLINE", verdict: t("Proxy core not running"), sub: "" };
+  if (!h.demo && !(h.singbox && h.singbox.running)) {
+    // Native-only: an absent core is by design (kernel plane carries everything), so the
+    // hero shows a benign "native" verdict instead of the red OFFLINE / core-down state.
+    if (isNativeOnly(h)) return { level: "protected", ico: "✓", word: "NATIVE", verdict: t("Native-only mode — sing-box not required"), sub: t("Routed by the kernel plane (fast mode)") };
+    return { level: "offline", ico: "○", word: "OFFLINE", verdict: t("Proxy core not running"), sub: "" };
+  }
   const def = (state.profile.rules || []).find(r => r.default);
   if (!def || !def.outbound || def.outbound === "direct") return { level: "unprotected", ico: "✕", word: "UNPROTECTED", verdict: t("Traffic goes direct (no tunnel)"), sub: def ? "" : t("No default route set") };
   if (def.outbound === "block") return { level: "degraded", ico: "⚠", word: "BLOCKED", verdict: t("Default route blocks all traffic"), sub: "" };
@@ -581,11 +760,14 @@ function paintHero() {
   const v = computeVerdict();
   const cls = { protected: "ok", degraded: "warn", unprotected: "err", checking: "muted", offline: "muted" }[v.level] || "muted";
   pill.className = "hero-pill hero-" + cls;
-  document.getElementById("hero-ico").textContent = v.ico;
-  document.getElementById("hero-word").textContent = t(v.word);
-  document.getElementById("hero-verdict").textContent = v.verdict;
+  const ico = document.getElementById("hero-ico");
+  const word = document.getElementById("hero-word");
+  const verdict = document.getElementById("hero-verdict");
   const sub = document.getElementById("hero-sub");
-  sub.textContent = v.sub || ""; sub.style.display = v.sub ? "" : "none";
+  if (ico) ico.textContent = v.ico;
+  if (word) word.textContent = t(v.word);
+  if (verdict) verdict.textContent = v.verdict;
+  if (sub) { sub.textContent = v.sub || ""; sub.style.display = v.sub ? "" : "none"; }
 }
 // Public exit IP — the address the active proxy presents upstream (what a VPN user
 // most wants to confirm). Async (a cached through-proxy lookup); fills the hero when
@@ -628,15 +810,18 @@ function paintSystem() {
   api.get("/api/system").then(si => {
     if (!si || !si.available) { strip.remove(); return; } // no procfs (non-Linux) → drop the strip
     const tot = si.mem_total_kb / 1024, used = (si.mem_total_kb - si.mem_avail_kb) / 1024, pct = Math.round(si.mem_used_pct);
-    const ram = strip.querySelector('[data-sys="ram"]'), rv = ram.querySelector(".sys-v");
-    rv.innerHTML = ""; rv.append(pct + "%", el("small", {}, "  " + Math.round(used) + " / " + Math.round(tot) + " MB"));
-    const fill = ram.querySelector(".sys-bar-fill");
-    fill.style.width = Math.min(100, pct) + "%";
-    fill.style.background = pct >= 88 ? "var(--err)" : pct >= 70 ? "var(--warn)" : "var(--ok)";
-    ram.title = Math.round(tot - used) + " MB free of " + Math.round(tot) + " MB";
+    const ram = strip.querySelector('[data-sys="ram"]');
+    if (ram) {
+      const rv = ram.querySelector(".sys-v");
+      if (rv) { rv.innerHTML = ""; rv.append(pct + "%", el("small", {}, "  " + Math.round(used) + " / " + Math.round(tot) + " MB")); }
+      const fill = ram.querySelector(".sys-bar-fill");
+      if (fill) { fill.style.width = Math.min(100, pct) + "%"; fill.style.background = pct >= 88 ? "var(--err)" : pct >= 70 ? "var(--warn)" : "var(--ok)"; }
+      ram.title = Math.round(tot - used) + " MB free of " + Math.round(tot) + " MB";
+    }
     const lv = strip.querySelector('[data-sys="load"] .sys-v');
-    lv.innerHTML = ""; lv.append((si.load1 || 0).toFixed(2), el("small", {}, "  " + t("1-min")));
-    strip.querySelector('[data-sys="uptime"] .sys-v').textContent = fmtUptime(si.uptime_s);
+    if (lv) { lv.innerHTML = ""; lv.append((si.load1 || 0).toFixed(2), el("small", {}, "  " + t("1-min"))); }
+    const uv = strip.querySelector('[data-sys="uptime"] .sys-v');
+    if (uv) uv.textContent = fmtUptime(si.uptime_s);
     const tt = strip.querySelector('[data-sys="temp"]'), tv = tt && tt.querySelector(".sys-v");
     if (tv) {
       tv.textContent = si.temp_c ? Math.round(si.temp_c) + "°C" : "—";
@@ -817,7 +1002,7 @@ function renderConnList(list, data) {
   if (!conns.length) { list.appendChild(el("div", { class: "empty" }, t("No active connections"))); if (sum) sum.textContent = ""; return; }
   if (sum) {
     let s = (data.total || conns.length) + " " + t("active");
-    if (data.max) s += "  ·  " + Math.round((data.total / data.max) * 100) + "% of " + data.max;
+    if (data.max && data.total != null) s += "  ·  " + Math.round((data.total / data.max) * 100) + "% of " + data.max;
     const ex = exitsSummary(data.exits);
     if (ex) s += "  ·  " + ex;
     sum.textContent = s;
@@ -927,6 +1112,7 @@ async function paintDashRouting() {
   let ok = 0, down = 0, off = 0;
   chips.forEach(d => {
     const ico = d.querySelector(".rl-ico"), note = d.querySelector(".rl-note");
+    if (!ico || !note) return;
     if (d.classList.contains("rl-chip-off")) { off++; ico.textContent = "○"; ico.style.color = "var(--ink-2)"; return; }
     const s = byId[d.getAttribute("data-dashrl")];
     if (!s) return; // leave the muted "…" until first probe lands
@@ -1002,12 +1188,15 @@ async function renderConnections(view) {
   } else {
     state.profile.endpoints.forEach(e => {
       const tog = el("div", { class: "toggle" + (e.enabled ? " on" : ""), onclick: () => toggleEndpoint(e) });
+      const isExternal = e.engine === "external";
       card.appendChild(el("div", { class: "conn" }, tog,
         el("div", { class: "body" },
           el("div", { class: "name" }, e.name || e.id, pillFor(e)),
           subMeta(e),
-          statsLine(e),
-          causeLine(e)),
+          isExternal
+            ? el("div", { class: "hint", style: "margin-top:3px" }, "OS-managed tunnel — enable to use for routing")
+            : statsLine(e),
+          isExternal ? null : causeLine(e)),
         el("div", { class: "acts" },
           el("button", { class: "btn btn-sm", onclick: () => shareEndpoint(e) }, "Share"),
           el("button", { class: "btn btn-sm", onclick: () => testEndpoint(e) }, "Test"),
@@ -1016,12 +1205,101 @@ async function renderConnections(view) {
     });
   }
   view.appendChild(card);
+
+  // Native VPN adoption — tunnels already managed by the OS (AmneziaWG / WireGuard).
+  // Best-effort: absent CLI tools → empty list → show nothing.
+  try {
+    const dv = await api.get("/api/vpn/discover");
+    const tunnels = (dv && dv.vpns) || [];
+    if (tunnels.length) {
+      const nativeHead = el("div", { class: "block-head" },
+        el("div", {},
+          el("div", { class: "ttl" }, "Native VPNs on this router"),
+          el("div", { class: "desc" }, "Tunnels already managed by the OS — add them as routing exits without re-entering credentials.")));
+      view.appendChild(nativeHead);
+      const nativeCard = el("div", { class: "card" });
+      tunnels.forEach(tunnel => {
+        const alreadyAdded = state.profile.endpoints.some(
+          e => e.engine === "external" && e.params && e.params.interface === tunnel.iface);
+        const typeBadge = el("span", { class: "badge" }, tunnel.type);
+        const activeDot = tunnel.active
+          ? el("span", { class: "pill ok", title: "Active — recent handshake" }, el("span", { class: "dot" }), "active")
+          : el("span", { class: "pill muted", title: "No recent handshake" }, "idle");
+        const fullTunnelPill = tunnel.full_tunnel
+          ? el("span", { class: "pill", title: "Routes all traffic (0.0.0.0/0)" }, "full tunnel")
+          : null;
+        const addBtn = alreadyAdded
+          ? el("button", { class: "btn btn-sm", disabled: "true" }, "Already added")
+          : el("button", { class: "btn btn-sm btn-primary", onclick: async () => {
+              try {
+                await api.post("/api/vpn/adopt", { iface: tunnel.iface });
+                await loadProfile();
+                route();
+                toast("Added! Enable it in Connections, then add routing lists.", "ok");
+              } catch (err) { toast(err.message, "err"); }
+            } }, "Add as exit");
+        nativeCard.appendChild(el("div", { class: "conn" },
+          el("div", { class: "body" },
+            el("div", { class: "name" }, tunnel.iface, typeBadge, activeDot, fullTunnelPill),
+            tunnel.name ? el("div", { class: "hint" }, tunnel.name) : null),
+          el("div", { class: "acts" }, addBtn)));
+      });
+      view.appendChild(nativeCard);
+    }
+  } catch (_) { /* CLI tools absent or endpoint unreachable — show nothing */ }
 }
 
 async function delEndpoint(e) {
   if (!confirm("Delete connection " + (e.name || e.id) + "?")) return;
   try { await api.del("/api/endpoints/" + encodeURIComponent(e.id)); await loadProfile(); route(); toast("Deleted", "ok"); }
   catch (err) { toast(err.message, "err"); }
+}
+
+// failoverMembers renders a group's members in the order urltest would prefer them:
+// alive first (lowest measured latency first), then unknown/not-yet-probed, then down
+// last (dimmed). The single member urltest would actually pick — alive + lowest latency —
+// gets a "BEST" pill so the user sees which exit currently carries traffic. Read-only:
+// it reuses the live per-endpoint healthMap the dashboard already polls (no extra fetch);
+// when health is absent it falls back to the configured member order.
+function failoverMemberRank(id) {
+  const h = healthMap[id];
+  if (h && h.state === "alive") return 0; // live exits sort to the top
+  if (h && h.state === "down") return 2;  // dead exits sink to the bottom
+  return 1;                               // unknown / not yet probed sits between
+}
+function failoverMembers(g) {
+  const ids = (g.members || []).slice();
+  const best = bestAliveMember(ids.map(findEndpoint).filter(Boolean));
+  const bestId = best ? best.ep.id : null;
+  // Stable sort: rank first, then latency (alive members ascending), preserving the
+  // configured order for ties (e.g. two unknown members) via the original index.
+  const order = new Map(ids.map((id, i) => [id, i]));
+  ids.sort((a, b) => {
+    const ra = failoverMemberRank(a), rb = failoverMemberRank(b);
+    if (ra !== rb) return ra - rb;
+    const la = (healthMap[a] || {}).latency_ms || 9999;
+    const lb = (healthMap[b] || {}).latency_ms || 9999;
+    if (la !== lb) return la - lb;
+    return order.get(a) - order.get(b);
+  });
+  const wrap = el("div", { class: "fo-members", style: "display:flex;flex-wrap:wrap;gap:8px;margin-top:8px" });
+  ids.forEach(id => {
+    const h = healthMap[id] || {};
+    const alive = h.state === "alive", down = h.state === "down";
+    const chip = el("div", {
+      class: "fo-member",
+      style: "display:inline-flex;align-items:center;gap:8px;min-width:0;word-break:break-word"
+        + (down ? ";opacity:.5" : "")
+    });
+    const dotCls = alive ? "ok" : down ? "err" : "muted";
+    chip.appendChild(el("span", { class: "pill " + dotCls, title: alive ? "alive" : down ? "down" : "not yet checked" },
+      el("span", { class: "dot" }),
+      nameOf(id),
+      alive && h.latency_ms ? el("small", { style: "margin-left:6px;color:inherit;opacity:.75" }, h.latency_ms + " ms") : null));
+    if (id === bestId) chip.appendChild(el("span", { class: "pill ok", title: "urltest would route through this member (alive, lowest latency)", style: "font-weight:600" }, "✓ BEST"));
+    wrap.appendChild(chip);
+  });
+  return wrap;
 }
 
 async function renderFailover(view) {
@@ -1047,9 +1325,11 @@ async function renderFailover(view) {
       el("div", { style: "min-width:0" }, el("div", { class: "name", style: "font-size:16px;min-width:0;word-break:break-word" }, g.name,
         el("span", { class: "badge" }, g.type),
         isDefault ? el("span", { class: "pill ok", style: "margin-left:6px" }, el("span", { class: "dot" }), "Default route") : null),
-        el("div", { class: "sub", style: "margin-top:4px;word-break:break-word;color:var(--ink-2)" }, g.members.map(nameOf).join("  ▸  "))),
+        failoverMembers(g)),
       el("div", { class: "acts" },
+        el("button", { class: "btn btn-sm", title: t("Actively re-test every member's latency, then sort best-first"), onclick: e => testFailoverGroup(g, e.currentTarget) }, t("Test all")),
         !isDefault ? el("button", { class: "btn btn-sm", onclick: () => setDefault(g) }, "Set as default route") : null,
+        el("button", { class: "btn btn-sm", title: t("Edit group settings"), onclick: () => openEditGroup(g) }, t("Edit")),
         el("button", { class: "btn btn-danger btn-sm", onclick: () => delGroup(g) }, "Delete"))));
     view.appendChild(card);
   });
@@ -1063,6 +1343,44 @@ async function delGroup(g) {
   if (!confirm("Delete group " + g.name + "?")) return;
   try { await api.del("/api/groups/" + encodeURIComponent(g.id)); await loadProfile(); route(); toast("Deleted", "ok"); }
   catch (err) { toast(err.message, "err"); }
+}
+
+// testFailoverGroup actively re-measures every member's latency on demand (reusing the
+// same per-endpoint Clash-delay probe testEndpoint() uses — /api/health/test/{id}),
+// folds the fresh results into the shared healthMap, then re-renders the Failover page
+// so failoverMembers() re-sorts members best-first (alive + lowest latency → ✓ BEST).
+// Falls back to /api/health/endpoints if a per-endpoint test fails for a member, so the
+// sort still reflects the latest known health rather than aborting outright.
+async function testFailoverGroup(g, btn) {
+  const ids = (g.members || []).slice();
+  if (!ids.length) { toast(t("This group has no members to test"), "info"); return; }
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.setAttribute("disabled", "true"); btn.textContent = t("Testing…"); }
+  let failed = 0;
+  try {
+    // Probe members concurrently — each reuses the existing per-endpoint delay test.
+    await Promise.all(ids.map(async id => {
+      try {
+        const h = await api.post("/api/health/test/" + encodeURIComponent(id), {});
+        if (h && h.id) healthMap[h.id] = h;
+      } catch (_) { failed++; }
+    }));
+    if (failed === ids.length) {
+      // Every per-endpoint probe failed (old daemon / endpoint gone) — fall back to a
+      // single bulk health read so the re-sort still uses the freshest available data.
+      try {
+        const r = await api.get("/api/health/endpoints");
+        (r || []).forEach(h => { healthMap[h.id] = h; });
+      } catch (_) {}
+    }
+    refreshPills();
+    route(); // re-render Failover → failoverMembers() re-sorts by the fresh latency
+    const alive = ids.filter(id => (healthMap[id] || {}).state === "alive").length;
+    toast(t("Tested {0} members — {1} alive", ids.length, alive), alive ? "ok" : "info");
+  } catch (err) {
+    toast(err.message, "err");
+    if (btn) { btn.removeAttribute("disabled"); btn.textContent = label; }
+  }
 }
 
 /* ---------- routing (list-based selective routing) ---------- */
@@ -1123,9 +1441,42 @@ async function renderRouting(view) {
       el("button", { class: "btn", title: "Add a ready-made routing list from the catalog", onclick: openRoutingCatalog }, "Preset lists"),
       el("button", { class: "btn btn-primary", title: "Create your own routing list (domains/IPs or a feed)", onclick: () => openRoutingList(null) }, "+ Custom list"))));
 
+  // PBR status badge — best-effort; silently absent if server is old or mode != hybrid.
+  try {
+    const pbrSt = await api.get("/api/pbr/status");
+    if (pbrSt && pbrSt.mode === "hybrid") {
+      const active = pbrSt.installed && !pbrSt.stale;
+      const pbrPill = active
+        ? el("span", { class: "pill ok pill--dot" }, "active · " + pbrSt.zones + " zones")
+        : pbrSt.installed
+          ? el("span", { class: "pill warn" }, "stale")
+          : el("span", { class: "pill muted" }, "not applied");
+      const row = el("div", { class: "hint row-between", style: "margin-top:var(--sp-2);align-items:center" },
+        el("span", {}, "Kernel routing: ", pbrPill));
+      if (!active) {
+        const applyBtn = el("button", { class: "btn", style: "font-size:var(--fs-small)" }, "Re-apply kernel routing");
+        applyBtn.onclick = async () => {
+          applyBtn.disabled = true;
+          try {
+            await api.post("/api/pbr/apply", {});
+            toast("Kernel routing re-applied");
+            renderRouting();
+          } catch (e) { toast("Re-apply failed: " + e.message, "err"); applyBtn.disabled = false; }
+        };
+        row.appendChild(applyBtn);
+      }
+      view.appendChild(row);
+    }
+  } catch (_) {}
+
   if (!state.profile.endpoints.filter(e => e.enabled).length) {
     view.appendChild(el("div", { class: "card" }, el("div", { class: "hint" },
       "Add an enabled connection first (Connections) — routing lists send matching traffic through your tunnels.")));
+  }
+  const disabledExternal = (state.profile.endpoints || []).filter(e => e.engine === "external" && !e.enabled);
+  if (disabledExternal.length) {
+    view.appendChild(el("div", { class: "card" }, el("div", { class: "hint" },
+      "Adopted native tunnels are disabled by default. Enable them in Connections before adding routing rules.")));
   }
   const lists = state.profile.routing_lists || [];
   const card = el("div", { class: "card" });
@@ -1387,26 +1738,52 @@ async function shareEndpoint(e) {
         el("button", { class: "btn btn-sm", onclick: () => copyText(res.text) }, "Copy"),
         res.kind === "conf" ? el("button", { class: "btn btn-sm", onclick: () => downloadText(res.filename || "client.conf", res.text) }, "⤓ Download .conf") : null)),
   });
-  const img = await qrImg(res.text, 280);
-  qrWrap.innerHTML = ""; qrWrap.appendChild(img);
+  try {
+    const img = await qrImg(res.text, 280);
+    qrWrap.innerHTML = ""; qrWrap.appendChild(img);
+  } catch (_) { qrWrap.innerHTML = ""; qrWrap.appendChild(el("div", { class: "hint", style: "color:var(--err)" }, "QR rendering failed")); }
 }
 async function openSubscription() {
   let info;
   try { info = await api.get("/api/subscription/info"); }
   catch (e) { return toast(e.message, "err"); }
-  const url = window.location.origin + info.path;
+  let url = window.location.origin + info.path;
   const qrWrap = el("div", { class: "qr-wrap" }, el("div", { class: "hint" }, "rendering…"));
+  const urlBox = el("pre", { class: "wr-console", style: "max-height:80px;margin-top:10px" }, url);
+  async function renderQR() {
+    qrWrap.innerHTML = ""; qrWrap.appendChild(el("div", { class: "hint" }, "rendering…"));
+    try {
+      const img = await qrImg(url, 280);
+      qrWrap.innerHTML = ""; qrWrap.appendChild(img);
+    } catch (_) { qrWrap.innerHTML = ""; qrWrap.appendChild(el("div", { class: "hint", style: "color:var(--err)" }, "QR rendering failed")); }
+  }
+  // Rotate: issues a fresh token and invalidates the current URL — for when the URL leaked
+  // (it grants access to every connection's secrets). Re-renders the URL + QR in place.
+  const rotateBtn = el("button", { class: "btn btn-sm", title: "Issue a new URL and invalidate the current one" }, "Rotate token");
+  rotateBtn.addEventListener("click", async () => {
+    if (!confirm("Rotate the subscription token? The current URL stops working immediately — you'll need to re-share the new one with every device.")) return;
+    const prev = rotateBtn.textContent;
+    rotateBtn.disabled = true; rotateBtn.textContent = "Rotating…";
+    try {
+      const r = await api.post("/api/subscription/rotate", {});
+      url = window.location.origin + r.path;
+      urlBox.textContent = url;
+      await renderQR();
+      toast("Subscription token rotated — re-share the new URL", "ok");
+    } catch (e) { toast(e.message, "err"); }
+    finally { rotateBtn.disabled = false; rotateBtn.textContent = prev; }
+  });
   modal({
     title: "Subscription",
     body: el("div", {},
       el("div", { class: "hint", style: "margin-bottom:12px" }, "Add this URL as a subscription in v2rayN/NG, Nekobox, Hiddify or Shadowrocket. Apps auto-update when your connections change — e.g. after a failover or re-provision — with no re-import. Covers link-based protocols (VLESS/Hysteria2/Trojan/…); WireGuard/AmneziaWG use per-connection Share."),
       qrWrap,
-      el("pre", { class: "wr-console", style: "max-height:80px;margin-top:10px" }, url),
+      urlBox,
       el("div", { style: "display:flex;gap:10px;margin-top:10px" },
-        el("button", { class: "btn btn-sm", onclick: () => copyText(url) }, "Copy URL"))),
+        el("button", { class: "btn btn-sm", onclick: () => copyText(url) }, "Copy URL"),
+        rotateBtn)),
   });
-  const img = await qrImg(url, 280);
-  qrWrap.innerHTML = ""; qrWrap.appendChild(img);
+  renderQR();
 }
 
 const PROTOCOLS = ["vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic", "wireguard", "amneziawg", "olcrtc", "socks", "http"];
@@ -1428,6 +1805,47 @@ function fCheck(id, label, checked) {
   return el("label", { class: "check" }, c, el("span", {}, label));
 }
 
+// fSniCheck is the SNI field (used by the vless tls/reality branch AND hysteria2/tuic)
+// with a "Check" button that probes the entered SNI from the router's vantage:
+// TCP-reachable + speaks TLS + negotiates TLS 1.3. Reality borrows a real public
+// TLS 1.3 site's SNI as camouflage, so an unreachable/non-TLS/TLS-1.2 dest silently
+// breaks the connection — this surfaces it before saving. Additive; the input keeps id
+// so collect()'s g("f-sni") is unchanged.
+function fSniCheck(id, label, value) {
+  const input = el("input", { type: "text", id, value: value != null ? String(value) : "" });
+  const result = el("span", { class: "hint", style: "margin-left:8px" });
+  const btn = el("button", { class: "btn btn-sm", type: "button" }, t("Check"));
+  btn.addEventListener("click", async () => {
+    const host = (input.value || "").trim();
+    if (!host) { toast(t("Enter an SNI to check"), "warn"); return; }
+    const prev = btn.textContent;
+    btn.disabled = true; btn.textContent = t("Checking…");
+    result.textContent = "";
+    result.style.color = "";
+    try {
+      const r = await api.post("/api/probe/tls", { host });
+      if (!r.reachable) {
+        result.style.color = "var(--err)";
+        result.textContent = t("✗ unreachable: {0}", r.error || t("no response"));
+      } else if (r.tls13) {
+        result.style.color = "var(--ok)";
+        result.textContent = t("✓ reachable · TLS 1.3");
+      } else {
+        result.style.color = "var(--warn)";
+        result.textContent = t("reachable, but TLS {0} (Reality needs 1.3)", r.version || "1.2");
+      }
+    } catch (e) {
+      result.style.color = "var(--err)";
+      result.textContent = t("✗ check failed: {0}", e.message || String(e));
+    } finally {
+      btn.disabled = false; btn.textContent = prev;
+    }
+  });
+  return el("div", { class: "field" },
+    el("label", {}, label),
+    el("div", { class: "row", style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap" }, input, btn, result));
+}
+
 // manualForm builds the protocol form. Returns {el, collect}. Pass an endpoint to edit.
 function manualForm(ep) {
   ep = ep || {};
@@ -1442,10 +1860,19 @@ function manualForm(ep) {
     else if (proto === "vmess") add(fInput("f-uuid", "UUID", P.uuid), fInput("f-aid", "Alter ID", P.alter_id || 0, { type: "number" }), fInput("f-scy", "Security (auto/aes-128-gcm/none)", P.security || "auto"));
     else if (proto === "trojan") add(fInput("f-password", "Password", P.password));
     else if (proto === "shadowsocks") add(fSelect("f-method", "Method", SS_METHODS, P.method || SS_METHODS[0]), fInput("f-password", "Password", P.password));
-    else if (proto === "hysteria2") add(fInput("f-password", "Password", P.password), fInput("f-sni", "SNI", T.sni), fInput("f-obfs", "Obfs (salamander, optional)", P.obfs), fInput("f-obfspw", "Obfs password", P.obfs_password), fCheck("f-insecure", "Allow insecure TLS", T.insecure));
-    else if (proto === "tuic") add(fInput("f-uuid", "UUID", P.uuid), fInput("f-password", "Password", P.password), fInput("f-sni", "SNI", T.sni), fInput("f-cc", "Congestion control (bbr/cubic)", P.congestion_control), fCheck("f-insecure", "Allow insecure TLS", T.insecure));
+    else if (proto === "hysteria2") add(fInput("f-password", "Password", P.password), fSniCheck("f-sni", "SNI", T.sni), fInput("f-obfs", "Obfs (salamander, optional)", P.obfs), fInput("f-obfspw", "Obfs password", P.obfs_password), fCheck("f-insecure", "Allow insecure TLS", T.insecure));
+    else if (proto === "tuic") add(fInput("f-uuid", "UUID", P.uuid), fInput("f-password", "Password", P.password), fSniCheck("f-sni", "SNI", T.sni), fInput("f-cc", "Congestion control (bbr/cubic)", P.congestion_control), fCheck("f-insecure", "Allow insecure TLS", T.insecure));
     else if (proto === "wireguard" || proto === "amneziawg") {
       add(fInput("f-pk", "Private key", P.private_key), fInput("f-ppk", "Peer public key", P.peer_public_key), fInput("f-psk", "Pre-shared key (optional)", P.pre_shared_key), fInput("f-addr", "Local address(es), comma-separated", (P.local_address || []).join(",")));
+      // Per-tunnel link tuning (optional; blank = unset = current behavior). Read the
+      // top-level Endpoint fields first, falling back to the legacy params.{mtu,
+      // persistent_keepalive} so configs imported before these were promoted still show.
+      const mtu0 = ep.mtu != null && ep.mtu !== 0 ? ep.mtu : (P.mtu != null ? P.mtu : "");
+      const pka0 = ep.persistent_keepalive != null && ep.persistent_keepalive !== 0 ? ep.persistent_keepalive
+        : (P.persistent_keepalive != null ? P.persistent_keepalive : "");
+      add(el("div", { style: "display:flex;gap:12px" },
+        el("div", { style: "flex:1;min-width:0" }, fInput("f-mtu", t("MTU"), mtu0, { type: "number", ph: t("e.g. 1420 — blank = auto") })),
+        el("div", { style: "flex:1;min-width:0" }, fInput("f-keepalive", t("Persistent keepalive (s)"), pka0, { type: "number", ph: t("e.g. 25 — blank = off") }))));
       if (proto === "amneziawg") add(el("div", { class: "hint" }, "AmneziaWG junk params (Jc/Jmin/…) are best captured by pasting a full .conf in the Paste tab."));
     } else if (proto === "olcrtc") {
       add(fSelect("f-provider", "Meet provider", ["jitsi", "telemost", "wbstream"], P.provider || "jitsi"),
@@ -1459,7 +1886,7 @@ function manualForm(ep) {
     if (["vless", "vmess", "trojan"].includes(proto)) {
       add(el("div", { class: "card-title", style: "margin:16px 0 8px" }, "Security"));
       add(fSelect("f-sec", "TLS", ["none", "tls", "reality"], T.type || (T.enabled ? "tls" : "none")),
-        fInput("f-sni", "SNI", T.sni), fInput("f-fp", "uTLS fingerprint (chrome…, optional)", T.fingerprint),
+        fSniCheck("f-sni", "SNI", T.sni), fInput("f-fp", "uTLS fingerprint (chrome…, optional)", T.fingerprint),
         fInput("f-pbk", "Reality public key", T.public_key), fInput("f-sid", "Reality short id", T.short_id));
       add(el("div", { class: "card-title", style: "margin:16px 0 8px" }, "Transport"));
       add(fSelect("f-tt", "Type", ["tcp", "ws", "grpc", "http", "httpupgrade"], R.type || "tcp"),
@@ -1496,7 +1923,18 @@ function manualForm(ep) {
     if (proto === "shadowsocks") p.method = g("f-method");
     if (proto === "hysteria2" && g("f-obfs")) { p.obfs = g("f-obfs"); if (g("f-obfspw")) p.obfs_password = g("f-obfspw"); }
     if (proto === "tuic" && g("f-cc")) p.congestion_control = g("f-cc");
-    if (["wireguard", "amneziawg"].includes(proto)) { p.private_key = g("f-pk"); p.peer_public_key = g("f-ppk"); if (g("f-psk")) p.pre_shared_key = g("f-psk"); if (g("f-addr")) p.local_address = g("f-addr").split(",").map(s => s.trim()).filter(Boolean); }
+    if (["wireguard", "amneziawg"].includes(proto)) {
+      p.private_key = g("f-pk"); p.peer_public_key = g("f-ppk"); if (g("f-psk")) p.pre_shared_key = g("f-psk"); if (g("f-addr")) p.local_address = g("f-addr").split(",").map(s => s.trim()).filter(Boolean);
+      // Per-tunnel link tuning → top-level Endpoint fields (mtu / persistent_keepalive).
+      // Blank/0 omits the field entirely (zero-value = "unset" = current behavior). When
+      // the user sets an explicit value, drop any legacy params.{mtu,persistent_keepalive}
+      // carried by the keep-map below so there's a single source of truth (the generator
+      // reads the top-level field).
+      const mtu = parseInt(g("f-mtu"), 10);
+      if (mtu > 0) { out.mtu = mtu; delete p.mtu; } else { out.mtu = 0; }
+      const pka = parseInt(g("f-keepalive"), 10);
+      if (pka > 0) { out.persistent_keepalive = pka; delete p.persistent_keepalive; } else { out.persistent_keepalive = 0; }
+    }
     if (["socks", "http"].includes(proto) && g("f-user")) p.username = g("f-user");
     if (proto === "olcrtc") {
       p.provider = g("f-provider"); p.room = g("f-room"); p.key = g("f-key");
@@ -1537,8 +1975,12 @@ function manualForm(ep) {
       shadowsocks: ["udp_over_tcp", "plugin", "plugin_opts"],
       hysteria2: ["hop_ports"],
       tuic: ["udp_relay_mode", "zero_rtt_handshake", "udp_over_stream", "heartbeat"],
-      wireguard: ["reserved", "mtu", "persistent_keepalive"],
-      amneziawg: ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5", "reserved", "mtu", "persistent_keepalive"],
+      // mtu / persistent_keepalive are NOT kept in params here — they are now surfaced as
+      // explicit top-level Endpoint fields (out.mtu / out.persistent_keepalive) by the
+      // WG/AWG branch above, which is their single source of truth (the generator reads the
+      // top-level field). The collect() above migrates any legacy params.mtu into it.
+      wireguard: ["reserved"],
+      amneziawg: ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5", "reserved"],
     };
     (keep[proto] || []).forEach(k => { if (P[k] !== undefined && p[k] === undefined) p[k] = P[k]; });
     return out;
@@ -1615,7 +2057,7 @@ function openAddConnection() {
     }
     const parseBtn = el("button", { class: "btn btn-primary", onclick: parse }, "Parse");
     const file = el("input", { type: "file", accept: ".conf,.json,.txt,.yaml,.yml", style: "display:none",
-      onchange: async ev => { const f = ev.target.files[0]; if (!f) return; ta.value = await f.text(); ev.target.value = ""; parse(); } });
+      onchange: async ev => { const f = ev.target.files && ev.target.files[0]; if (!f) return; ta.value = await f.text(); ev.target.value = ""; parse(); } });
     const fileBtn = el("button", { class: "btn", onclick: () => file.click() }, "Import file…");
     return el("div", {}, el("div", { class: "field" }, el("label", {}, "Paste a share link or config — or import a file"), ta),
       el("div", { style: "display:flex;gap:10px;flex-wrap:wrap" }, parseBtn, fileBtn), file,
@@ -1637,7 +2079,7 @@ function openAddConnection() {
     const importBtn = el("button", { class: "btn btn-primary", disabled: "true", onclick: async () => {
       const chosen = $$("input[type=checkbox]:checked", list).map(c => found[+c.value]);
       if (!chosen.length) return toast("Nothing selected", "err");
-      try { const r = await api.post("/api/endpoints/bulk", { endpoints: chosen }); done("Imported " + r.saved + " connection(s)" + (r.errors && r.errors.length ? ", " + r.errors.length + " failed" : "")); } catch (e) { toast(e.message, "err"); }
+      try { const r = await api.post("/api/endpoints/bulk", { endpoints: chosen }); done("Imported " + r.saved + " connection(s)" + (r.duplicates ? ", " + r.duplicates + " duplicate(s) skipped" : "") + (r.errors && r.errors.length ? ", " + r.errors.length + " failed" : "")); } catch (e) { toast(e.message, "err"); }
     } }, "Import selected");
     const fetchBtn = el("button", { class: "btn", onclick: async () => {
       list.innerHTML = ""; importBtn.setAttribute("disabled", "true");
@@ -1645,6 +2087,7 @@ function openAddConnection() {
         const r = await api.post("/api/subscription", { url: url.value.trim(), text: ta.value });
         found = r.endpoints || [];
         if (!found.length) { list.appendChild(el("div", { class: "hint" }, "No connections found" + (r.errors && r.errors.length ? " (" + r.errors.length + " line errors)" : "") + ".")); return; }
+        if (r.name) list.appendChild(el("div", { class: "hint", style: "color:var(--ink-2);margin-bottom:8px" }, "From: " + r.name));
         found.forEach((e, i) => list.appendChild(el("label", { class: "check" }, el("input", { type: "checkbox", value: String(i), checked: "true" }), el("span", {}, (e.name || e.id) + "  "), el("span", { class: "badge" }, e.protocol))));
         if (r.errors && r.errors.length) list.appendChild(el("div", { class: "hint" }, r.errors.length + " line(s) skipped"));
         importBtn.removeAttribute("disabled");
@@ -1695,6 +2138,7 @@ function openNewGroup() {
       el("span", {}, (e.name || e.id) + "  "), el("span", { class: "badge" }, e.protocol)));
   });
   const asDefault = el("input", { type: "checkbox" });
+  const killSwitch = el("input", { type: "checkbox" });
 
   async function create() {
     const members = $$("input[type=checkbox]:checked", checks).map(c => c.value);
@@ -1702,8 +2146,12 @@ function openNewGroup() {
     if (!members.length) return toast("Pick at least one member", "err");
     const id = "grp-" + name.value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
     try {
-      await api.post("/api/groups", { id, name: name.value.trim(), type: type.value, members,
-        test: { url: "http://cp.cloudflare.com/generate_204", interval: 60, tolerance: 50 } });
+      // kill_switch is omitted from the payload when unchecked (omitempty / false =
+      // current behavior: WAN fallback when all members are down).
+      const g = { id, name: name.value.trim(), type: type.value, members,
+        test: { url: "http://cp.cloudflare.com/generate_204", interval: 60, tolerance: 50 } };
+      if (killSwitch.checked) g.kill_switch = true;
+      await api.post("/api/groups", g);
       if (asDefault.checked) await api.post("/api/rules", { id: "default", default: true, outbound: id });
       back.remove(); await loadProfile(); route(); toast("Created " + name.value.trim(), "ok");
     } catch (e) { toast(e.message, "err"); }
@@ -1713,15 +2161,66 @@ function openNewGroup() {
     el("div", { class: "field" }, el("label", {}, "Group name"), name),
     el("div", { class: "field" }, el("label", {}, "Type"), type),
     el("div", { class: "field" }, el("label", {}, "Members (preference order)"), checks),
-    el("label", { class: "check" }, asDefault, el("span", {}, "Set as default route (all traffic)")));
+    el("label", { class: "check" }, asDefault, el("span", {}, "Set as default route (all traffic)")),
+    el("label", { class: "check" }, killSwitch, el("span", {}, t("Kill switch (drop when all members down)"))),
+    el("div", { class: "hint" }, t("When on, traffic is dropped instead of falling back to the open WAN if every member is down — no leak to the unprotected internet.")));
   const back = modal({ title: "New failover group", body,
     footer: [el("button", { class: "btn btn-ghost", onclick: () => back.remove() }, "Cancel"),
     el("button", { class: "btn btn-primary", onclick: create }, "Create")] });
 }
 
+// openEditGroup edits an existing failover group's settings. The create modal builds new
+// groups; this re-posts the SAME group (POST /api/groups upserts by id) with the editable
+// fields — name, type, members, and the kill_switch toggle — preserving every other field
+// (test config, etc.) verbatim so an edit never silently drops it.
+function openEditGroup(g) {
+  const name = el("input", { type: "text", value: g.name || "" });
+  const type = el("select", {},
+    el("option", { value: "urltest" }, "urltest — auto, fastest working"),
+    el("option", { value: "fallback" }, "fallback — strict order"),
+    el("option", { value: "selector" }, "selector — manual"));
+  type.value = g.type || "urltest";
+  const have = new Set(g.members || []);
+  const checks = el("div", { class: "checks" });
+  // List current members first (in saved preference order), then the remaining endpoints.
+  const ordered = (g.members || []).map(findEndpoint).filter(Boolean)
+    .concat(state.profile.endpoints.filter(e => !have.has(e.id)));
+  ordered.forEach(e => {
+    const cb = el("input", { type: "checkbox", value: e.id });
+    if (have.has(e.id)) cb.setAttribute("checked", "true");
+    checks.appendChild(el("label", { class: "check" }, cb,
+      el("span", {}, (e.name || e.id) + "  "), el("span", { class: "badge" }, e.protocol)));
+  });
+  const killSwitch = el("input", { type: "checkbox" });
+  if (g.kill_switch) killSwitch.setAttribute("checked", "true");
+
+  async function save() {
+    const members = $$("input[type=checkbox]:checked", checks).map(c => c.value);
+    if (!name.value.trim()) return toast("Name required", "err");
+    if (!members.length) return toast("Pick at least one member", "err");
+    try {
+      // Spread g first so unedited fields (test config, etc.) round-trip unchanged.
+      const out = { ...g, name: name.value.trim(), type: type.value, members, kill_switch: killSwitch.checked };
+      await api.post("/api/groups", out);
+      back.remove(); await loadProfile(); route(); toast(t("Saved {0}", name.value.trim()), "ok");
+    } catch (e) { toast(e.message, "err"); }
+  }
+
+  const body = el("div", {},
+    el("div", { class: "field" }, el("label", {}, "Group name"), name),
+    el("div", { class: "field" }, el("label", {}, "Type"), type),
+    el("div", { class: "field" }, el("label", {}, "Members (preference order)"), checks),
+    el("label", { class: "check" }, killSwitch, el("span", {}, t("Kill switch (drop when all members down)"))),
+    el("div", { class: "hint" }, t("When on, traffic is dropped instead of falling back to the open WAN if every member is down — no leak to the unprotected internet.")));
+  const back = modal({ title: t("Edit failover group"), body,
+    footer: [el("button", { class: "btn btn-ghost", onclick: () => back.remove() }, "Cancel"),
+    el("button", { class: "btn btn-primary", onclick: save }, "Save")] });
+}
+
 /* ---------- apply ---------- */
 async function applyConfig(save) {
   const btn = save ? $("#applysavebtn") : $("#applybtn");
+  if (!btn) return;
   const label = btn.textContent;
   btn.setAttribute("disabled", "true"); btn.textContent = "Applying…";
   try {
@@ -1758,11 +2257,13 @@ function startFailsafeBanner() {
 }
 function hideFailsafeBanner() {
   const b = $("#failsafe-banner");
+  if (!b) { if (failsafeTimer) { clearInterval(failsafeTimer); failsafeTimer = null; } return; }
   b.style.display = "none"; b.innerHTML = "";
   if (failsafeTimer) { clearInterval(failsafeTimer); failsafeTimer = null; }
 }
 function renderFailsafeBanner(st) {
   const b = $("#failsafe-banner");
+  if (!b) return;
   b.style.display = "block"; b.innerHTML = "";
   const degraded = st.phase === "degraded";
   b.appendChild(el("div", { class: "card", style: "margin:0;border-left:3px solid " + (degraded ? "var(--err)" : "var(--warn)") },
@@ -1846,7 +2347,7 @@ function subMeta(e) {
   if (e.engine === "external") {
     const iface = (e.params && e.params.interface) || "?";
     const epip = e.params && e.params.endpoint_ip;
-    sub.appendChild(el("span", { class: "badge proto external" }, t("external")));
+    sub.appendChild(el("span", { class: "badge proto external" }, t("OS tunnel")));
     sub.appendChild(el("span", { class: "addr" }, "⇄ " + iface + (epip ? " → " + epip : "")));
     return sub;
   }
@@ -2043,13 +2544,13 @@ async function testEndpoint(e) {
 async function runSpeedtest(btn, out) {
   const label = btn.textContent;
   btn.setAttribute("disabled", "true"); btn.textContent = "Testing…";
-  out.textContent = "running…"; out.style.color = "var(--ink-2)";
+  if (out) { out.textContent = "running…"; out.style.color = "var(--ink-2)"; }
   try {
     const r = await api.post("/api/speedtest", { bytes: 10000000 });
-    const txt = "↓ " + r.down_mbps + " Mbps" + (r.up_mbps ? "   ↑ " + r.up_mbps + " Mbps" : "") + "   ·   " + r.latency_ms + " ms (" + r.via + ")";
+    const txt = "↓ " + r.down_mbps + " Mbps" + (r.up_mbps ? "   ↑ " + r.up_mbps + " Mbps" : "") + "   ·   " + (r.latency_ms ?? "?") + " ms (" + (r.via ?? "?") + ")";
     speedResults["__global"] = { text: txt, ts: Date.now(), ok: true };
-    out.textContent = txt; out.style.color = "var(--ok)";
-  } catch (e) { speedResults["__global"] = { text: "failed: " + e.message, ts: Date.now(), ok: false }; out.textContent = "failed: " + e.message; out.style.color = "var(--err)"; }
+    if (out) { out.textContent = txt; out.style.color = "var(--ok)"; }
+  } catch (e) { speedResults["__global"] = { text: "failed: " + e.message, ts: Date.now(), ok: false }; if (out) { out.textContent = "failed: " + e.message; out.style.color = "var(--err)"; } toast("Speedtest: " + e.message, "err"); }
   finally { btn.removeAttribute("disabled"); btn.textContent = label; }
 }
 
@@ -2060,9 +2561,12 @@ async function renderUpdater(view) {
       el("div", { class: "ttl" }, "Updater"),
       el("div", { class: "desc" }, "Keep WakeRoute and its proxy engines up to date."))));
   view.appendChild(selfUpdateCard()); // WakeRoute self-update — at the top (fills async, non-blocking)
+  const loadingEngines = el("div", { class: "hint", style: "margin:18px 0" }, "checking engine versions…");
+  view.appendChild(loadingEngines);
   let data;
   try { data = await api.get("/api/updater/engines"); }
-  catch (e) { renderError(view, e); return; }
+  catch (e) { loadingEngines.remove(); renderError(view, e); return; }
+  loadingEngines.remove();
   const mirrorCount = (data.mirrors || []).filter(Boolean).length;
   view.appendChild(el("div", { class: "row-between", style: "margin:18px 0 16px" },
     el("div", { class: "card-title" }, "Engine versions"),
@@ -2154,6 +2658,7 @@ function engineCard(e) {
 
 async function loadVersions(e, card) {
   const box = card.querySelector(".vbox");
+  if (!box) return;
   box.innerHTML = ""; box.appendChild(el("div", { class: "hint" }, "checking releases…"));
   try {
     const v = await api.get("/api/updater/" + encodeURIComponent(e.id) + "/versions");
@@ -2193,23 +2698,194 @@ async function installVersion(e, version, btn) {
    server-side /api/healthcheck (clock skew + IPv6 leak the browser can't probe).
    Results live in state.hbat so they survive tab navigation; nothing runs until the
    family clicks Run (router-light). Worst row drives the banner; FAIL rows auto-expand. */
-const HC_ORDER = ["core", "internet", "tunnels", "censored", "exit", "time", "ipv6", "dns", "offload", "system", "log"];
+const HC_ORDER = ["core", "internet", "tunnels", "censored", "exit", "endpoint_reach", "time", "ipv6", "dns", "offload", "pbr_kernel", "system", "log"];
 const HC_LABEL = {
   core: "VPN core running", internet: "Internet works", tunnels: "VPN tunnels healthy",
-  censored: "Blocked sites reachable", exit: "Exit IP",
+  censored: "Blocked sites reachable", exit: "Exit IP", endpoint_reach: "VPN servers reachable",
   time: "Router clock is correct", ipv6: "No IPv6 leak", dns: "DNS is private",
-  offload: "Flow offload", system: "Router resources", log: "No engine errors",
+  offload: "Flow offload", pbr_kernel: "Kernel routing (PBR)", system: "Router resources", log: "No engine errors",
 };
 const HC_DEEP = { connections: ["#connections", "Open Connections"], routing: ["#routing", "Open Routing"] };
-// CHECKS maps an id to its client-side thunk. time/ipv6/dns are NOT here — they fold
-// in from the backend /api/healthcheck call (see HC_BACKEND). This single map drives
-// BOTH the full battery run and a single-row re-check, so the two can never drift.
+// CHECKS maps an id to its client-side thunk. time/ipv6/dns/offload/pbr_kernel are NOT
+// here — they fold in from the backend /api/healthcheck call (see HC_BACKEND). This
+// single map drives BOTH the full battery run and a single-row re-check.
 const CHECKS = { core: chkCore, internet: chkInternet, tunnels: chkTunnels, censored: chkCensored, exit: chkExit, system: chkSystem, log: chkLog };
-const HC_BACKEND = ["time", "ipv6", "dns", "offload"];
+const HC_BACKEND = ["time", "ipv6", "dns", "offload", "pbr_kernel", "endpoint_reach"];
+
+// nativeSupportCard — read-only "what can this router carry natively?" card for
+// the Diagnostics page. Fetches GET /api/native/capabilities and renders one pill
+// per protocol: NATIVE (kernel/firmware, ok), "install: <pkg>" (native possible,
+// warn) for installable entries, or muted "via sing-box" for the sing-box-only set.
+// Purely informational — no routing change. The card self-loads after mount so a
+// slow/absent endpoint never blocks the rest of the page.
+function nativeSupportCard() {
+  const card = el("div", { class: "card", id: "natcap" });
+  card.appendChild(el("div", { id: "natcap-body" },
+    el("div", { class: "card-title", style: "margin-bottom:var(--sp-2)" }, "Native support"),
+    el("div", { class: "hint" }, "Loading…")));
+  loadNativeCaps(); // fire-and-forget; paints into #natcap-body when it settles
+  return card;
+}
+
+async function loadNativeCaps() {
+  const body = () => document.getElementById("natcap-body");
+  let d;
+  try { d = await api.get("/api/native/capabilities"); }
+  catch (e) {
+    const b = body(); if (!b) return;
+    b.innerHTML = "";
+    b.appendChild(el("div", { class: "card-title", style: "margin-bottom:var(--sp-2)" }, "Native support"));
+    b.appendChild(el("div", { class: "hint", style: "color:var(--ink-2)" }, t("Unavailable") + " — " + e.message));
+    return;
+  }
+  const b = body(); if (!b) return;
+  b.innerHTML = "";
+  const native = d.native || {}, installable = d.installable || {};
+  const sbReq = d.singbox_required || [];
+  const sbSet = new Set(sbReq);
+  // Title carries the detected platform so support reports show what we measured on.
+  const title = el("div", { class: "row-between", style: "align-items:flex-start;margin-bottom:var(--sp-3)" },
+    el("div", { class: "card-title" }, "Native support"),
+    d.platform ? el("span", { class: "badge proto" }, d.platform) : null);
+  b.appendChild(title);
+
+  // One union of all protocols we know about, kept in a stable order.
+  const all = [];
+  const seen = new Set();
+  const push = k => { if (k && !seen.has(k)) { seen.add(k); all.push(k); } };
+  Object.keys(native).forEach(push);
+  Object.keys(installable).forEach(push);
+  sbReq.forEach(push);
+
+  if (!all.length) {
+    b.appendChild(el("div", { class: "hint" }, t("No capability data reported.")));
+  } else {
+    const rows = el("div", { style: "display:flex;flex-direction:column;gap:var(--sp-2)" });
+    all.forEach(proto => {
+      let pill;
+      if (native[proto]) {
+        // kernel/firmware-native — carried without sing-box.
+        pill = el("span", { class: "pill ok", title: t("Carried by the kernel / firmware — no sing-box needed") },
+          el("span", { class: "dot" }), t("NATIVE"));
+      } else if (installable[proto]) {
+        // native possible once the package is installed — actionable below in
+        // "Recommended installs"; the pill flags it so the per-protocol row is consistent.
+        pill = el("span", { class: "pill warn", title: t("Native once this package is installed") },
+          el("span", { class: "dot" }), t("install") + ": " + installable[proto]);
+      } else if (sbSet.has(proto)) {
+        // only reachable via the sing-box core.
+        pill = el("span", { class: "pill muted", title: t("Carried by the sing-box core") }, t("via sing-box"));
+      } else {
+        pill = el("span", { class: "pill muted" }, "—");
+      }
+      rows.appendChild(el("div", { class: "row-between", style: "gap:var(--sp-3);align-items:center" },
+        el("span", { style: "font-size:var(--fs-control);font-weight:500" }, proto), pill));
+    });
+    b.appendChild(rows);
+  }
+
+  // Recommended installs — turn the "install: <pkg>" pills into copyable opkg
+  // commands so the user can act without leaving the page. Detect + recommend only;
+  // nothing is executed here. Skipped entirely when nothing is installable.
+  const recos = Object.keys(installable)
+    .filter(p => !native[p] && installable[p]) // a kernel-native proto never needs a package
+    .map(p => ({ proto: p, pkg: installable[p] }));
+  if (recos.length) {
+    const platform = d.platform || "";
+    const sec = el("div", { style: "margin-top:var(--sp-3);border-top:1px solid var(--divider);padding-top:var(--sp-3)" },
+      el("div", { class: "hint", style: "font-weight:600;margin-bottom:var(--sp-2)" }, t("Recommended installs")));
+    recos.forEach(({ proto, pkg }) => {
+      if (platform === "keenetic") {
+        // Keenetic native protos are FIRMWARE COMPONENTS managed by the device's own UI —
+        // NOT opkg-installable, so an "opkg install" command would be wrong. Recommend
+        // enabling them in the Keenetic app instead (detect+recommend scope; WR never writes
+        // ndmc). Show an instruction, not a copyable shell command.
+        sec.appendChild(el("div", { style: "display:flex;flex-direction:column;gap:4px;margin-bottom:var(--sp-2)" },
+          el("div", { class: "hint" }, proto + " — " + t("not enabled (firmware component)")),
+          el("div", { class: "hint", style: "color:var(--muted)" },
+            t("Enable it in the Keenetic app (System → Component options) and reboot — it then routes natively."))));
+        return;
+      }
+      // OpenWrt (and default): a copyable opkg command. `opkg update` first so a fresh feed
+      // index is present (kmods especially need a matching, current index).
+      const cmd = "opkg update && opkg install " + pkg;
+      const code = el("code", { class: "mono", style: "font-family:ui-monospace,Menlo,Consolas,monospace;font-size:var(--fs-small);background:var(--card-2);border-radius:5px;padding:2px 6px;word-break:break-all" }, cmd);
+      const copy = el("button", { class: "btn btn-sm", title: t("Copy command"), onclick: () => copyText(cmd) }, t("Copy"));
+      sec.appendChild(el("div", { style: "display:flex;flex-direction:column;gap:4px;margin-bottom:var(--sp-2)" },
+        el("div", { class: "hint" }, proto + " — " + t("not built in")),
+        el("div", { style: "display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap" }, code, copy)));
+    });
+    b.appendChild(sec);
+  }
+
+  // Detected native tunnels — what /api/vpn/discover already found on the router
+  // (iface · type · name). Each row gets an "Adopt as exit" button that POSTs to
+  // /api/vpn/adopt: the OS keeps owning the tunnel; WakeRoute only adds a DISABLED
+  // external endpoint that ROUTES THROUGH it. Best-effort: a 404 / empty list shows
+  // nothing extra, mirroring loadNativeCaps' own graceful try/catch.
+  try {
+    const dv = await api.get("/api/vpn/discover");
+    const vpns = (dv && dv.vpns) || [];
+    if (vpns.length) {
+      // Tunnels already represented by an external endpoint shouldn't offer Adopt
+      // again — mirror the matcher the Connections page uses (engine external +
+      // params.interface). state.profile is loaded on the Diagnostics route.
+      const adopted = iface => ((state.profile && state.profile.endpoints) || []).some(
+        e => e.engine === "external" && e.params && e.params.interface === iface);
+      const sec = el("div", { style: "margin-top:var(--sp-3);border-top:1px solid var(--divider);padding-top:var(--sp-3)" },
+        el("div", { class: "hint", style: "font-weight:600;margin-bottom:var(--sp-2)" }, t("Detected native tunnels")),
+        // One-time explainer: adopting is non-destructive and never auto-enables.
+        el("div", { class: "hint", style: "color:var(--ink-2);margin-bottom:var(--sp-2);line-height:1.5" },
+          t("WakeRoute will ROUTE THROUGH the tunnel but does not manage it (the OS owns it). It is added disabled — enable it in Connections to start routing.")));
+      vpns.forEach(v => {
+        const parts = [v.iface, v.type, v.public_key].filter(Boolean);
+        const statusPill = v.active
+          ? el("span", { class: "pill ok", title: t("Tunnel has a recent handshake") }, el("span", { class: "dot" }), t("active"))
+          : el("span", { class: "pill muted", title: t("Configured but no recent handshake") }, t("idle"));
+        // Adopt button: disabled-looking "Adopted" once an external endpoint exists
+        // for this iface; otherwise a btn-sm that adopts + refreshes the card.
+        const adoptBtn = adopted(v.iface)
+          ? el("button", { class: "btn btn-sm", disabled: "true", title: t("Already added as a routing exit") }, t("Adopted"))
+          : el("button", { class: "btn btn-sm", title: t("Add this OS-owned tunnel as a routing exit (added disabled — WakeRoute will not manage it)"),
+              onclick: async () => {
+                try {
+                  await api.post("/api/vpn/adopt", { iface: v.iface });
+                  // Keep the profile fresh so the Connections page + the re-rendered
+                  // card both see the new external endpoint, then refresh the card.
+                  try { await loadProfile(); } catch (_) {}
+                  toast(t("Adopted {0} — enable it in Connections to route through it", v.iface), "ok");
+                  loadNativeCaps();
+                } catch (err) { toast(err.message, "err"); }
+              } }, t("Adopt as exit"));
+        sec.appendChild(el("div", { class: "row-between", style: "gap:var(--sp-3);align-items:center;margin-bottom:var(--sp-2)" },
+          el("span", { class: "mono", style: "font-family:ui-monospace,Menlo,Consolas,monospace;font-size:var(--fs-small);word-break:break-all" }, parts.join(" · ")),
+          el("span", { style: "display:inline-flex;gap:var(--sp-2);align-items:center;flex-shrink:0" }, statusPill, adoptBtn)));
+      });
+      b.appendChild(sec);
+    }
+  } catch (_) { /* endpoint absent (404) or unreachable — show nothing extra */ }
+
+  // sing-box presence — the core that carries everything not natively supported.
+  // When the live profile is native-only (kernel plane carries everything in fast mode),
+  // an absent core is BY DESIGN: show a positive "not required" badge instead of a red
+  // "absent" warning. The native-only signal is read defensively from the capabilities
+  // payload (d.native_only) or, failing that, the daemon health verdict — so when neither
+  // field is present this falls back to the existing present/absent pill, unchanged.
+  const sbNativeOnly = !!d.native_only || isNativeOnly(state.health);
+  const sbPill = d.singbox_present
+    ? el("span", { class: "pill ok" }, el("span", { class: "dot" }), t("present"))
+    : sbNativeOnly
+      ? el("span", { class: "pill ok", title: t("Every endpoint is kernel-native and traffic is routed by the kernel plane in fast mode, so the sing-box core is intentionally not running.") }, el("span", { class: "dot" }), t("not required"))
+      : el("span", { class: "pill warn" }, el("span", { class: "dot" }), t("absent"));
+  b.appendChild(el("div", { class: "row-between", style: "gap:var(--sp-3);align-items:center;margin-top:var(--sp-3);border-top:1px solid var(--divider);padding-top:var(--sp-3)" },
+    el("span", { class: "hint" }, "sing-box"), sbPill));
+  if (sbNativeOnly && !d.singbox_present)
+    b.appendChild(el("div", { class: "hint", style: "color:var(--ok);margin-top:var(--sp-2)" }, t("Native-only mode — sing-box not required")));
+}
 
 function healthBatteryCard() {
   const card = el("div", { class: "card", id: "hbat" });
-  const runBtn = el("button", { class: "btn btn-primary", style: "padding:9px 20px", onclick: () => runHealthBattery() }, "Run all checks");
+  const runBtn = el("button", { class: "btn btn-primary", id: "hbat-run", style: "padding:9px 20px", onclick: () => runHealthBattery() }, "Run all checks");
   const copyBtn = el("button", { class: "btn btn-sm", id: "hbat-copy", onclick: () => copyReport() }, "Copy report");
   copyBtn.disabled = true;
   // Mask toggle (default ON): the report carries exit IP + ISP/ASN once geo is in,
@@ -2271,27 +2947,35 @@ function paintBattery() {
   const h = state.hbat, res = h.results;
   const done = HC_ORDER.map(id => res[id]).filter(Boolean);
   const worst = done.reduce((a, r) => r.status === "fail" ? "fail" : (r.status === "warn" && a !== "fail") ? "warn" : a, "pass");
-  const vb = document.getElementById("hbat-verdict"); vb.innerHTML = "";
-  if (h.running) vb.appendChild(el("div", { class: "hero-pill hero-warn" }, el("span", { class: "spin" }), t("Checking…")));
-  else if (done.length) {
-    const fails = done.filter(r => r.status === "fail").length, warns = done.filter(r => r.status === "warn").length;
-    const cls = worst === "fail" ? "hero-err" : worst === "warn" ? "hero-warn" : "hero-ok";
-    const txt = worst === "fail" ? t("Something is broken") + (fails > 1 ? " (" + fails + ")" : "")
-      : worst === "warn" ? warns + " " + (warns > 1 ? t("things to look at") : t("thing to look at"))
-        : t("Everything's working");
-    vb.appendChild(el("div", { class: "hero-pill " + cls }, txt));
-    vb.appendChild(el("div", { class: "hint", style: "margin-top:8px" }, t("Checked") + " " + timeAgo(h.ranAt)));
+  const vb = document.getElementById("hbat-verdict");
+  if (vb) {
+    vb.innerHTML = "";
+    if (h.running) vb.appendChild(el("div", { class: "hero-pill hero-warn" }, el("span", { class: "spin" }), t("Checking…")));
+    else if (done.length) {
+      const fails = done.filter(r => r.status === "fail").length, warns = done.filter(r => r.status === "warn").length;
+      const cls = worst === "fail" ? "hero-err" : worst === "warn" ? "hero-warn" : "hero-ok";
+      const txt = worst === "fail" ? t("Something is broken") + (fails > 1 ? " (" + fails + ")" : "")
+        : worst === "warn" ? warns + " " + (warns > 1 ? t("things to look at") : t("thing to look at"))
+          : t("Everything's working");
+      vb.appendChild(el("div", { class: "hero-pill " + cls }, txt));
+      vb.appendChild(el("div", { class: "hint", style: "margin-top:8px" }, t("Checked") + " " + timeAgo(h.ranAt)));
+    }
   }
   const cb = document.getElementById("hbat-copy"); if (cb) cb.disabled = h.running || !done.length;
-  const wrap = document.getElementById("hbat-rows"); wrap.innerHTML = "";
-  h.open = h.open || {};
-  HC_ORDER.forEach(id => wrap.appendChild(healthRowEl(id, res[id], h.running, (h.busy || {})[id], h.open)));
+  const rb = document.getElementById("hbat-run"); if (rb) rb.disabled = h.running;
+  const wrap = document.getElementById("hbat-rows");
+  if (wrap) {
+    wrap.innerHTML = "";
+    h.open = h.open || {};
+    HC_ORDER.forEach(id => wrap.appendChild(healthRowEl(id, res[id], h.running, (h.busy || {})[id], h.open)));
+  }
 }
 
 function healthRowEl(id, r, running, busy, open) {
-  const chip = el("span", { class: "pill " + (!r || busy ? "muted" : r.status === "pass" ? "ok" : r.status === "warn" ? "warn" : "err") },
-    (r && !busy) ? el("span", { class: "dot" }) : el("span", { class: "spin" }));
-  const res = el("span", { class: "res" }, busy ? t("checking…") : !r ? (running ? t("checking…") : "—") : (r.summary || ""));
+  const chipCls = busy || (!r && running) ? "muted" : !r ? "muted" : r.status === "pass" ? "ok" : r.status === "warn" ? "warn" : "err";
+  const chipInner = busy || (!r && running) ? el("span", { class: "spin" }) : !r ? el("span", { class: "dot", style: "opacity:.3" }) : el("span", { class: "dot" });
+  const chip = el("span", { class: "pill " + chipCls }, chipInner);
+  const res = el("span", { class: "res" }, busy ? t("checking…") : !r && running ? t("checking…") : !r ? "—" : (r.summary || ""));
   // per-row re-check: re-run just this check after a fix, without the whole battery
   const recheck = el("button", { class: "btn-icon", title: t("Re-check"), onclick: (e) => { e.stopPropagation(); recheckOne(id); } }, "↻");
   recheck.disabled = !!(running || busy);
@@ -2357,7 +3041,7 @@ async function chkSystem() {
   const s = await api.get("/api/system");
   const meta = { version: s.version, arch: s.arch };
   if (!s.available) return { status: "warn", summary: "unavailable", meta };
-  const sum = Math.round(s.mem_used_pct) + "% RAM · load " + s.load1 + " · up " + humanDur(s.uptime_s);
+  const sum = Math.round(s.mem_used_pct) + "% RAM · load " + (s.load1 != null ? s.load1.toFixed(2) : "–") + " · up " + humanDur(s.uptime_s);
   const st = s.mem_used_pct >= 92 ? "warn" : "pass";
   return { status: st, summary: sum, detail: sum + "\nfree RAM " + Math.round((s.mem_avail_kb || 0) / 1024) + " of " + Math.round((s.mem_total_kb || 0) / 1024) + " MB", fix: st === "warn" ? "RAM is nearly full — heavy connection load can drop packets. Reboot or reduce load." : "", meta };
 }
@@ -2501,6 +3185,7 @@ async function renderDiagnostics(view) {
   try { await loadProfile(); } catch (_) {} // ensure the egress dropdown lists current tunnels
   view.appendChild(healthBatteryCard()); // hero: one-click "Run all checks" battery + verdict + copy report
   if (state.hbat) paintBattery();        // restore a prior run across tab nav
+  view.appendChild(nativeSupportCard()); // read-only: what this router can carry natively (next to the battery)
 
   // Network tools — egress-aware ping/traceroute/DNS (streamed live) + reachability.
   // Results live in state.diag so they survive tab navigation; a running stream
@@ -2766,7 +3451,8 @@ function renderDiagResult(out, r) {
 
 function kbCard(e) {
   return el("div", { class: "card" },
-    el("div", { class: "name", style: "font-size:15px" }, e.title, el("span", { class: "badge", style: "margin-left:8px" }, e.engine)),
+    el("div", { class: "name", style: "font-size:15px" }, e.title, el("span", { class: "badge", style: "margin-left:8px" }, e.engine),
+      (e.count > 1 ? el("span", { class: "badge", style: "margin-left:6px", title: t("matched {0} log lines", e.count) }, "×" + e.count) : null)),
     el("div", { class: "sub", style: "margin-top:8px;line-height:1.55" }, e.explanation),
     el("div", { style: "margin-top:10px;line-height:1.55" }, el("b", {}, "Fix: "), e.fix),
     (e.sources && e.sources.length) ? el("div", { class: "hint", style: "margin-top:10px" }, "Sources: ",
@@ -2793,11 +3479,12 @@ async function renderServer(view) {
     el("div", { class: "side" },
       el("button", { class: "btn btn-primary", title: "Provision a new remote server over SSH and add its client to Connections", onclick: openAddServer }, "+ Add server"))));
 
-  // Let a fetch failure propagate to route()'s renderError (reconnect banner /
-  // inline error) instead of swallowing it — otherwise a daemon blip renders the
-  // reassuring "No servers yet" even when the user has servers that just failed to
-  // load. A genuine empty response (null/[]) still shows the empty state.
-  const servers = (await api.get("/api/servers")) || [];
+  const loadingSrv = el("div", { class: "hint", style: "margin:18px 0" }, "loading servers…");
+  view.appendChild(loadingSrv);
+  let servers;
+  try { servers = (await api.get("/api/servers")) || []; }
+  catch (e) { loadingSrv.remove(); renderError(view, e); return; }
+  loadingSrv.remove();
 
   if (!servers.length) {
     view.appendChild(el("div", { class: "card" }, el("div", { class: "empty" },
@@ -2858,24 +3545,79 @@ function credsBlock(sv) {
   return { node, get: () => ({ host: host.value.trim(), port: parseInt(port.value, 10) || 22, user: user.value.trim(), password: mode === "password" ? pw.value : "", key: mode === "key" ? key.value : "" }) };
 }
 
+// usesSelfSignedTLS detects, from the option's own copy, whether the protocol
+// provisions with a self-signed certificate (and therefore needs a "bring your own
+// domain+cert" caveat). Data-driven — looks for the phrase the catalog Details use
+// ("self-signed") or the insecure=1 marker — so adding/removing such a protocol
+// server-side needs no UI change, and never hard-codes protocol ids.
+function usesSelfSignedTLS(o) {
+  const hay = [o.summary || ""].concat(o.details || []).join(" ").toLowerCase();
+  return hay.includes("self-signed") || hay.includes("insecure=1") || hay.includes("skip-cert-verify");
+}
+
+// protoCard builds one selectable protocol card (a <label> so the whole card toggles
+// its checkbox). Read-only, fully escaped via el(); reuses the existing install-grid
+// / proto-card / opt-details classes.
+function protoCard(o, checked) {
+  const cb = el("input", { type: "checkbox" });
+  cb.checked = !!checked;
+  const selfSigned = usesSelfSignedTLS(o);
+  const card = el("label", { class: "proto-card" }, cb,
+    el("div", {},
+      el("div", { class: "pt" }, o.name,
+        o.recommended ? el("span", { class: "tag-ok" }, "recommended") : null,
+        selfSigned ? el("span", { class: "tag-ok", style: "color:var(--warn);background:var(--warn-tint)", title: "Provisions with a self-signed TLS certificate" }, "self-signed TLS") : null,
+        o.port ? el("span", { class: "hint", style: "margin-left:8px;font-weight:400" }, (o.transport || "tcp") + " :" + o.port) : null),
+      el("div", { class: "pd" }, o.summary),
+      el("ul", { class: "opt-details" }, ...(o.details || []).map(d => el("li", {}, d)))));
+  return { cb, card };
+}
+
 // Setup-options picker — the list of what WakeRoute can install, with details.
+// Recommended protocols (the suggested defaults) are surfaced first; the rest are
+// grouped under "Also available". A single self-signed-TLS caveat is shown once for
+// the group of protocols whose option data says they use a self-signed certificate.
 async function optionPicker(preselect) {
   if (!serverOptionsCache) { try { serverOptionsCache = await api.get("/api/server/options"); } catch (_) { serverOptionsCache = []; } }
+  const opts = serverOptionsCache || [];
   const inputs = {};
-  const grid = el("div", { class: "install-grid" });
-  (serverOptionsCache || []).forEach(o => {
-    const cb = el("input", { type: "checkbox" });
-    if ((preselect && preselect.includes(o.id)) || (!preselect && o.recommended)) cb.checked = true;
-    inputs[o.id] = cb;
-    grid.appendChild(el("label", { class: "proto-card" }, cb,
-      el("div", {},
-        el("div", { class: "pt" }, o.name,
-          o.recommended ? el("span", { class: "tag-ok" }, "recommended") : null,
-          o.port ? el("span", { class: "hint", style: "margin-left:8px;font-weight:400" }, (o.transport || "tcp") + " :" + o.port) : null),
-        el("div", { class: "pd" }, o.summary),
-        el("ul", { class: "opt-details" }, ...(o.details || []).map(d => el("li", {}, d))))));
-  });
-  return { node: grid, get: () => Object.keys(inputs).filter(id => inputs[id].checked) };
+  const wrap = el("div", {});
+
+  const isOn = o => (preselect && preselect.includes(o.id)) || (!preselect && o.recommended);
+  const addGroup = (label, list, sub) => {
+    if (!list.length) return;
+    wrap.appendChild(el("div", { class: "hint", style: "margin:2px 0 8px;font-weight:600;color:var(--ink-2)" },
+      label, sub ? el("span", { style: "font-weight:400;margin-left:6px" }, sub) : null));
+    const grid = el("div", { class: "install-grid", style: "margin-bottom:14px" });
+    list.forEach(o => {
+      const { cb, card } = protoCard(o, isOn(o));
+      inputs[o.id] = cb;
+      grid.appendChild(card);
+    });
+    wrap.appendChild(grid);
+  };
+
+  const recommended = opts.filter(o => o.recommended);
+  const others = opts.filter(o => !o.recommended);
+
+  addGroup("Recommended", recommended, "— suggested defaults, hardest to detect");
+
+  // One shared caveat for the self-signed-TLS protocols (driven by option data, not
+  // by hard-coded names), placed just above the group that contains them. When there
+  // are no recommended protocols, the self-signed ones may sit in "Available", so key
+  // the caveat off whichever list will actually be rendered as "others".
+  if (others.some(usesSelfSignedTLS)) {
+    wrap.appendChild(el("div", { class: "card", style: "margin:0 0 12px;padding:10px 12px;border-left:3px solid var(--warn)" },
+      el("div", { class: "hint", style: "color:var(--ink-2);line-height:1.5" },
+        el("b", { style: "color:var(--warn)" }, "Self-signed TLS"),
+        " — the protocols tagged below provision with a self-signed certificate. That's fine for personal use; for active-probing resistance, bring your own domain + a real cert.")));
+  }
+
+  // Group the rest under "Also available" — or just "Available" when there were no
+  // recommended ones to contrast against, so the label never reads oddly.
+  addGroup(recommended.length ? "Also available" : "Available", others);
+
+  return { node: wrap, get: () => Object.keys(inputs).filter(id => inputs[id].checked) };
 }
 
 // Smart console: polls a job and renders steps (✓/✗/…/∅) + a verbose log.
@@ -2884,7 +3626,7 @@ function smartConsole() {
   const log = el("pre", { class: "wr-console" });
   const logBox = el("details", { class: "wr-logbox" }, el("summary", { class: "hint" }, "verbose log"), log);
   const node = el("div", { style: "margin-top:14px;display:none" }, steps, logBox);
-  let timer = null;
+  let timer = null, stopped = false;
   const ICON = { ok: "✓", error: "✗", skipped: "∅", running: "…" };
   const CLS = { ok: "ok", error: "err", skipped: "muted", running: "run" };
   function paint(v) {
@@ -2910,9 +3652,11 @@ function smartConsole() {
       } catch (_) { stop(); }
     };
     await poll();
-    if (timer === null) timer = setInterval(poll, 600);
+    // stopped may be true if the job finished (or errored) during the first poll;
+    // only start the repeating timer when the job is still in progress.
+    if (!stopped) timer = setInterval(poll, 600);
   }
-  function stop() { if (timer !== null) { clearInterval(timer); timer = null; } }
+  function stop() { if (timer !== null) { clearInterval(timer); timer = null; } stopped = true; }
   return { node, run, stop };
 }
 
@@ -2980,7 +3724,7 @@ async function openProvision(sv) {
     checkBtn.disabled = true;
     try {
       const r = await api.post("/api/server/check", { host: cr.host, port: cr.port });
-      toast((r.reachable ? "✓ reachable" : "✗ unreachable") + " — ping " + (r.ping_ok ? Math.round(r.ping_ms) + " ms" : "no reply") + ", SSH port " + r.port + " " + (r.port_open ? "open" : "closed"), r.reachable ? "ok" : "err");
+      toast((r.reachable ? "✓ reachable" : "✗ unreachable") + " — ping " + (r.ping_ok ? (r.ping_ms != null ? Math.round(r.ping_ms) : "?") + " ms" : "no reply") + ", SSH port " + r.port + " " + (r.port_open ? "open" : "closed"), r.reachable ? "ok" : "err");
     } catch (e) { toast(e.message, "err"); } finally { checkBtn.disabled = false; }
   });
   previewBtn.addEventListener("click", async () => {
@@ -3079,17 +3823,20 @@ async function openVersions(sv) {
       const r = await api.post("/api/server/check-versions", { server_id: sv && sv.id, ...cr });
       con.run(r.job_id, v => {
         checkBtn.disabled = false; checkBtn.textContent = t("Re-check");
-        if (v.ok && v.result) renderVersionTable(results, v.result.binaries, sv, c, con);
+        if (v.ok && v.result) renderVersionTable(results, v.result, sv, c, con);
         else toast("Version check failed — see console", "err");
       });
     } catch (e) { checkBtn.disabled = false; checkBtn.textContent = t("Check versions"); toast(e.message, "err"); }
   });
 }
 
-function renderVersionTable(box, binaries, sv, c, con) {
+function renderVersionTable(box, result, sv, c, con) {
   box.innerHTML = "";
+  const binaries = result && result.binaries;
   // Rendered on the job-done callback — AFTER route()/modal() i18nApply — so these
   // strings must go through t() explicitly to localize (i18nApply won't revisit them).
+  if (result && result.arch) box.appendChild(el("div", { class: "hint", style: "margin-bottom:var(--sp-2)" }, "arch: " + result.arch));
+  if (result && result.curl === false) box.appendChild(el("div", { class: "hint", style: "color:var(--warn);margin-bottom:var(--sp-2)" }, "⚠ curl not found on the server — sing-box binary updates require curl (apt install curl)"));
   if (!binaries || !binaries.length) { box.appendChild(el("div", { class: "hint" }, t("No managed binaries found on this server."))); return; }
   const th = lbl => el("th", { style: "padding:8px 10px;text-align:left;border-bottom:1px solid var(--divider)" }, t(lbl));
   const table = el("table", { class: "rm-table" },
@@ -3101,8 +3848,11 @@ function renderVersionTable(box, binaries, sv, c, con) {
         ? el("span", { class: "badge badge-ok" }, t("update → {0}", b.latest))
         : (b.managed === "apt" ? el("span", { class: "hint" }, t("via apt"))
           : el("span", { class: "pill muted" }, el("span", { class: "dot" }), b.latest_error ? t("check failed") : t("up to date")));
+      const curlOk = result && result.curl !== false;
       let act = null;
-      if (b.managed === "github" && avail) act = el("button", { class: "btn btn-primary btn-sm", onclick: () => updateBinary(sv, c, con, b, b.latest_tag || b.latest) }, t("Update"));
+      if (b.managed === "github" && avail) act = curlOk
+        ? el("button", { class: "btn btn-primary btn-sm", onclick: () => updateBinary(sv, c, con, b, b.latest_tag || b.latest) }, t("Update"))
+        : el("button", { class: "btn btn-primary btn-sm", disabled: true, title: t("curl not found on the server — install curl first (apt install curl)") }, t("Update"));
       else if (b.managed === "apt") act = el("button", { class: "btn btn-sm", onclick: () => updateBinary(sv, c, con, b, "") }, t("apt upgrade"));
       return el("tr", {},
         el("td", { "data-label": "Binary" }, b.name),
@@ -3178,9 +3928,12 @@ let _settingsDirty = false;
 let _settingsUnloadHooked = false;
 
 async function renderSettings(view) {
+  const loadingCfg = el("div", { class: "hint", style: "margin:18px 0" }, t("loading settings…"));
+  view.appendChild(loadingCfg);
   let cfg;
   try { cfg = await api.get("/api/config"); }
-  catch (e) { view.appendChild(el("div", { class: "empty" }, t("Could not load config: {0}", e.message))); return; }
+  catch (e) { loadingCfg.remove(); view.appendChild(el("div", { class: "empty" }, t("Could not load config: {0}", e.message))); return; }
+  loadingCfg.remove();
 
   view.appendChild(el("div", { class: "block-head" },
     el("div", {},
@@ -3204,6 +3957,64 @@ async function renderSettings(view) {
     el("div", { style: "display:flex;gap:16px;flex-wrap:wrap" },
       el("div", { class: "field", style: "max-width:260px;margin-bottom:0" }, el("label", {}, t("Theme")), themeSel),
       el("div", { class: "field", style: "max-width:260px;margin-bottom:0" }, el("label", {}, t("Language")), langSel))));
+
+  // Subscription auto-refresh — opt-in periodic re-fetch of an imported subscription URL
+  // (additive: it only ADDS the provider's newly-rotated servers, never deletes). Self-
+  // contained: fetches /api/subscription/info + drives the dedicated control endpoints.
+  (function subRefreshCard() {
+    const card = el("div", { class: "card" });
+    card.appendChild(el("div", { class: "card-title", style: "margin-bottom:12px" }, t("Subscription auto-refresh")));
+    const bodyDiv = el("div", {}, el("div", { class: "hint" }, t("loading…")));
+    card.appendChild(bodyDiv);
+    view.appendChild(card);
+    api.get("/api/subscription/info").then(info => {
+      bodyDiv.innerHTML = "";
+      if (!info || !info.url) {
+        bodyDiv.appendChild(el("div", { class: "hint" }, t("No imported subscription. Import a subscription URL under Connections to enable periodic auto-refresh.")));
+        return;
+      }
+      bodyDiv.appendChild(el("div", { class: "hint", style: "margin-bottom:10px;word-break:break-all" }, t("Source: ") + info.url));
+      const enable = el("input", { type: "checkbox" }); enable.checked = (info.refresh_hours || 0) > 0;
+      const hours = el("input", { type: "number", min: "1", max: "168", value: String(info.refresh_hours > 0 ? info.refresh_hours : 24), style: "width:80px" });
+      const save = el("button", { class: "btn btn-sm" }, t("Save"));
+      const now = el("button", { class: "btn btn-sm" }, t("Refresh now"));
+      // Status of the last real refresh attempt (auto loop or manual) — so the user
+      // can see auto-refresh is actually working, not just that it's enabled.
+      const statusLine = el("div", { class: "hint", style: "margin-top:10px" });
+      const relAgo = (unixSec) => {
+        const s = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
+        if (s < 60) return t("just now");
+        if (s < 3600) return t("{0}m ago", Math.floor(s / 60));
+        if (s < 86400) return t("{0}h ago", Math.floor(s / 3600));
+        return t("{0}d ago", Math.floor(s / 86400));
+      };
+      const renderStatus = (lastUnix, added, errStr) => {
+        statusLine.innerHTML = "";
+        if (errStr) statusLine.appendChild(el("span", { style: "color:var(--bad,#e0666e)" }, t("Last refresh failed: ") + errStr));
+        else if (lastUnix > 0) statusLine.appendChild(el("span", {}, t("Last refreshed {0} (+{1} new)", relAgo(lastUnix), added || 0)));
+        else statusLine.appendChild(el("span", {}, t("Never refreshed yet")));
+      };
+      renderStatus(info.last_refresh_unix || 0, info.last_added || 0, info.last_error || "");
+      save.addEventListener("click", async () => {
+        const h = enable.checked ? Math.max(1, Math.min(168, parseInt(hours.value, 10) || 24)) : 0;
+        save.disabled = true;
+        try { await api.post("/api/subscription/autorefresh", { hours: h }); toast(h > 0 ? t("Auto-refresh every {0} h", h) : t("Auto-refresh disabled"), "ok"); }
+        catch (e) { toast(e.message, "err"); }
+        finally { save.disabled = false; }
+      });
+      now.addEventListener("click", async () => {
+        const prev = now.textContent; now.disabled = true; now.textContent = t("Refreshing…");
+        try { const r = await api.post("/api/subscription/refresh", {}); const n = (r && r.added) || 0; toast(t("Refreshed — {0} new connection(s)", n), "ok"); renderStatus(Math.floor(Date.now() / 1000), n, ""); }
+        catch (e) { toast(e.message, "err"); }
+        finally { now.disabled = false; now.textContent = prev; }
+      });
+      bodyDiv.appendChild(el("div", { style: "display:flex;gap:14px;align-items:center;flex-wrap:wrap" },
+        el("label", { class: "check" }, enable, el("span", {}, t("Auto-refresh"))),
+        el("div", { class: "field", style: "margin-bottom:0" }, el("label", {}, t("Every (hours)")), hours),
+        save, now));
+      bodyDiv.appendChild(statusLine);
+    }).catch(() => { bodyDiv.innerHTML = ""; bodyDiv.appendChild(el("div", { class: "hint" }, t("Could not load subscription info."))); });
+  })();
 
   const txt = (v, ph) => el("input", { type: "text", value: v == null ? "" : String(v), placeholder: ph || "" });
   const num = (v) => el("input", { type: "number", value: v == null ? "" : String(v) });
@@ -3449,6 +4260,36 @@ async function renderSettings(view) {
       el("label", { class: "check", style: "display:inline-flex" }, includeSecrets, el("span", {}, t("Include secrets"))),
       restoreBtn, fileInput, resetBtn)));
 
+  // Full backup (everything) — the whole setup (connections, failover groups,
+  // routing lists, saved servers, routing mode) in one file, for saving before a
+  // firmware reflash or migrating to another WakeRoute instance.
+  const fullDownloadBtn = el("a", { class: "btn", href: "/api/backup", download: "wakeroute-backup.json" }, t("Download full backup"));
+  const fullFileInput = el("input", { type: "file", accept: "application/json,.json", style: "display:none" });
+  const fullRestoreBtn = el("button", { class: "btn", type: "button" }, t("Restore full backup…"));
+  fullRestoreBtn.addEventListener("click", () => fullFileInput.click());
+  fullFileInput.addEventListener("change", async () => {
+    const f = fullFileInput.files && fullFileInput.files[0];
+    if (!f) return;
+    let parsed;
+    try { parsed = JSON.parse(await f.text()); }
+    catch { fullFileInput.value = ""; return toast(t("That file is not valid JSON."), "err"); }
+    if (parsed.wakeroute_backup !== 1) { fullFileInput.value = ""; return toast(t("That is not a WakeRoute full backup."), "err"); }
+    if (!confirm(t("Restore your whole setup from this backup? It replaces all connections, groups and routing lists (validated first). Nothing is applied automatically — review it, then press Apply. Your panel address and access settings are NOT changed."))) { fullFileInput.value = ""; return; }
+    try {
+      const r = await api.post("/api/backup/restore", parsed);
+      toast(t("Restored {0} connections, {1} groups, {2} servers — review and press Apply to activate.", r.endpoints, r.groups, r.servers), "ok");
+      await loadProfile();
+      route();
+    } catch (e) { toast(e.message, "err"); }
+    finally { fullFileInput.value = ""; }
+  });
+  view.appendChild(el("div", { class: "card" },
+    el("div", { class: "card-title", style: "margin-bottom:8px" }, t("Full backup (everything)")),
+    el("div", { class: "hint", style: "margin-bottom:6px" }, t("Save your whole setup — connections, failover groups, routing lists, saved servers and routing mode — to one file. Ideal before a firmware reflash or when moving to another WakeRoute. Restoring validates everything first and never applies on its own; you review it and press Apply.")),
+    el("div", { class: "hint", style: "margin-bottom:12px" }, t("The backup file contains your connection secrets (keys, passwords) — keep it private. Daemon access settings (panel port and host allow-list) are NOT changed by a restore.")),
+    el("div", { style: "display:flex;gap:10px;flex-wrap:wrap;align-items:center" },
+      fullDownloadBtn, fullRestoreBtn, fullFileInput)));
+
   const restartBtn = el("button", { class: "btn btn-danger" }, t("Restart service"));
   restartBtn.addEventListener("click", restartService);
   view.appendChild(el("div", { class: "card" },
@@ -3469,6 +4310,7 @@ async function loadProfile() {
   p.endpoints = p.endpoints || [];
   p.groups = p.groups || [];
   p.rules = p.rules || [];
+  p.routing_lists = p.routing_lists || [];
   // Nested: a group's members can be null too (dashboard/Failover call .map on it).
   p.groups.forEach(g => { g.members = g.members || []; });
   state.profile = p;
@@ -3478,8 +4320,9 @@ async function loadHealth() { state.health = await api.get("/api/health"); updat
 /* ---------- init ---------- */
 async function init() {
   $$(".nav-item").forEach(n => n.addEventListener("click", () => { location.hash = "#" + n.dataset.page; }));
-  $("#applybtn").addEventListener("click", () => applyConfig(false));
-  $("#applysavebtn").addEventListener("click", () => applyConfig(true));
+  const ab = $("#applybtn"), asb = $("#applysavebtn");
+  if (ab) ab.addEventListener("click", () => applyConfig(false));
+  if (asb) asb.addEventListener("click", () => applyConfig(true));
   window.addEventListener("hashchange", route);
   try { await loadHealth(); } catch (_) {}
   checkFailsafe(); // re-arm the rollback countdown if a reload landed mid-Apply-window

@@ -230,8 +230,11 @@ func TestServerjobs_OptionsCatalog(t *testing.T) {
 		Recommended bool     `json:"recommended"`
 	}
 	serverjobs_decode(t, w, &opts)
-	if len(opts) != 2 {
-		t.Fatalf("catalog len = %d, want 2: %+v", len(opts), opts)
+	// AmneziaWG + VLESS-Reality + sing-box (VMess/Trojan/Shadowsocks/Hysteria2/TUIC) +
+	// plain WireGuard. Asserted by ID below, so adding a protocol won't break this on the
+	// raw count alone — only a regression that drops one will.
+	if len(opts) < 8 {
+		t.Fatalf("catalog len = %d, want >=8: %+v", len(opts), opts)
 	}
 
 	byID := map[string]struct {
@@ -247,6 +250,15 @@ func TestServerjobs_OptionsCatalog(t *testing.T) {
 			recommended     bool
 			details         int
 		}{o.Name, o.Transport, o.Port, o.Recommended, len(o.Details)}
+	}
+
+	for _, id := range []string{
+		initserver.ProtoVMess, initserver.ProtoTrojan, initserver.ProtoShadowsocks,
+		initserver.ProtoHysteria2, initserver.ProtoTUIC, initserver.ProtoWireGuard,
+	} {
+		if _, present := byID[id]; !present {
+			t.Errorf("catalog missing protocol %q", id)
+		}
 	}
 
 	awg, ok := byID[initserver.ProtoAmneziaWG]

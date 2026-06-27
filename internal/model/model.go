@@ -95,6 +95,13 @@ type Endpoint struct {
 	TLS       *TLS           `json:"tls,omitempty"`
 	Health    *Health        `json:"health,omitempty"`
 	Enabled   bool           `json:"enabled"`
+	// MTU is the WireGuard/AmneziaWG link MTU. 0 = unset (omitted from output,
+	// engine default applies). Protocol-agnostic field; only meaningful for the
+	// WG-family engines, but harmless when unset for any protocol.
+	MTU int `json:"mtu,omitempty"`
+	// PersistentKeepalive is the WireGuard/AmneziaWG keepalive interval in seconds.
+	// 0 = unset (omitted; no keepalive). Useful behind NAT to keep the tunnel warm.
+	PersistentKeepalive int `json:"persistent_keepalive,omitempty"`
 }
 
 // GroupType selects how a group chooses among its members.
@@ -113,6 +120,11 @@ type Group struct {
 	Type    GroupType `json:"type"`
 	Members []string  `json:"members"` // endpoint or group IDs, in preference order
 	Test    *Health   `json:"test,omitempty"`
+	// KillSwitch, when true, DROPs traffic that selects this group while ALL of
+	// its members are down — instead of leaking to the WAN. Default false keeps
+	// the current behavior (WAN fallback). Opt-in, so an unset/zero value is a
+	// byte-identical no-op for existing profiles.
+	KillSwitch bool `json:"kill_switch,omitempty"`
 }
 
 // Rule routes matching traffic to a target outbound.

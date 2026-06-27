@@ -16,8 +16,9 @@ type healthResp struct {
 	Version string `json:"version"`
 	Demo    bool   `json:"demo"`
 	SingBox struct {
-		Available bool `json:"available"`
-		Running   bool `json:"running"`
+		Available  bool `json:"available"`
+		Running    bool `json:"running"`
+		NativeOnly bool `json:"native_only"`
 	} `json:"singbox"`
 }
 
@@ -37,11 +38,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// report that so the UI stops showing a false "core not running" while live stats flow.
 	if !resp.SingBox.Running && s.clash != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
+		defer cancel()
 		if _, err := s.clash.Proxies(ctx); err == nil {
 			resp.SingBox.Running = true
 			resp.SingBox.Available = true
 		}
-		cancel()
+	}
+	// Native-only: the live profile needs no sing-box (generator.DatapathNativeOnly — "fast"
+	// mode + all egresses kernel-native), so an absent core is BY DESIGN. The UI reads this
+	// to show "native-only mode" instead of a false "core down". Conservative by construction.
+	if s.store != nil {
+		p := s.store.Profile()
+		resp.SingBox.NativeOnly = s.datapathNativeOnly(s.config(), &p)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

@@ -95,12 +95,22 @@ func (s *Server) handleUpdaterInstall(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	// If we updated the running primary core, reload it.
+	// If we updated the running primary core, reload it — UNDER applyMu so it can't
+	// interleave with handleApply's / the fail-safe's Stop+Start+Reload. Reload drops the
+	// core's lock between Stop and Start, so two concurrent reloads could each spawn a
+	// sing-box while the other's old process is still draining — two instances both
+	// installing TUN auto_route / auto_redirect kernel rules. applyMu is the same gate the
+	// apply path holds end-to-end, making the two mutually exclusive. Re-check Running()
+	// under the lock so we don't resurrect a core an in-flight apply intentionally stopped.
 	reloaded := false
-	if e.ID == "sing-box" && s.singbox != nil && s.singbox.Running() {
-		if err := s.singbox.Reload(); err == nil {
-			reloaded = true
+	if e.ID == "sing-box" && s.singbox != nil {
+		s.applyMu.Lock()
+		if s.singbox.Running() {
+			if err := s.singbox.Reload(); err == nil {
+				reloaded = true
+			}
 		}
+		s.applyMu.Unlock()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"installed": tag, "engine": e.ID, "reloaded": reloaded})
 }

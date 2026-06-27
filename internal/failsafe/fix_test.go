@@ -4,6 +4,7 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -59,6 +60,56 @@ func TestArmSupersedesPriorGoroutine(t *testing.T) {
 	time.Sleep(40 * time.Millisecond)
 	if g := runtime.NumGoroutine(); g > base+6 {
 		t.Fatalf("fail-safe goroutines leaked: base=%d now=%d (re-Arm must cancel the prior run())", base, g)
+	}
+}
+
+// #3: a manual RollbackNow racing the auto-rollback dispatched by tick()'s run
+// loop must not invoke the rollback closure rb() twice (double rollback of the
+// LIVE routing). check()=false + RollbackAfter=0 drives the run loop into
+// ActRollback while RollbackNow fires concurrently; rb must run EXACTLY once.
+func TestRollbackFiresExactlyOnce_AutoVsManual(t *testing.T) {
+	d := Durations{Grace: 0, Interval: time.Millisecond, RollbackAfter: 0, RebootAfter: time.Hour, KeepWindow: time.Hour}
+	for i := 0; i < 200; i++ {
+		var calls int32
+		m := New(d)
+		m.Arm(
+			func() bool { return false }, // always bad -> auto path wants to roll back
+			func() error { atomic.AddInt32(&calls, 1); return nil },
+			func() {}, false,
+		)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = m.RollbackNow() }()
+		wg.Wait()
+		// give the run loop a moment to also reach its ActRollback branch
+		time.Sleep(2 * time.Millisecond)
+		m.Confirm()
+		if n := atomic.LoadInt32(&calls); n != 1 {
+			t.Fatalf("iter %d: rollback fired %d times, want exactly 1", i, n)
+		}
+	}
+}
+
+// #3: two concurrent RollbackNow calls must also collapse to a single rb()
+// invocation (fire-once per window), not two.
+func TestRollbackFiresExactlyOnce_TwoManual(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		var calls int32
+		m := New(DefaultDurations())
+		m.Arm(
+			func() bool { return true },
+			func() error { atomic.AddInt32(&calls, 1); return nil },
+			func() {}, false,
+		)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for j := 0; j < 2; j++ {
+			go func() { defer wg.Done(); _ = m.RollbackNow() }()
+		}
+		wg.Wait()
+		if n := atomic.LoadInt32(&calls); n != 1 {
+			t.Fatalf("iter %d: rollback fired %d times, want exactly 1", i, n)
+		}
 	}
 }
 

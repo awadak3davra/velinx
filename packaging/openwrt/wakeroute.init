@@ -55,7 +55,7 @@ start_service() {
 # via the web UI, so a service-level reload just restarts the instance to pick
 # up edits made to config.json by hand.
 service_triggers() {
-	procd_add_reload_trigger "wakeroute"
+	: # no UCI config — procd_set_param file in start_service handles config-change restarts
 }
 
 reload_service() {

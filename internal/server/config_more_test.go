@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -263,6 +264,91 @@ func TestConfigReset_DropsInvalidPreservedAllowList(t *testing.T) {
 	}
 	if err := got.Validate(); err != nil {
 		t.Fatalf("reset produced an invalid config: %v", err)
+	}
+}
+
+// unwritableCfgServer builds a *Server whose config is seeded with defaults but
+// whose backing file CANNOT be written: after Load creates the config dir, we
+// replace that dir with a regular file of the same name, so the next Save() ->
+// atomicfile.Write -> os.MkdirAll fails (ENOTDIR / "not a directory") on every
+// platform. Used to exercise the failed-Save rollback path.
+func unwritableCfgServer(t *testing.T) *Server {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "cfgdir")
+	cfg, err := config.Load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, []byte("not a dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: a Save must now fail, otherwise the test would be vacuous.
+	if err := cfg.Save(); err == nil {
+		t.Fatal("setup: Save unexpectedly succeeded; rollback test would be vacuous")
+	}
+	return &Server{cfg: cfg}
+}
+
+// TestPersistConfig_RollbackOnSaveFailure: when Save() fails, persistConfig must
+// leave the live config byte-identical to before (no memory/disk divergence) and
+// return the error. Covers the bug where applyConfigFields mutated s.cfg in place
+// before a failed Save, so the daemon used new values while disk kept the old.
+func TestPersistConfig_RollbackOnSaveFailure(t *testing.T) {
+	s := unwritableCfgServer(t)
+	before := s.config()
+	beforeJSON, _ := json.Marshal(before)
+
+	in := before // start from the live config so only the edits below differ
+	in.RoutingMode = "fast"
+	in.Offload = "sw"
+	in.OffloadDevices = []string{"wan", "br-lan"}
+	in.AllowedHosts = []string{"router.lan"}
+	in.Updater.Mirrors = []string{"https://example.test/"}
+
+	if err := s.persistConfig(&in); err == nil {
+		t.Fatal("persistConfig should have returned the Save error")
+	}
+
+	after := s.config()
+	afterJSON, _ := json.Marshal(after)
+	if string(afterJSON) != string(beforeJSON) {
+		t.Fatalf("live config diverged after a failed Save:\n before=%s\n  after=%s", beforeJSON, afterJSON)
+	}
+	// The restored snapshot must not alias the rejected request's backing arrays:
+	// mutating in's slices afterward must not change the live config.
+	if len(in.OffloadDevices) > 0 {
+		in.OffloadDevices[0] = "MUTATED"
+	}
+	if len(in.AllowedHosts) > 0 {
+		in.AllowedHosts[0] = "MUTATED"
+	}
+	if reAfter := s.config(); reflect.DeepEqual(reAfter, after) == false {
+		t.Fatalf("restored config aliased the rejected request's slices: %+v", reAfter)
+	}
+}
+
+// TestConfigImport_RollbackOnSaveFailure: the import handler shares persistConfig,
+// so a failed Save must leave the live config unchanged and reply 500.
+func TestConfigImport_RollbackOnSaveFailure(t *testing.T) {
+	s := unwritableCfgServer(t)
+	before := s.config()
+	beforeJSON, _ := json.Marshal(before)
+
+	imp := before
+	imp.RoutingMode = "fast"
+	imp.AllowedHosts = []string{"router.lan"}
+	body, _ := json.Marshal(imp)
+
+	w := opshandlers_post(s.handleConfigImport, "/api/config/import", string(body))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("failed Save should be 500, got %d: %s", w.Code, w.Body.String())
+	}
+	afterJSON, _ := json.Marshal(s.config())
+	if string(afterJSON) != string(beforeJSON) {
+		t.Fatalf("import diverged the live config after a failed Save:\n before=%s\n  after=%s", beforeJSON, afterJSON)
 	}
 }
 

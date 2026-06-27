@@ -20,6 +20,10 @@ func TestBlockInternalDial(t *testing.T) {
 		{"ULA private v6", "[fc00::1]:80"},
 		{"unspecified v4", "0.0.0.0:80"},
 		{"unspecified v6", "[::]:80"},
+		{"cgnat 100.64/10 low", "100.64.0.1:80"},           // RFC6598 carrier-grade NAT shared range
+		{"cgnat 100.64/10 mid", "100.96.5.9:443"},          // inside 100.64.0.0/10
+		{"cgnat 100.64/10 high", "100.127.255.254:80"},     // top of the /10
+		{"cgnat ipv4-mapped-v6", "[::ffff:100.64.0.1]:80"}, // same CGNAT addr in mapped form
 	}
 	for _, c := range reject {
 		if err := blockInternalDial("tcp", c.addr, nil); err == nil {
@@ -30,6 +34,8 @@ func TestBlockInternalDial(t *testing.T) {
 	allow := []struct{ name, addr string }{
 		{"public v4", "8.8.8.8:443"},
 		{"public v6 (Cloudflare)", "[2606:4700:4700::1111]:443"},
+		{"public just below cgnat (100.63)", "100.63.255.255:80"}, // boundary: outside 100.64.0.0/10
+		{"public just above cgnat (100.128)", "100.128.0.0:80"},   // boundary: outside 100.64.0.0/10
 	}
 	for _, c := range allow {
 		if err := blockInternalDial("tcp", c.addr, nil); err != nil {

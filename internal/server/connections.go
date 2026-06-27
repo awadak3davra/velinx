@@ -15,15 +15,16 @@ import (
 // shows a clean empty state. Capped server-side to the top-N by total bytes so the
 // payload and the DOM stay bounded.
 func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
+	empty := clash.Connections{Connections: []clash.Conn{}}
 	if s.clash == nil {
-		writeJSON(w, http.StatusOK, clash.Connections{})
+		writeJSON(w, http.StatusOK, empty)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
 	defer cancel()
 	conns, err := s.clash.Connections(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusOK, clash.Connections{})
+		writeJSON(w, http.StatusOK, empty)
 		return
 	}
 	sort.Slice(conns.Connections, func(i, j int) bool {

@@ -145,11 +145,19 @@ func (j *Job) Snapshot() JobView {
 	copy(steps, j.steps)
 	console := make([]string, len(j.console))
 	copy(console, j.console)
+	result := make(map[string]any, len(j.result))
+	for k, v := range j.result {
+		result[k] = v
+	}
 	return JobView{
 		ID: j.id, Kind: j.kind, ServerID: j.serverID,
-		Steps: steps, Console: console, Done: j.done, OK: j.ok, Result: j.result,
+		Steps: steps, Console: console, Done: j.done, OK: j.ok, Result: result,
 	}
 }
+
+// maxJobHistory is the rolling cap on jobs the manager keeps in memory.
+// Once full, the oldest job is evicted on every New() call (FIFO).
+const maxJobHistory = 32
 
 // JobManager keeps recent jobs addressable by id for the UI to poll.
 type JobManager struct {
@@ -172,7 +180,7 @@ func (m *JobManager) New(kind, serverID string) *Job {
 	m.order = append(m.order, j.id)
 	// Keep memory bounded: evict the genuinely oldest job (by creation order, not
 	// by string-compared id — "job-10" sorts before "job-9" lexically).
-	if len(m.order) > 32 {
+	if len(m.order) > maxJobHistory {
 		old := m.order[0]
 		m.order = m.order[1:]
 		delete(m.jobs, old)

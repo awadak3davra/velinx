@@ -233,6 +233,72 @@ AllowedIPs = 0.0.0.0/0`
 	}
 }
 
+// --- Bug [19]: VMess JSON edge cases -----------------------------------------
+
+// TestParseVMessMalformedJSON asserts that parseVMess returns an error (not a
+// zero Endpoint) when the base64 body decodes to truncated or otherwise invalid
+// JSON. Before the [19] audit this was already handled correctly; this test
+// pins the behavior so a future refactor cannot regress it silently.
+func TestParseVMessMalformedJSON(t *testing.T) {
+	for _, body := range []string{
+		`{"v":"2","ps":"VM`, // truncated JSON
+		`not-json-at-all`,   // plaintext garbage
+		`{"v":2`,            // missing closing brace
+		``,                  // empty (decodes fine but unmarshal fails)
+	} {
+		link := "vmess://" + base64.StdEncoding.EncodeToString([]byte(body))
+		_, err := Parse(link)
+		if err == nil {
+			t.Errorf("body %q: expected error for malformed JSON, got nil", body)
+		}
+	}
+}
+
+// TestParseVMessPortAsInt asserts that parseVMess correctly parses "port" when
+// it is a JSON integer (common in many client exports) rather than the string
+// form used in the existing TestParseVMess fixture. asInt handles both; this
+// test guards against a future strongly-typed struct unmarshal that would silently
+// zero-out a numeric port when the field type is `string`.
+func TestParseVMessPortAsInt(t *testing.T) {
+	js := `{"v":"2","ps":"VMi","add":"vm.example.com","port":8443,"id":"uuid-int","aid":0,"net":"tcp"}`
+	link := "vmess://" + base64.StdEncoding.EncodeToString([]byte(js))
+	e, err := Parse(link)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if e.Port != 8443 {
+		t.Fatalf("port (integer JSON) = %d, want 8443", e.Port)
+	}
+}
+
+// TestParseVMessPortAsString confirms that "port" as a JSON string (common in
+// older v2rayN exports and the existing test fixture) is also parsed correctly.
+func TestParseVMessPortAsString(t *testing.T) {
+	js := `{"v":"2","ps":"VMs","add":"vm.example.com","port":"9090","id":"uuid-str","aid":"0","net":"tcp"}`
+	link := "vmess://" + base64.StdEncoding.EncodeToString([]byte(js))
+	e, err := Parse(link)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if e.Port != 9090 {
+		t.Fatalf("port (string JSON) = %d, want 9090", e.Port)
+	}
+}
+
+// TestParseVMessAidAsInt confirms that "aid" (alter_id) as a JSON integer is
+// parsed correctly (matching the string form tested in TestParseVMess).
+func TestParseVMessAidAsInt(t *testing.T) {
+	js := `{"v":"2","ps":"VMaid","add":"vm.example.com","port":443,"id":"uuid-aid","aid":7,"net":"tcp"}`
+	link := "vmess://" + base64.StdEncoding.EncodeToString([]byte(js))
+	e, err := Parse(link)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if e.Params["alter_id"] != 7 {
+		t.Fatalf("alter_id (integer JSON) = %v, want 7", e.Params["alter_id"])
+	}
+}
+
 func TestPlainWireGuardConfDetectedAsWG(t *testing.T) {
 	conf := `[Interface]
 PrivateKey = key==

@@ -37,6 +37,24 @@ type Status struct {
 	Reason      string `json:"reason,omitempty"` // why it isn't running, if it failed to start
 }
 
+// mtuStr / keepaliveStr prefer the typed Endpoint field (the UI's canonical home — it writes
+// these there and drops the legacy Params copy on edit) and fall back to Params for not-yet-
+// migrated configs, so a UI-edited AmneziaWG tunnel still has its MTU/keepalive applied at
+// bring-up AND exported. Empty string = unset (omit the line).
+func mtuStr(e model.Endpoint) string {
+	if e.MTU > 0 {
+		return strconv.Itoa(e.MTU)
+	}
+	return numStr(e.Params["mtu"])
+}
+
+func keepaliveStr(e model.Endpoint) string {
+	if e.PersistentKeepalive > 0 {
+		return strconv.Itoa(e.PersistentKeepalive)
+	}
+	return numStr(e.Params["persistent_keepalive"])
+}
+
 // NativeConfig renders the engine-native config text + filename for an endpoint.
 func NativeConfig(e model.Endpoint, socksPort int) (string, string, error) {
 	switch e.Engine {
@@ -71,15 +89,31 @@ func isIKey(key string) bool {
 	return len(key) == 2 && key[0] == 'i' && key[1] >= '1' && key[1] <= '5'
 }
 
+// confLine returns s truncated at the first ASCII control character (newline, CR, tab, …)
+// so a crafted value can never inject extra lines into the line-based awg .conf that
+// `awg setconf` parses. A key carrying "KEY\nPublicKey = <attacker>" thus collapses to the
+// malformed single-line "KEY" — the tunnel fails to come up (drop-don't-brick) rather than
+// smuggling in attacker-controlled cryptokey-routing directives. Validation only checks the
+// key is non-empty, and a raw POST/hand-edited profile.json bypasses the importer, so this
+// is the render-time guard.
+func confLine(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 {
+			return s[:i]
+		}
+	}
+	return s
+}
+
 func awgConfig(e model.Endpoint) string {
 	p := e.Params
 	var b strings.Builder
 	b.WriteString("[Interface]\n")
-	b.WriteString("PrivateKey = " + str(p, "private_key") + "\n")
+	b.WriteString("PrivateKey = " + confLine(str(p, "private_key")) + "\n")
 	if a := util.LocalAddr(p); a != "" {
 		b.WriteString("Address = " + a + "\n")
 	}
-	if mtu := numStr(p["mtu"]); mtu != "" {
+	if mtu := mtuStr(e); mtu != "" {
 		b.WriteString("MTU = " + mtu + "\n")
 	}
 	for _, j := range awgOrder {
@@ -100,15 +134,15 @@ func awgConfig(e model.Endpoint) string {
 		}
 	}
 	b.WriteString("\n[Peer]\n")
-	b.WriteString("PublicKey = " + str(p, "peer_public_key") + "\n")
-	if psk := str(p, "pre_shared_key"); psk != "" {
+	b.WriteString("PublicKey = " + confLine(str(p, "peer_public_key")) + "\n")
+	if psk := confLine(str(p, "pre_shared_key")); psk != "" {
 		b.WriteString("PresharedKey = " + psk + "\n")
 	}
 	b.WriteString("Endpoint = " + e.Server + ":" + strconv.Itoa(e.Port) + "\n")
 	b.WriteString("AllowedIPs = 0.0.0.0/0\n")
 	// PersistentKeepalive survives awgStrip (it is a peer cryptokey-routing field
 	// `awg setconf` honors) and keeps an idle tunnel's NAT mapping from expiring.
-	if ka := numStr(p["persistent_keepalive"]); ka != "" {
+	if ka := keepaliveStr(e); ka != "" {
 		b.WriteString("PersistentKeepalive = " + ka + "\n")
 	}
 	return b.String()
@@ -260,7 +294,7 @@ func (m *Manager) start(id string, s Spec) *proc {
 	cfg, fname, err := NativeConfig(s.Endpoint, s.SOCKSPort)
 	p := &proc{engine: s.Endpoint.Engine, socks: s.SOCKSPort, config: cfg}
 	if err != nil {
-		p.reason = err.Error()
+		p.reason = "native config: " + err.Error()
 		return p
 	}
 	p.cfgPath = filepath.Join(m.dir, fname)
@@ -356,7 +390,7 @@ func (m *Manager) awgUp(e model.Endpoint, cfgText string) (string, error) {
 	// MTU is stripped from the setconf input (awg setconf rejects it) but is a real
 	// ip-layer setting; apply it here like the address, or the tunnel uses the kernel
 	// default and over a constrained path large packets fragment/blackhole.
-	if mtu := numStr(e.Params["mtu"]); mtu != "" {
+	if mtu := mtuStr(e); mtu != "" {
 		if out, err := exec.Command(ipBin, "link", "set", iface, "mtu", mtu).CombinedOutput(); err != nil {
 			log.Printf("wakeroute: awg %s: set mtu %s failed: %v: %s", iface, mtu, err, strings.TrimSpace(string(out)))
 		}
@@ -398,6 +432,14 @@ func (m *Manager) stop(_ string, p *proc) {
 	if p.engine == model.EngineAmneziaWG && p.running && p.iface != "" {
 		if ipBin, ok := m.resolve("ip"); ok {
 			_ = exec.Command(ipBin, "link", "del", p.iface).Run()
+		}
+	}
+	// Remove the rendered config — it holds secrets (WireGuard PrivateKey/PresharedKey,
+	// olcRTC crypto.key) and would otherwise linger 0600 on the router overlay across
+	// add/remove cycles. Best-effort; ENOENT (one-shot already cleaned, or never written) is fine.
+	if p.cfgPath != "" {
+		if err := os.Remove(p.cfgPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("wakeroute: plugin cfg cleanup (engine=%s iface=%s): %v", p.engine, p.iface, err)
 		}
 	}
 	p.running = false
@@ -450,7 +492,14 @@ func pluginBackoffTicks(restarts int) int {
 // uses a one-shot `awg-quick up` (interface, not a process), so it is left to M7
 // routing health. Best-effort and on-device only (no-op when binaries are absent).
 func (m *Manager) Supervise() {
-	m.mu.Lock()
+	// Non-blocking: Sync() holds m.mu across blocking external commands (ip/awg setconf)
+	// and the process reap (<-p.done), which can take seconds during an Apply/rollback.
+	// The watchdog drives this on the SAME tick that crash-restarts sing-box, so blocking
+	// here would delay the core's crash recovery. If a Sync is in flight, skip this tick;
+	// the next (~3s) one supervises. A skipped plugin relaunch waits one tick — harmless.
+	if !m.mu.TryLock() {
+		return
+	}
 	defer m.mu.Unlock()
 	for _, p := range m.procs {
 		// Only launched long-running procs (olcRTC/nfqws2) are supervised here (AmneziaWG is

@@ -111,10 +111,12 @@ func (s *Server) coreUp() bool {
 		return false
 	}
 	cl := &http.Client{Timeout: 2 * time.Second}
+	defer cl.CloseIdleConnections()
 	resp, err := cl.Get("http://" + ctrl + "/version")
 	if err != nil {
 		return false
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
 }

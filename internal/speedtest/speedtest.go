@@ -102,8 +102,7 @@ func (t *Tester) latency(ctx context.Context, cl *http.Client) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	defer resp.Body.Close()
 	return int(time.Since(start).Milliseconds()), nil
 }
 
@@ -112,7 +111,6 @@ func (t *Tester) download(ctx context.Context, cl *http.Client, bytes int) (int6
 	if err != nil {
 		return 0, 0, err
 	}
-	start := time.Now()
 	resp, err := cl.Do(req)
 	if err != nil {
 		return 0, 0, err
@@ -121,6 +119,10 @@ func (t *Tester) download(ctx context.Context, cl *http.Client, bytes int) (int6
 	if resp.StatusCode != http.StatusOK {
 		return 0, 0, fmt.Errorf("status %d", resp.StatusCode)
 	}
+	// Time ONLY the body transfer, not the request + response-header round-trip: the
+	// connection is already warm from the preceding latency() probe, so including the header
+	// RTT here would understate throughput on a high-latency tunnel.
+	start := time.Now()
 	n, err := io.Copy(io.Discard, resp.Body)
 	return n, time.Since(start), err
 }
@@ -137,8 +139,7 @@ func (t *Tester) upload(ctx context.Context, cl *http.Client, bytes int) (time.D
 	if err != nil {
 		return 0, err
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	defer resp.Body.Close()
 	return time.Since(start), nil
 }
 

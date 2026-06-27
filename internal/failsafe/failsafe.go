@@ -62,6 +62,7 @@ type Manager struct {
 	bad        bool
 	badSince   int64
 	rolledBack bool
+	dispatched bool // rb() has been (or is being) invoked for this window — gates fire-once
 	lastOk     bool
 	lastAt     int64
 	lastErr    string
@@ -93,6 +94,7 @@ func (m *Manager) Arm(check func() bool, rollback func() error, reboot func(), a
 	m.pending = true
 	m.phase = "armed"
 	m.rolledBack = false
+	m.dispatched = false
 	m.bad = false
 	m.badSince = 0
 	m.lastErr = ""
@@ -109,11 +111,14 @@ func (m *Manager) Arm(check func() bool, rollback func() error, reboot func(), a
 }
 
 func (m *Manager) run(ctx context.Context, check func() bool, rollback func() error, reboot func(), allowReboot bool) {
+	grace := time.NewTimer(m.d.Grace)
 	select {
-	case <-time.After(m.d.Grace):
+	case <-grace.C:
 	case <-ctx.Done():
+		grace.Stop()
 		return
 	}
+	grace.Stop() // drain in case both channels are ready
 	t := time.NewTicker(m.d.Interval)
 	defer t.Stop()
 	for {
@@ -128,7 +133,9 @@ func (m *Manager) run(ctx context.Context, check func() bool, rollback func() er
 		}
 		switch m.tick(nowMS(), check()) {
 		case ActRollback:
-			if rollback != nil {
+			// Fire at most once per window: skip if a manual RollbackNow already
+			// claimed (and is running/ran) the rollback for this window.
+			if rollback != nil && m.claimRollback() {
 				if err := rollback(); err != nil {
 					m.markRollbackFailed(err)
 				}
@@ -147,6 +154,21 @@ func (m *Manager) run(ctx context.Context, check func() bool, rollback func() er
 			return
 		}
 	}
+}
+
+// claimRollback atomically claims the right to invoke rb() for the current
+// fail-safe window. It returns true to exactly ONE caller; every later caller
+// (a concurrent RollbackNow racing tick()'s auto path, or a second RollbackNow)
+// gets false and must NOT call rb(). This makes the rollback fire at most once
+// per window even though rb() is invoked unlocked. The flag is reset on Arm().
+func (m *Manager) claimRollback() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dispatched {
+		return false
+	}
+	m.dispatched = true
+	return true
 }
 
 // markRollbackFailed records that the rollback could not restore the config, so
@@ -225,6 +247,10 @@ func (m *Manager) Confirm() {
 func (m *Manager) RollbackNow() error {
 	m.mu.Lock()
 	rb := m.rollback
+	already := m.dispatched // tick()'s auto path may have already claimed/fired rb()
+	if !already {
+		m.dispatched = true // claim the single fire-once dispatch under the lock
+	}
 	m.pending = false
 	m.phase = "rolled_back"
 	m.rolledBack = true
@@ -232,6 +258,11 @@ func (m *Manager) RollbackNow() error {
 		m.cancel()
 	}
 	m.mu.Unlock()
+	// Fire at most once per window: if the auto path already dispatched the
+	// rollback, do NOT invoke rb() a second time (avoids a double rollback).
+	if already {
+		return nil
+	}
 	if rb != nil {
 		if err := rb(); err != nil {
 			m.markRollbackFailed(err)

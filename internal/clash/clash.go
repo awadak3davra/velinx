@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,6 +17,18 @@ import (
 	"time"
 
 	"wakeroute/internal/traffic"
+)
+
+const (
+	// streamIdleTimeout bounds how long StreamTraffic waits for the next /traffic sample
+	// before forcing a reconnect. The stream emits at ~1 Hz, so a long silence means a
+	// half-open socket (sing-box restarted, firewall dropped the flow with no RST) that a
+	// plain blocking read would never notice. Reset on every sample.
+	streamIdleTimeout = 20 * time.Second
+	// maxClashBody caps one-shot REST reads (/connections, /proxies) so an abnormally large
+	// payload can't spike memory on the ~60MB-overlay router. The /traffic STREAM stays
+	// uncapped (it is incremental). Generous: a busy table is well under this.
+	maxClashBody = 8 << 20
 )
 
 // ErrProxyDown means a Clash delay test ran but the proxy could not reach the
@@ -38,8 +51,13 @@ func New(controller, secret string) (*Client, error) {
 	return &Client{
 		base:   u,
 		secret: secret,
-		// No global timeout: /traffic is a long-lived streaming response.
-		hc: &http.Client{},
+		// No global timeout: /traffic is a long-lived streaming response;
+		// per-call timeouts are set via context.WithTimeout by callers.
+		hc: &http.Client{Transport: &http.Transport{
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 8, // default 2 is too low for 8-parallel health probes
+			IdleConnTimeout:     30 * time.Second,
+		}},
 	}, nil
 }
 
@@ -52,6 +70,15 @@ func (c *Client) auth(r *http.Request) {
 // StreamTraffic connects to /traffic and invokes onSample once per emitted
 // object until ctx is cancelled or the stream ends.
 func (c *Client) StreamTraffic(ctx context.Context, onSample func(traffic.Sample)) error {
+	// Idle watchdog: a half-open socket leaves dec.Decode blocked forever, and the caller
+	// only reconnects when this returns — so the live graph would freeze until a daemon
+	// restart. Cancel the request ctx if no sample arrives within streamIdleTimeout (each
+	// sample resets it), which unblocks the read and triggers a reconnect.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	idle := time.AfterFunc(streamIdleTimeout, cancel)
+	defer idle.Stop()
+
 	u := *c.base
 	u.Path = "/traffic"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -81,6 +108,7 @@ func (c *Client) StreamTraffic(ctx context.Context, onSample func(traffic.Sample
 			}
 			return err
 		}
+		idle.Reset(streamIdleTimeout)
 		onSample(traffic.Sample{T: time.Now().UnixMilli(), Up: m.Up, Down: m.Down})
 	}
 }
@@ -138,7 +166,7 @@ func (c *Client) Proxies(ctx context.Context) (map[string]Proxy, error) {
 	var out struct {
 		Proxies map[string]Proxy `json:"proxies"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxClashBody)).Decode(&out); err != nil {
 		return nil, err
 	}
 	return out.Proxies, nil
@@ -175,13 +203,19 @@ func (c *Client) Delay(ctx context.Context, name, testURL string, timeoutMS int)
 		MeanDelay int    `json:"meanDelay"`
 		Message   string `json:"message"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&m)
+	decErr := json.NewDecoder(io.LimitReader(resp.Body, maxClashBody)).Decode(&m)
 	if resp.StatusCode != http.StatusOK {
 		msg := m.Message
 		if msg == "" {
 			msg = resp.Status
 		}
 		return 0, fmt.Errorf("%w: %s", ErrProxyDown, msg)
+	}
+	if decErr != nil {
+		// A 200 whose body didn't parse is not a valid measurement: report it as
+		// unreachable (probe → Unknown) rather than silently Alive(0), which would mask a
+		// real failure and could suppress a failover decision.
+		return 0, fmt.Errorf("clash delay: malformed response: %w", decErr)
 	}
 	if m.Delay == 0 {
 		return m.MeanDelay, nil
@@ -235,7 +269,7 @@ func (c *Client) Connections(ctx context.Context) (Connections, error) {
 		return Connections{}, fmt.Errorf("clash /connections: status %d", resp.StatusCode)
 	}
 	var out Connections
-	err = json.NewDecoder(resp.Body).Decode(&out)
+	err = json.NewDecoder(io.LimitReader(resp.Body, maxClashBody)).Decode(&out)
 	return out, err
 }
 

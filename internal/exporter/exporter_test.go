@@ -89,6 +89,28 @@ func TestRoundTripAmneziaWGConf(t *testing.T) {
 	}
 }
 
+// TestExportTypedMTUKeepalive: MTU + PersistentKeepalive set on the TYPED Endpoint fields
+// (as the UI now writes them, dropping the legacy Params copy on edit) must still appear in
+// the exported .conf — else a UI-edited tunnel would export without them.
+func TestExportTypedMTUKeepalive(t *testing.T) {
+	e := model.Endpoint{
+		Name: "WG", Engine: model.EngineSingBox, Protocol: model.ProtoWireGuard,
+		Server: "203.0.113.7", Port: 51820,
+		MTU: 1280, PersistentKeepalive: 25,
+		Params: map[string]any{"private_key": "PRIV=", "peer_public_key": "PUB="},
+	}
+	r, ok := Export(e)
+	if !ok || r.Kind != "conf" {
+		t.Fatalf("export = %+v ok=%v", r, ok)
+	}
+	if !strings.Contains(r.Text, "MTU = 1280") {
+		t.Errorf("typed MTU not exported:\n%s", r.Text)
+	}
+	if !strings.Contains(r.Text, "PersistentKeepalive = 25") {
+		t.Errorf("typed PersistentKeepalive not exported:\n%s", r.Text)
+	}
+}
+
 func TestExportUnsupported(t *testing.T) {
 	if _, ok := Export(model.Endpoint{Protocol: model.ProtoOlcRTC}); ok {
 		t.Error("olcrtc should not be exportable as a link/conf")

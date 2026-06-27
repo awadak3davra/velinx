@@ -13,7 +13,7 @@
   --console-bg:#0E141E; --console-ink:#8A94A6;
   /* Radius discipline: 4px standard, 8px cards. */
   --radius:8px; --radius-sm:4px;
-  --shadow:0 1px 2px rgba(0,0,0,.22), 0 8px 24px rgba(0,0,0,.22);
+  --shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 1px 3px rgba(0,0,0,.28);
   /* Signature blue-tinted shadow on active/selected elements. */
   --shadow-active:0 1px 3px rgba(0,151,220,.2), 0 1px 2px rgba(0,151,220,.25), 0 0 2px rgba(0,151,220,.2);
   --t:.06s; /* snappy ~0.05s transitions. */
@@ -211,7 +211,7 @@ button { font-family:inherit; }
 /* traffic graph */
 .graphwrap { position:relative; margin-top:4px; }
 .ymax { position:absolute; right:2px; top:-2px; font-size:var(--fs-small); color:var(--ink-3); }
-canvas.graph { width:100%; height:200px; display:block; border:1px dashed var(--plot); border-radius:6px; }
+canvas.graph { width:100%; height:200px; display:block; border:1px solid var(--plot); border-radius:6px; }
 .legend { display:flex; justify-content:center; gap:26px; font-size:var(--fs-control); color:var(--ink-2); margin-top:9px; }
 .legend b { color:var(--ink); font-weight:600; }
 .legend .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:7px; vertical-align:middle; }
@@ -430,7 +430,7 @@ input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc
   --ok-tint:rgba(31,157,87,.12); --warn-tint:rgba(185,118,15,.12); --err-tint:rgba(210,59,59,.10);
   --ink:#16202E; --ink-2:#55627A; --ink-3:#8A95A8;
   --rx:#2E6FB0; --tx:#1F9D57;
-  --shadow:0 1px 2px rgba(20,30,45,.06), 0 6px 20px rgba(20,30,45,.08);
+  --shadow:0 1px 3px rgba(20,30,45,.10), 0 0 0 1px rgba(20,30,45,.06);
   --shadow-active:0 1px 3px rgba(0,134,196,.18), 0 0 2px rgba(0,134,196,.22);
   --topbar-bg:rgba(255,255,255,.7); --backdrop:rgba(20,28,40,.42);
   --console-bg:#0E141E; --console-ink:#C6CEDA;

@@ -54,7 +54,7 @@ type PingResult struct {
 // Lookup is a DNS resolution result.
 type Lookup struct {
 	Target string   `json:"target"`
-	IPs    []string `json:"ips"`
+	IPs    []string `json:"ips,omitempty"`
 	CNAME  string   `json:"cname,omitempty"`
 	Err    string   `json:"err,omitempty"`
 }
@@ -91,6 +91,10 @@ func Ping(ctx context.Context, host string, count int) PingResult {
 		args = []string{"-c", strconv.Itoa(count), "-W", "2", host}
 	}
 	out, _ := exec.CommandContext(ctx, "ping", args...).CombinedOutput()
+	if ctx.Err() != nil {
+		res.Output = fmt.Errorf("ping: %w", ctx.Err()).Error()
+		return res
+	}
 	res.Output = strings.TrimSpace(string(out))
 
 	if m := reLossUnix.FindStringSubmatch(res.Output); m != nil {
@@ -122,6 +126,9 @@ func Traceroute(ctx context.Context, host string, maxHops int) string {
 		cmd = exec.CommandContext(ctx, "traceroute", "-n", "-m", strconv.Itoa(maxHops), "-w", "2", host)
 	}
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("traceroute: %w", ctx.Err()).Error()
+	}
 	s := strings.TrimSpace(string(out))
 	if s == "" && err != nil {
 		return "traceroute unavailable: " + err.Error()
@@ -319,7 +326,7 @@ func ReachViaIface(ctx context.Context, iface, target string, timeoutMS int) Rea
 		return r
 	}
 	r.Reachable = true
-	r.LatencyMs = int(sec * 1000)
+	r.LatencyMs = int(sec*1000 + 0.5) // round, not truncate (0.4ms → 0 looked like "unknown")
 	return r
 }
 
@@ -358,12 +365,34 @@ func pickPublic(ips []net.IP) (string, error) {
 	return "", fmt.Errorf("refusing to probe an internal/private address")
 }
 
+// cgnatNet is the RFC 6598 carrier-grade NAT (shared address) range 100.64.0.0/10.
+// net.IP.IsPrivate covers only RFC1918/ULA, so a host resolving into CGNAT would
+// otherwise read as "external" and be probed. Parsed once at init.
+var cgnatNet = mustCIDR("100.64.0.0/10")
+
+func mustCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic("netdiag: bad CIDR " + s + ": " + err.Error())
+	}
+	return n
+}
+
 // isInternalAddr reports whether ip is one a reachability probe must refuse: loopback,
-// RFC1918/ULA private, link-local (incl. 169.254.169.254 metadata), or unspecified.
-// Mirrors server.blockInternalDial's predicate (the subscription-fetch dial guard).
+// RFC1918/ULA private, RFC6598 CGNAT (100.64.0.0/10), link-local (incl. 169.254.169.254
+// metadata), or unspecified. Mirrors server.blockInternalDial's predicate (the
+// subscription-fetch dial guard).
 func isInternalAddr(ip net.IP) bool {
-	return ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	// Normalize IPv4-mapped-IPv6 to 4 bytes so the CGNAT /10 Contains check matches
+	// consistently with the IsPrivate family above (which already handles the mapped form).
+	if v4 := ip.To4(); v4 != nil {
+		return cgnatNet.Contains(v4)
+	}
+	return false
 }
 
 // Run executes all three diagnostics with sane per-tool timeouts.

@@ -9,12 +9,19 @@ import (
 // isInternalAddr is the SSRF predicate: a reachability probe must refuse loopback,
 // private, link-local (incl. 169.254.169.254 metadata) and unspecified targets.
 func TestIsInternalAddr(t *testing.T) {
-	for _, s := range []string{"127.0.0.1", "10.0.0.1", "192.168.1.1", "172.16.0.1", "169.254.169.254", "::1", "0.0.0.0", "fe80::1"} {
+	for _, s := range []string{
+		"127.0.0.1", "10.0.0.1", "192.168.1.1", "172.16.0.1", "169.254.169.254", "::1", "0.0.0.0", "fe80::1",
+		"100.64.0.1", "100.96.5.9", "100.127.255.254", // RFC6598 CGNAT 100.64.0.0/10
+		"::ffff:100.64.0.1", // CGNAT in IPv4-mapped-IPv6 form
+	} {
 		if !isInternalAddr(net.ParseIP(s)) {
 			t.Errorf("isInternalAddr(%s) = false, want true (internal)", s)
 		}
 	}
-	for _, s := range []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"} {
+	for _, s := range []string{
+		"1.1.1.1", "8.8.8.8", "9.9.9.9",
+		"100.63.255.255", "100.128.0.0", // boundaries just outside 100.64.0.0/10 — public
+	} {
 		if isInternalAddr(net.ParseIP(s)) {
 			t.Errorf("isInternalAddr(%s) = true, want false (public)", s)
 		}

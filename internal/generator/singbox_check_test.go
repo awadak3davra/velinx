@@ -17,28 +17,74 @@ import (
 // using minimally-VALID params (correct key lengths) so a real `sing-box check`
 // accepts the result, not just structural generation.
 //
+// The protocol table is the SAFETY CONTRACT for the Init-Server provisioner: it
+// MUST carry a representative endpoint for EVERY protocol the provisioner can hand
+// a user, in the SAME SHAPE the provisioner's WR_CLIENT_CONFIG link decodes to (see
+// internal/initserver/initserver.go scriptReality / scriptVMess / scriptTrojan /
+// scriptShadowsocks / scriptHysteria2 / scriptTUIC / scriptWireGuard / scriptAmneziaWG).
+// If any provisionable protocol produced a config a real sing-box rejects, the user
+// would get a dead link; this test fails first. The 8 provisionable protocols are:
+//
+//	AmneziaWG, plain WireGuard, VLESS-Reality, VMess (ws+tls insecure),
+//	Trojan (tls insecure), Shadowsocks (2022-blake3-aes-256-gcm), Hysteria2
+//	(quic+tls insecure), TUIC (quic+tls insecure, cc=bbr).
+//
+// (SOCKS + HTTP are not provisioner-facing but are kept here so the generator's
+// remaining outbound types stay covered by the real `check` too.)
+//
 // Native WireGuard IS included: the generator now emits it as a top-level
 // `endpoints` entry (the 1.11+ schema) instead of the `wireguard` outbound that
 // 1.11 deprecated and 1.13 removed. That endpoint form is accepted by BOTH the
 // deployed 1.12.x and 1.13.x, so it is no longer version-sensitive and a real
-// `check` validates it on every pinned sing-box the CI runs.
+// `check` validates it on every pinned sing-box the CI runs. AmneziaWG is a plugin
+// engine: the generator emits it as a `direct` outbound bound to the awg interface
+// (plus a Plugin record), which a real `check` accepts.
 func allProtocolProfile() *model.Profile {
-	ssKey := base64.StdEncoding.EncodeToString(make([]byte, 16)) // 2022-blake3-aes-128-gcm wants a 16-byte key
-	wgKey := base64.StdEncoding.EncodeToString(make([]byte, 32)) // WireGuard keys are 32-byte base64
+	ssKey128 := base64.StdEncoding.EncodeToString(make([]byte, 16)) // 2022-blake3-aes-128-gcm wants a 16-byte key
+	ssKey256 := base64.StdEncoding.EncodeToString(make([]byte, 32)) // 2022-blake3-aes-256-gcm (the provisioner cipher) wants a 32-byte key
+	wgKey := base64.StdEncoding.EncodeToString(make([]byte, 32))    // WireGuard keys are 32-byte base64
 	uuid := "11111111-1111-1111-1111-111111111111"
+	// A valid x25519 reality public key is the base64 of 32 bytes; the generator
+	// drops a reality block whose public_key is malformed (validRealityPubKey), which
+	// would silently downgrade the endpoint, so use a real-length key. short_id is
+	// even-length hex (<=16 chars), matching `sing-box generate rand --hex 8`.
+	realityPub := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	realitySID := "0123456789abcdef"
 	// Hysteria2 and TUIC run over QUIC+TLS and sing-box rejects them without a tls
-	// block ("TLS required"); attach one (the importer always sets it on real links).
-	withTLS := func(e model.Endpoint) model.Endpoint {
-		e.TLS = &model.TLS{Enabled: true, Type: "tls", SNI: "example.com"}
+	// block ("TLS required"); attach one. The provisioner's self-signed cert makes
+	// the importer set insecure=1 + alpn h3, so mirror that exact shape.
+	withQUICTLS := func(e model.Endpoint) model.Endpoint {
+		e.TLS = &model.TLS{Enabled: true, Type: "tls", SNI: "wakeroute.local", Insecure: true, ALPN: []string{"h3"}}
 		return e
 	}
+	// VLESS-Reality endpoint mirrors scriptReality's link:
+	// vless://uuid@host:443?security=reality&sni=...&fp=chrome&pbk=...&sid=...&flow=xtls-rprx-vision&type=tcp
+	vlessReality := generator_singBoxEndpoint("p-vless", model.ProtoVLESS, map[string]any{"uuid": uuid, "flow": "xtls-rprx-vision"})
+	vlessReality.TLS = &model.TLS{Enabled: true, Type: "reality", SNI: "www.microsoft.com", Fingerprint: "chrome", PublicKey: realityPub, ShortID: realitySID}
+	// VMess endpoint mirrors scriptVMess's link: vmess over ws + self-signed TLS
+	// (allowInsecure=1) on the /wakeroute path.
+	vmess := generator_singBoxEndpoint("p-vmess", model.ProtoVMess, map[string]any{"uuid": uuid, "alter_id": 0, "security": "auto"})
+	vmess.Transport = &model.Transport{Type: "ws", Path: "/wakeroute", Host: "wakeroute.local"}
+	vmess.TLS = &model.TLS{Enabled: true, Type: "tls", SNI: "wakeroute.local", Insecure: true}
+	// Trojan endpoint mirrors scriptTrojan's link: trojan over TLS (self-signed,
+	// insecure=1).
+	trojan := generator_singBoxEndpoint("p-trojan", model.ProtoTrojan, map[string]any{"password": "pw"})
+	trojan.TLS = &model.TLS{Enabled: true, Type: "tls", SNI: "wakeroute.local", Insecure: true}
+	// AmneziaWG endpoint mirrors scriptAmneziaWG: a WG-shaped peer that the plugin
+	// engine brings up; the generator emits a `direct` outbound bound to its iface.
+	awg := generator_singBoxEndpoint("p-awg", model.ProtoAmneziaWG, map[string]any{
+		"private_key": wgKey, "peer_public_key": wgKey, "local_address": []string{"10.0.0.2/32"},
+	})
+	awg.Engine = model.EngineAmneziaWG
 	eps := []model.Endpoint{
-		generator_singBoxEndpoint("p-vless", model.ProtoVLESS, map[string]any{"uuid": uuid}),
-		generator_singBoxEndpoint("p-vmess", model.ProtoVMess, map[string]any{"uuid": uuid, "alter_id": 0, "security": "auto"}),
-		generator_singBoxEndpoint("p-trojan", model.ProtoTrojan, map[string]any{"password": "pw"}),
-		generator_singBoxEndpoint("p-ss", model.ProtoShadowsocks, map[string]any{"method": "2022-blake3-aes-128-gcm", "password": ssKey}),
-		withTLS(generator_singBoxEndpoint("p-hy2", model.ProtoHysteria2, map[string]any{"password": "pw", "obfs": "salamander", "obfs_password": "op"})),
-		withTLS(generator_singBoxEndpoint("p-tuic", model.ProtoTUIC, map[string]any{"uuid": uuid, "password": "pw", "congestion_control": "bbr", "udp_relay_mode": "native"})),
+		vlessReality,
+		vmess,
+		trojan,
+		generator_singBoxEndpoint("p-ss", model.ProtoShadowsocks, map[string]any{"method": "2022-blake3-aes-256-gcm", "password": ssKey256}),
+		// Keep the 128-bit cipher covered too (the importer/generator support both).
+		generator_singBoxEndpoint("p-ss128", model.ProtoShadowsocks, map[string]any{"method": "2022-blake3-aes-128-gcm", "password": ssKey128}),
+		withQUICTLS(generator_singBoxEndpoint("p-hy2", model.ProtoHysteria2, map[string]any{"password": "pw", "obfs": "salamander", "obfs_password": "op"})),
+		withQUICTLS(generator_singBoxEndpoint("p-tuic", model.ProtoTUIC, map[string]any{"uuid": uuid, "password": "pw", "congestion_control": "bbr", "udp_relay_mode": "native"})),
 		generator_singBoxEndpoint("p-socks", model.ProtoSOCKS, map[string]any{}),
 		generator_singBoxEndpoint("p-http", model.ProtoHTTP, map[string]any{}),
 		// Native WireGuard → top-level `endpoints` entry. Real 32-byte keys so
@@ -46,6 +92,7 @@ func allProtocolProfile() *model.Profile {
 		generator_singBoxEndpoint("p-wg", model.ProtoWireGuard, map[string]any{
 			"private_key": wgKey, "peer_public_key": wgKey, "local_address": []string{"10.0.0.2/32"},
 		}),
+		awg,
 	}
 	return &model.Profile{
 		Endpoints: eps,

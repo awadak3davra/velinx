@@ -2,27 +2,88 @@ package watchdog
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
 
-// fakeSup is a controllable Supervisor for deterministic watchdog tests.
+// fakeSup is a controllable Supervisor for deterministic watchdog tests. It also
+// implements atomicRestarter so the watchdog exercises the TOCTOU-safe path.
+//
+// The deterministic tests drive it from a single goroutine (controllable clock)
+// and read its fields directly between tick()s — that is race-free. The
+// concurrency tests instead use the lock-protected helpers (setDesired/setAlive/
+// startCount) so a -race run stays clean while Stop() races a restart decision.
 type fakeSup struct {
+	mu       sync.Mutex
 	desired  bool
 	alive    bool
 	starts   int
 	startErr error
-	onStart  func() // called inside Start (e.g. to flip alive)
+	onStart  func() // called inside the (re)start (e.g. to flip alive)
 }
 
-func (f *fakeSup) Desired() bool { return f.desired }
-func (f *fakeSup) Alive() bool   { return f.alive }
+func (f *fakeSup) Desired() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.desired
+}
+
+func (f *fakeSup) Alive() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.alive
+}
+
+// Start mirrors core.SingBox.Start for the non-atomic fallback path and for
+// explicit start calls: it always (re)spawns and marks desired.
 func (f *fakeSup) Start() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.desired = true
+	return f.spawnLocked()
+}
+
+// StartIfDesiredDead mirrors core.SingBox.StartIfDesiredDead: under the lock,
+// spawn ONLY IF still desired and not alive; never promote desired false→true.
+func (f *fakeSup) StartIfDesiredDead() (started bool, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.desired || f.alive {
+		return false, nil
+	}
+	if err := f.spawnLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// spawnLocked is the shared spawn body; caller holds f.mu.
+func (f *fakeSup) spawnLocked() error {
 	f.starts++
 	if f.onStart != nil {
 		f.onStart()
 	}
 	return f.startErr
+}
+
+// --- lock-protected accessors for the concurrency tests ----------------------
+
+func (f *fakeSup) setDesired(v bool) { f.mu.Lock(); f.desired = v; f.mu.Unlock() }
+func (f *fakeSup) setAlive(v bool)   { f.mu.Lock(); f.alive = v; f.mu.Unlock() }
+func (f *fakeSup) startCount() int   { f.mu.Lock(); defer f.mu.Unlock(); return f.starts }
+func (f *fakeSup) isDesired() bool   { f.mu.Lock(); defer f.mu.Unlock(); return f.desired }
+func (f *fakeSup) isAlive() bool     { f.mu.Lock(); defer f.mu.Unlock(); return f.alive }
+
+// stop models core.SingBox.Stop(): under the single lock it clears desired AND
+// makes the process not alive (the kill), atomically — so a concurrent
+// StartIfDesiredDead is fully serialized with it and can never observe a
+// half-applied Stop (desired cleared but still "alive", or vice versa).
+func (f *fakeSup) stop() {
+	f.mu.Lock()
+	f.desired = false
+	f.alive = false
+	f.mu.Unlock()
 }
 
 // newAt builds a watchdog with a controllable clock starting at t.

@@ -23,7 +23,8 @@ HOME_DIR=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
 [ -n "$HOME_DIR" ] || HOME_DIR="$HOME"
 log "installing key for $TARGET_USER ($HOME_DIR)"
 mkdir -p "$HOME_DIR/.ssh"; chmod 700 "$HOME_DIR/.ssh"
-KF=$(mktemp); rm -f "$KF" "$KF.pub"
+TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT INT TERM
+KF="$TMPD/key"
 ssh-keygen -t ed25519 -N '' -C 'wakeroute-managed' -f "$KF" >/dev/null
 touch "$HOME_DIR/.ssh/authorized_keys"
 cat "$KF.pub" >> "$HOME_DIR/.ssh/authorized_keys"
@@ -32,7 +33,6 @@ chmod 600 "$HOME_DIR/.ssh/authorized_keys"
 chown -R "$TARGET_USER" "$HOME_DIR/.ssh" 2>/dev/null || true
 echo "WR_SSH_PUB=$(cat "$KF.pub")"
 echo "WR_SSH_KEY_B64=$(base64 -w0 < "$KF" 2>/dev/null || base64 < "$KF" | tr -d '\n')"
-rm -f "$KF" "$KF.pub"
 log "key installed into authorized_keys"
 `, user)
 }

@@ -15,7 +15,7 @@
 #
 # Idempotent: re-running upgrades in place. POSIX sh / busybox-safe.
 
-VERSION="0.3.0"
+VERSION="0.3.3"
 
 # --- native OpenWrt paths --------------------------------------------------
 SBIN=/usr/sbin
@@ -75,7 +75,29 @@ ask() {
 run() { if [ "$DRY_RUN" = 1 ]; then printf '  %b(dry-run)%b would: %s\n' "$C_D" "$C_0" "$*"; return 0; fi; "$@"; }
 port_busy() { { netstat -tln 2>/dev/null || ss -ltn 2>/dev/null; } | grep -qE "[:.]$1[[:space:]]"; }
 port_listener() { { netstat -tlnp 2>/dev/null || ss -ltnp 2>/dev/null; } | grep -E "[:.]$1[[:space:]]" | head -n1 | grep -oE '[0-9]+/[A-Za-z._-]+|"[A-Za-z._-]+"' | tr '\n' ' '; }
-first_free_port() { for p in 8089 8090 8091 8099 18088; do port_busy "$p" || { echo "$p"; return; }; done; echo 8089; }
+first_free_port() { for p in 8089 8090 8091 8099 18088; do port_busy "$p" || { echo "$p"; return; }; done; echo 18089; }
+
+# Advisory-only: report which native VPN engines this OpenWrt box can carry, and
+# recommend a package for any that are absent. DETECT + RECOMMEND ONLY -- never
+# installs anything. POSIX/busybox-safe; no-op if the probes are missing.
+native_have() {
+  mod="$1"; cmd="$2"; shift 2
+  for m in $mod; do lsmod 2>/dev/null | grep -q "^$m" && return 0; done
+  [ -n "$cmd" ] && command -v "$cmd" >/dev/null 2>&1 && return 0
+  for f in "$@"; do [ -f "$f" ] && return 0; done
+  return 1
+}
+native_summary() {
+  hdr "Native VPN support"
+  present=""
+  if native_have amneziawg awg /lib/netifd/proto/amneziawg.sh; then present="$present amneziawg"
+  else info "for native amneziawg: $PMINST kmod-amneziawg amneziawg-tools  (proto handler: luci-proto-amneziawg)"; fi
+  if native_have wireguard wg /lib/netifd/proto/wireguard.sh; then present="$present wireguard"
+  else info "for native wireguard: $PMINST kmod-wireguard wireguard-tools"; fi
+  if [ -n "$present" ]; then ok "native:$present"
+  else info "native: none detected -- WakeRoute will tunnel these via sing-box instead"; fi
+  info "(advisory only -- nothing was installed; WakeRoute carries non-native protocols via sing-box)"
+}
 
 say "WakeRoute (OpenWrt) installer $VERSION"
 [ "$DRY_RUN" = 1 ] && warn "DRY-RUN: no changes will be made"
@@ -98,7 +120,7 @@ detect_arch() {
     mips|mips64)
       bb="$(command -v busybox 2>/dev/null || echo /bin/busybox)"
       d="$(dd if="$bb" bs=1 skip=5 count=1 2>/dev/null | od -t u1 | head -n1 | tr -s ' ' | cut -d' ' -f2)"
-      [ "$d" = 1 ] && echo mipsle || echo mips ;;
+      if [ "$d" -eq 1 ] 2>/dev/null; then echo mipsle; else echo mips; fi ;;
     *) echo unknown ;;
   esac
 }
@@ -106,7 +128,7 @@ ARCH="${FORCE_ARCH:-$(detect_arch)}"
 [ "$ARCH" = unknown ] && die "could not detect arch (uname -m=$(uname -m)); pass one explicitly"
 BIN="$SRC/wakeroute-$ARCH"
 [ -f "$BIN" ] || BIN="$SRC/wakeroute"
-[ -f "$BIN" ] || die "binary not found -- expected $SRC/wakeroute-$ARCH (wrong arch tarball?)"
+[ -f "$BIN" ] || die "binary not found -- expected $SRC/wakeroute-$ARCH or $SRC/wakeroute (wrong arch tarball?)"
 ok "arch: $ARCH ($(uname -m))   binary: $(basename "$BIN")"
 [ -f /etc/openwrt_release ] && info "$(. /etc/openwrt_release; echo "$DISTRIB_DESCRIPTION")"
 case "$ARCH" in mips|mipsle) info "MIPS builds are softfloat; if the daemon crashes on start, re-run with the other MIPS arch.";; esac
@@ -120,7 +142,7 @@ if [ -n "$avail_kb" ] && [ "$avail_kb" -gt 0 ] 2>/dev/null; then
   if [ "$avail_kb" -lt 16000 ]; then warn "free overlay space: $((avail_kb/1024)) MB -- LOW (the binary is ~9 MB; an upgrade could fail mid-write)"
   else ok "free overlay space: $((avail_kb/1024)) MB"; fi
 fi
-mem_kb="$(awk '/MemTotal/{print $2; exit}' /proc/meminfo 2>/dev/null)"; [ -n "$mem_kb" ] && info "RAM: $((mem_kb/1024)) MB"
+mem_kb="$(awk '/MemTotal/{print $2; exit}' /proc/meminfo 2>/dev/null)"; [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ] 2>/dev/null && info "RAM: $((mem_kb/1024)) MB"
 if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then ok "internet: reachable"; else warn "internet: 1.1.1.1 unreachable (ok offline; needed later to pull rule-sets)"; fi
 
 # ===========================================================================
@@ -128,14 +150,16 @@ if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then ok "internet: reachable"; else war
 # ===========================================================================
 hdr "Dependencies"
 PKG=""; command -v apk >/dev/null 2>&1 && PKG=apk; [ -z "$PKG" ] && command -v opkg >/dev/null 2>&1 && PKG=opkg
-[ -n "$PKG" ] && ok "package manager: $PKG" || warn "no apk/opkg found"
+# apk uses "apk add"; opkg uses "opkg install" — keep this distinct from $PKG add which is wrong for opkg
+PMINST="opkg install"; [ "$PKG" = apk ] && PMINST="apk add"
+if [ -n "$PKG" ]; then ok "package manager: $PKG"; else warn "no apk/opkg found"; fi
 MISSING=""
 for c in ip nft; do
   if command -v "$c" >/dev/null 2>&1; then ok "$c present"; else warn "$c not found"; MISSING="$MISSING $c"; fi
 done
 command -v ipset >/dev/null 2>&1 && ok "ipset present" || info "ipset not present (only needed for some kernel-routing modes)"
 if [ -n "$MISSING" ] && [ -n "$PKG" ]; then
-  pkgs=""; for c in $MISSING; do case "$c" in ip) pkgs="$pkgs ip-full";; nft) pkgs="$pkgs nftables";; esac; done
+  pkgs=""; for c in $MISSING; do case "$c" in ip) pkgs="$pkgs $([ "$PKG" = apk ] && echo ip || echo ip-full)";; nft) pkgs="$pkgs nftables";; esac; done
   if ask "Install missing packages via $PKG (${pkgs# }) ?" n; then
     if [ "$PKG" = apk ]; then run sh -c "apk update && apk add ${pkgs# }" || warn "install failed"
     else run sh -c "opkg update && opkg install ${pkgs# }" || warn "install failed"; fi
@@ -144,7 +168,16 @@ fi
 SB="/usr/bin/sing-box"
 if [ -x "$SB" ]; then ok "sing-box: $SB"
 elif command -v sing-box >/dev/null 2>&1; then SB="$(command -v sing-box)"; ok "sing-box: $SB"
-else warn "sing-box not found -- the UI starts, but you cannot Apply a proxy config until it exists at $SB ($PKG add sing-box, or drop the $ARCH build from github.com/SagerNet/sing-box/releases)"; fi
+else warn "sing-box not found -- the UI starts, but you cannot Apply a proxy config until it exists at $SB ($PMINST sing-box, or drop the $ARCH build from github.com/SagerNet/sing-box/releases)"; fi
+# Version compatibility: WakeRoute targets sing-box 1.12.x (1.13 removed the wireguard outbound).
+if [ -x "$SB" ]; then
+  SB_VER="$("$SB" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  SB_MAJOR="$(echo "$SB_VER" | cut -d. -f1)"
+  SB_MINOR="$(echo "$SB_VER" | cut -d. -f2)"
+  if [ -n "$SB_MAJOR" ] && [ -n "$SB_MINOR" ] && [ "$SB_MAJOR" -eq 1 ] 2>/dev/null && [ "$SB_MINOR" -lt 12 ] 2>/dev/null; then
+    warn "sing-box $SB_VER is older than 1.12 — WakeRoute needs 1.12+ (upgrade: $PMINST sing-box, or use the GitHub release)"
+  fi
+fi
 
 # ===========================================================================
 # Conflicts
@@ -159,7 +192,7 @@ case "$listener" in
     if ask "  Use a different UI port?" y; then
       if [ "$ASSUME" = yes ] || [ ! -t 0 ]; then PORT="$(first_free_port)"; ok "UI will use :$PORT (auto)"
       else
-        while :; do printf '  new UI port [8089]: '; read -r np; [ -z "$np" ] && np=8089
+        while :; do printf '  new UI port [8089]: '; read -r np || { np="$(first_free_port)"; break; }; [ -z "$np" ] && np=8089
           case "$np" in *[!0-9]*) warn "  not a number"; continue;; esac
           { [ "$np" -ge 1 ] && [ "$np" -le 65535 ]; } || { warn "  out of range"; continue; }
           port_busy "$np" && { warn "  :$np also in use"; continue; }; break; done
@@ -176,13 +209,17 @@ if [ "$DRY_RUN" = 1 ]; then hdr "Dry-run complete"; say "no changes made. Re-run
 # Install
 # ===========================================================================
 hdr "Install"
+if [ -x "$SBIN/wakeroute" ]; then
+  PREV_VER="$("$SBIN/wakeroute" --version 2>/dev/null | head -1)"
+  [ -n "$PREV_VER" ] && info "upgrading from: $PREV_VER"
+fi
 mkdir -p "$ETC" "$VAR" || die "could not create directories"
 if [ -x "$INITD/wakeroute" ]; then say "stopping existing service"; "$INITD/wakeroute" stop 2>/dev/null || true; sleep 1; fi
 
 say "installing binary -> $SBIN/wakeroute"
 cp "$BIN" "$SBIN/wakeroute.new" || die "failed to copy binary"
 chmod 0755 "$SBIN/wakeroute.new" || die "failed to chmod binary"
-[ -f "$SBIN/wakeroute" ] && cp "$SBIN/wakeroute" "$SBIN/wakeroute.bak"
+[ -f "$SBIN/wakeroute" ] && { cp "$SBIN/wakeroute" "$SBIN/wakeroute.bak" || warn "could not create backup (rollback with wakeroute.bak unavailable)"; }
 mv "$SBIN/wakeroute.new" "$SBIN/wakeroute" || die "failed to install binary"
 ok "binary installed"
 
@@ -211,7 +248,9 @@ else
   if [ -n "$cur" ] && [ "$cur" != "$PORT" ]; then
     warn "existing config listens on :$cur but you selected :$PORT"
     if ask "  update the config's listen port to :$PORT?" y; then
-      sed -i "s|\"listen\"[^,]*|\"listen\": \":$PORT\"|" "$ETC/config.json" && ok "updated to :$PORT" || { warn "edit by hand"; PORT="$cur"; }
+      if sed -i "s|\"listen\"[^,]*|\"listen\": \":$PORT\"|" "$ETC/config.json" && \
+         grep -q "\"listen\": \":$PORT\"" "$ETC/config.json"; then ok "updated to :$PORT"
+      else warn "could not update config; change \"listen\" to \":$PORT\" by hand"; PORT="$cur"; fi
     else PORT="$cur"; info "keeping :$cur"; fi
   fi
 fi
@@ -222,23 +261,35 @@ say "enabling service (boot start)"
 # ===========================================================================
 # Start + health check
 # ===========================================================================
-if [ "$NO_START" = 1 ]; then hdr "Done (not started)"; say "start later: $INITD/wakeroute start"; exit 0; fi
+if [ "$NO_START" = 1 ]; then hdr "Done (not started)"; say "start later: $INITD/wakeroute start"; native_summary; exit 0; fi
 hdr "Start"
 say "starting service"
 "$INITD/wakeroute" start 2>/dev/null || warn "start returned non-zero -- check: logread -e wakeroute"
 sleep 2
+PROBE_TOOL=""
+if command -v curl >/dev/null 2>&1; then PROBE_TOOL=curl
+elif command -v wget >/dev/null 2>&1; then PROBE_TOOL=wget; fi
 HEALTHY=0
-if command -v curl >/dev/null 2>&1; then
-  i=0; while [ "$i" -lt 5 ]; do
-    [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/" 2>/dev/null)" = 200 ] && { HEALTHY=1; break; }
-    i=$((i+1)); sleep 1
-  done
-fi
-IP="$(ip route get 1 2>/dev/null | awk '{print $7; exit}')"; [ -z "$IP" ] && IP="$(uname -n 2>/dev/null)"
+i=0
+while [ "$i" -lt 5 ]; do
+  case "$PROBE_TOOL" in
+    curl) [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/" 2>/dev/null)" = 200 ] && { HEALTHY=1; break; } ;;
+    wget) wget -q -O /dev/null --timeout=3 "http://127.0.0.1:$PORT/" 2>/dev/null && { HEALTHY=1; break; } ;;
+    *)    break ;;
+  esac
+  i=$((i+1)); sleep 1
+done
+INSTALLED_VER="$("$SBIN/wakeroute" --version 2>/dev/null | head -1)"
+IP="$(ip route get 1 2>/dev/null | awk 'NR==1{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')"; [ -z "$IP" ] && IP="$(uname -n 2>/dev/null)"
 hdr "Done"
-if [ "$HEALTHY" = 1 ]; then ok "UI is up (HTTP 200 on :$PORT)"; else warn "UI not answering yet on :$PORT -- check: logread -e wakeroute"; fi
+[ -n "$INSTALLED_VER" ] && ok "version:  $INSTALLED_VER"
+if [ "$HEALTHY" = 1 ]; then ok "UI is up (HTTP 200 on :$PORT)"
+elif [ -z "$PROBE_TOOL" ]; then info "no curl or wget found -- health probe skipped; open http://${IP:-<router-ip>}:$PORT to verify"
+else warn "UI not answering yet on :$PORT -- check: logread -e wakeroute"; fi
 say "open  ->  http://${IP:-<router-ip>}:$PORT"
+native_summary
 echo ""
 echo "  status: $INITD/wakeroute status   |   logs: logread -e wakeroute"
-[ -x "$SB" ] || echo "  install sing-box ($PKG add sing-box) so you can Apply configs"
-echo "  uninstall: sh ./uninstall.sh  (add --purge to also delete config)"
+[ -x "$SB" ] || echo "  install sing-box ($PMINST sing-box) so you can Apply configs"
+if [ -f "$SRC/uninstall.sh" ]; then echo "  uninstall: sh ./uninstall.sh  (add --purge to also delete config)"
+else warn "uninstall.sh not found in $SRC -- check the tarball"; fi

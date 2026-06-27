@@ -17,6 +17,28 @@ func further_lineWith(s, sub string) string {
 	return ""
 }
 
+// --- scriptHeader: born-secure umask (iter-5 review finding) ----------------
+
+// TestScriptHeaderUmaskBornSecure asserts the provisioning script sets a
+// restrictive umask (077) before any secret-generating command, so generated
+// keys/certs/configs are never briefly world-readable on the fresh VPS. Checked
+// for every Option, since scriptHeader is shared by all fragments.
+func TestScriptHeaderUmaskBornSecure(t *testing.T) {
+	for _, o := range Options() {
+		s := BuildScript([]string{o.ID}, "")
+		iUmask := strings.Index(s, "umask 077")
+		if iUmask < 0 {
+			t.Errorf("%s: script missing 'umask 077' — secrets could be born world-readable", o.ID)
+			continue
+		}
+		for _, gen := range []string{"genkey", "generate uuid", "generate reality-keypair", "openssl", "generate rand"} {
+			if i := strings.Index(s, gen); i >= 0 && i < iUmask {
+				t.Errorf("%s: secret-gen %q (idx %d) precedes 'umask 077' (idx %d)", o.ID, gen, i, iUmask)
+			}
+		}
+	}
+}
+
 // --- BuildScript: the WR_PROTO-before-WR_CLIENT_CONFIG invariant ------------
 
 // TestBuildScriptProtoMarkerPrecedesConfigPerProtocol asserts the documented

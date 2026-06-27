@@ -30,31 +30,31 @@ const (
 
 // Egress is one kernel routing destination with its assigned fwmark + routing table.
 type Egress struct {
-	Tag   string // model outbound tag (endpoint id, group id, "direct", "block")
-	Kind  EgressKind
-	Iface string // kernel ifname when Kind==EgressInterface
-	Mark  uint32 // fwmark (masked by Plan.Mask)
-	Table int    // routing table number
+	Tag   string     `json:"tag"` // model outbound tag (endpoint id, group id, "direct", "block")
+	Kind  EgressKind `json:"kind"`
+	Iface string     `json:"iface,omitempty"` // kernel ifname when Kind==EgressInterface
+	Mark  uint32     `json:"mark"`            // fwmark (masked by Plan.Mask)
+	Table int        `json:"table"`           // routing table number
 }
 
 // Zone is an IP-CIDR set whose matching destination traffic is marked for an egress.
 type Zone struct {
-	Name      string   // stable, nft-safe set name
-	EgressTag string   // which Egress this zone routes to
-	Mark      uint32   // == the egress mark (denormalized for rendering)
-	V4        []string // IPv4 CIDRs (normalized, sorted)
-	V6        []string // IPv6 CIDRs
+	Name      string   `json:"name"`         // stable, nft-safe set name
+	EgressTag string   `json:"egress_tag"`   // which Egress this zone routes to
+	Mark      uint32   `json:"mark"`         // == the egress mark (denormalized for rendering)
+	V4        []string `json:"v4,omitempty"` // IPv4 CIDRs (normalized, sorted)
+	V6        []string `json:"v6,omitempty"` // IPv6 CIDRs
 	// Domains is populated only when Options.CollectDomainZones is set (the Keenetic ipset+
 	// dnsmasq plane): the list's domain entries, which dnsmasq resolves into the zone's kernel
 	// ipset at query-time (so an 81k-domain list costs ~0 standing RAM — never pre-resolved).
 	// Empty on the OpenWrt nft path (domains there are warned and handled by sing-box).
-	Domains []string
+	Domains []string `json:"domains,omitempty"`
 }
 
 // Warning flags model content the IP-based Phase-1 compiler does not kernel-route.
 type Warning struct {
-	Scope string // rule/list id
-	Msg   string
+	Scope string `json:"scope"` // rule/list id
+	Msg   string `json:"msg"`
 }
 
 // Flowtable is the optional Phase-1b flow-offload datapath: general (UNmarked) LAN↔WAN
@@ -64,19 +64,20 @@ type Warning struct {
 // RenderNft/RenderTeardown snapshot/restore it under the fail-safe for free — we never
 // touch fw4's uci flow_offloading. See docs/ARCHITECTURE_NATIVE_FIRST.md "Phase 1a/1b".
 type Flowtable struct {
-	Devices []string // netdevs to offload (WAN uplink + LAN bridge); awg* tunnels excluded
-	HW      bool     // emit `flags offload` for hardware PPE offload (vs software only)
+	Devices []string `json:"devices,omitempty"` // netdevs to offload (WAN uplink + LAN bridge); awg* tunnels excluded
+	HW      bool     `json:"hw,omitempty"`      // emit `flags offload` for hardware PPE offload (vs software only)
 }
 
 // Plan is the compiled kernel-routing plan for hybrid mode.
 type Plan struct {
-	Table     string   // nft table name (own table, coexists with fw4)
-	Mask      uint32   // fwmark mask owned by this plan
-	Egresses  []Egress // sorted: wan first, then the rest by tag
-	Zones     []Zone   // sorted by name
-	BypassV4  []string // kernel endpoints' own server IPs → main table (anti-loop)
-	BypassV6  []string
-	Flowtable *Flowtable // optional Phase-1b flow-offload (nil = no offload, the default)
+	Table      string     `json:"table"`               // nft table name (own table, coexists with fw4)
+	Mask       uint32     `json:"mask"`                // fwmark mask owned by this plan
+	Egresses   []Egress   `json:"egresses"`            // sorted: wan first, then the rest by tag
+	Zones      []Zone     `json:"zones"`               // sorted by name
+	BypassV4   []string   `json:"bypass_v4,omitempty"` // kernel endpoints' own server IPs → main table (anti-loop)
+	BypassV6   []string   `json:"bypass_v6,omitempty"`
+	Flowtable  *Flowtable `json:"flowtable,omitempty"`   // optional Phase-1b flow-offload (nil = no offload, the default)
+	MasqIfaces []string   `json:"masq_ifaces,omitempty"` // kernel tunnel ifaces needing forwarded-LAN MASQUERADE (de-duped, stable order)
 }
 
 // Options tune the marking/table scheme (defaults mirror the keen-pbr layout).
@@ -142,6 +143,15 @@ func kernelIface(e *model.Endpoint) string {
 	}
 }
 
+// isExternalEndpoint reports whether the outbound tag refers to an EngineExternal endpoint
+// (an adopted OS-owned tunnel like awg0). Both EngineExternal and EngineAmneziaWG resolve to
+// EgressInterface, but only EngineExternal gets the v4-only fail-closed posture — AWG endpoints
+// can carry IPv6 CIDRs normally.
+func isExternalEndpoint(p *model.Profile, tag string) bool {
+	e := p.EndpointByID(tag)
+	return e != nil && e.Engine == model.EngineExternal
+}
+
 // Compile turns the profile into a kernel-routing Plan plus warnings for anything the
 // IP-based Phase-1 compiler cannot kernel-route (domains, geoip/geosite rule-sets,
 // group failover, proxy-engine targets).
@@ -150,7 +160,7 @@ func Compile(p *model.Profile, opt Options) (*Plan, []Warning, error) {
 	if p == nil {
 		return nil, nil, fmt.Errorf("nil profile")
 	}
-	plan := &Plan{Table: opt.Table, Mask: opt.MarkMask}
+	plan := &Plan{Table: opt.Table, Mask: opt.MarkMask, Zones: []Zone{}}
 	var warns []Warning
 	warn := func(scope, msg string) { warns = append(warns, Warning{Scope: scope, Msg: msg}) }
 
@@ -238,7 +248,17 @@ func Compile(p *model.Profile, opt Options) (*Plan, []Warning, error) {
 			continue
 		}
 		if k, _, ok := resolveEgress(r.ID, r.Outbound); ok && k != "" {
-			addZone("rule_"+nftName(r.ID), r.Outbound, r.IPCIDR, r.ID)
+			cidrsForZone := r.IPCIDR
+			if k == EgressInterface && isExternalEndpoint(p, r.Outbound) {
+				// Adopted native-OS interface (EngineExternal): v4-only fail-closed posture.
+				// IPv6 flows stay in the tunnel's own routing table rather than be fwmark-routed.
+				// AmneziaWG/WG-managed interfaces also resolve to EgressInterface but CAN carry
+				// IPv6, so the guard is on the engine type, not just the egress kind.
+				cidrsForZone, _, _ = classifyCIDRs(cidrsForZone)
+			}
+			if len(cidrsForZone) > 0 {
+				addZone("rule_"+nftName(r.ID), r.Outbound, cidrsForZone, r.ID)
+			}
 		}
 	}
 	for i := range p.RoutingLists {
@@ -261,7 +281,14 @@ func Compile(p *model.Profile, opt Options) (*Plan, []Warning, error) {
 			continue
 		}
 		if k, _, ok := resolveEgress(rl.ID, rl.Outbound); ok && k != "" {
-			addZone("list_"+nftName(rl.ID), rl.Outbound, cidrs, rl.ID)
+			cidrList := cidrs
+			if k == EgressInterface && isExternalEndpoint(p, rl.Outbound) {
+				// Adopted native-OS interface only: v4-only fail-closed posture.
+				cidrList, _, _ = classifyCIDRs(cidrList)
+			}
+			if len(cidrList) > 0 {
+				addZone("list_"+nftName(rl.ID), rl.Outbound, cidrList, rl.ID)
+			}
 		}
 	}
 
@@ -272,11 +299,41 @@ func Compile(p *model.Profile, opt Options) (*Plan, []Warning, error) {
 		e := &p.Endpoints[i]
 		// Only ENABLED kernel endpoints (a disabled one is never emitted/used, and
 		// generator.endpointBypass also skips it — keep the two in sync).
-		if e.Enabled && kernelIface(e) != "" && e.Server != "" {
+		if !e.Enabled || kernelIface(e) == "" {
+			continue
+		}
+		if e.Server != "" {
 			bypass = append(bypass, e.Server)
+		}
+		// External endpoints carry the peer IP in params["endpoint_ip"], not in Server.
+		// Mirror generator.endpointBypass so the two bypass sets never diverge.
+		if eip, ok := e.Params["endpoint_ip"].(string); ok && eip != "" {
+			bypass = append(bypass, eip)
 		}
 	}
 	plan.BypassV4, plan.BypassV6, _ = classifyCIDRs(bypass)
+
+	// MasqIfaces: every enabled KERNEL-routed endpoint's iface needs a forwarded-LAN
+	// MASQUERADE regardless of whether it has active zones (an endpoint may be the egress
+	// for a v4-only routing list that was already filtered above, or may not be in usedEgress
+	// at all — e.g. all its CIDRs were IPv6). This covers BOTH EngineExternal (an adopted OS
+	// tunnel, iface in Params) AND EngineAmneziaWG (WR's own wr-* device): forwarded LAN
+	// packets leave with their RFC1918 source, so without a MASQUERADE the tunnel peer has no
+	// return route and every LAN client on that zone is black-holed. Drive the masq set off
+	// the SAME kernelIface() test that builds the egress zones so the two never diverge.
+	{
+		seen := map[string]bool{}
+		for i := range p.Endpoints {
+			e := &p.Endpoints[i]
+			if !e.Enabled {
+				continue
+			}
+			if ifc := kernelIface(e); ifc != "" && !seen[ifc] {
+				seen[ifc] = true
+				plan.MasqIfaces = append(plan.MasqIfaces, ifc)
+			}
+		}
+	}
 
 	// Assign marks + tables. WAN is always present (the bypass + any "direct" zone use it);
 	// then each other used egress, in stable order.

@@ -38,6 +38,7 @@ type stat struct {
 	lastLatency                      int
 	state                            State
 	reconnects                       int
+	consecFail                       int   // consecutive Down probes not yet promoted to a flip (hysteresis)
 	firstSeen, lastChange, lastProbe int64 // unix ms
 
 	// traffic (from Clash /connections, best-effort)
@@ -45,6 +46,38 @@ type stat struct {
 	rateUp, rateDown     int64 // bytes/s
 	totalUp, totalDown   int64 // approx bytes since monitoring started
 	lastConnSample       int64
+
+	// Rolling window of the last healthWindow probe OUTCOMES (Alive/Down only), so
+	// SuccessRate and AvgLatencyMs reflect RECENT health rather than the lifetime average —
+	// a long-healthy endpoint that just died would otherwise keep a ~99% ratio for hours.
+	// Circular: slots 0..recentN-1 are valid until full, then all healthWindow slots are.
+	recent    [healthWindow]probeSample
+	recentN   int
+	recentPos int
+}
+
+// probeSample is one windowed probe outcome; latency is valid only when ok.
+type probeSample struct {
+	ok      bool
+	latency int
+}
+
+// healthWindow is the rolling-window size for SuccessRate/AvgLatencyMs (~5 min at the
+// default 10s probe cadence).
+const healthWindow = 30
+
+// flapThreshold is how many CONSECUTIVE Down probes must be seen before the monitor flips
+// an endpoint's state to Down. It debounces a single transient probe failure (which would
+// otherwise zero uptime + inflate the reconnect counter) on a lossy path. Demo mode uses 1
+// (instant showcase). Recovery (Alive) and Unknown always commit immediately.
+const flapThreshold = 2
+
+func (s *stat) pushSample(p probeSample) {
+	s.recent[s.recentPos] = p
+	s.recentPos = (s.recentPos + 1) % healthWindow
+	if s.recentN < healthWindow {
+		s.recentN++
+	}
 }
 
 // View is the JSON snapshot of a target's health + stats.
@@ -131,14 +164,29 @@ func (m *Monitor) record(id, name, kind string, state State, latency int, now in
 		s.ok++
 		s.sumLatency += int64(latency)
 		s.lastLatency = latency
+		s.consecFail = 0
+		s.pushSample(probeSample{ok: true, latency: latency})
 	case Down:
 		s.fail++
+		s.consecFail++
+		s.pushSample(probeSample{ok: false})
 	}
-	if state != s.state {
-		if state == Alive && s.state == Down {
+	// Hysteresis: hold the current state until flapThreshold consecutive Down probes confirm
+	// a real outage, so one dropped probe on a lossy path doesn't flip Down→Alive (zeroing
+	// uptime + counting a bogus reconnect). Alive/Unknown commit immediately; demo is instant.
+	threshold := flapThreshold
+	if m.demo {
+		threshold = 1
+	}
+	commit := state
+	if state == Down && s.consecFail < threshold {
+		commit = s.state
+	}
+	if commit != s.state {
+		if commit == Alive && s.state == Down {
 			s.reconnects++
 		}
-		s.state = state
+		s.state = commit
 		s.lastChange = now
 	}
 }
@@ -242,6 +290,9 @@ func (m *Monitor) tick(ctx context.Context) {
 		}(tg)
 	}
 	wg.Wait()
+	if tctx.Err() != nil {
+		return
+	}
 	m.sampleTraffic(tctx, now)
 }
 
@@ -286,6 +337,18 @@ func (m *Monitor) sampleTraffic(ctx context.Context, now int64) {
 			}
 		}
 		s.activeUp, s.activeDown, s.lastConnSample = a[0], a[1], now
+	}
+	// Decay endpoints that contributed NO bytes this tick (all their connections closed,
+	// e.g. traffic moved off them after a failover) to 0 — otherwise rateUp/rateDown keep
+	// their last positive value on the dashboard/metrics forever. Reset the active baseline
+	// too so a later reappearance computes a fresh delta, not a spike against a stale total.
+	for id, s := range m.stats {
+		if _, ok := agg[id]; ok {
+			continue
+		}
+		s.rateUp, s.rateDown = 0, 0
+		s.activeUp, s.activeDown = 0, 0
+		s.lastConnSample = now
 	}
 }
 
@@ -337,13 +400,24 @@ func (m *Monitor) demoTick(now int64) {
 	}
 }
 
-// ProbeOne probes a single target immediately and returns its view.
+// ProbeOne probes a single target immediately and returns its view. An id that
+// matches no current target is NOT probed or recorded — record() would otherwise
+// create a permanent m.stats entry keyed by the (caller-supplied) id, so an
+// attacker hitting POST /api/health/test/{random} could grow the map without
+// bound. For an unknown id we return an empty/Unknown View (toView's nil path)
+// without touching m.stats.
 func (m *Monitor) ProbeOne(ctx context.Context, id string) View {
 	var tgt target
+	found := false
 	for _, tg := range m.targets() {
 		if tg.id == id {
 			tgt = tg
+			found = true
+			break
 		}
+	}
+	if !found {
+		return toView(id, nil, nowMS())
 	}
 	tctx, cancel := context.WithTimeout(ctx, time.Duration(m.timeoutMS)*time.Millisecond+5*time.Second)
 	defer cancel()
@@ -468,11 +542,26 @@ func toView(id string, s *stat, now int64) View {
 	default:
 		v.Handshake = "unknown"
 	}
-	if def := s.ok + s.fail; def > 0 {
+	// SuccessRate + AvgLatencyMs over the rolling window (recent health). Fall back to the
+	// lifetime accumulators only before any windowed sample exists (recentN == 0).
+	if s.recentN > 0 {
+		okN, latSum, latN := 0, 0, 0
+		for i := 0; i < s.recentN; i++ {
+			if p := s.recent[i]; p.ok {
+				okN++
+				latSum += p.latency
+				latN++
+			}
+		}
+		v.SuccessRate = okN * 100 / s.recentN
+		if latN > 0 {
+			v.AvgLatencyMs = latSum / latN
+		}
+	} else if def := s.ok + s.fail; def > 0 {
 		v.SuccessRate = s.ok * 100 / def
-	}
-	if s.ok > 0 {
-		v.AvgLatencyMs = int(s.sumLatency) / s.ok
+		if s.ok > 0 {
+			v.AvgLatencyMs = int(s.sumLatency) / s.ok
+		}
 	}
 	if s.state == Alive {
 		v.UptimeS = (now - s.lastChange) / 1000

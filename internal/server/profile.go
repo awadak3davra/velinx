@@ -180,6 +180,7 @@ func (s *Server) handleRoutingStatus(w http.ResponseWriter, r *http.Request) {
 				res[i] = cur
 				return
 			}
+			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			cur.Status = resp.StatusCode
 			cur.OK = resp.StatusCode >= 200 && resp.StatusCode < 400
@@ -241,13 +242,25 @@ func (s *Server) SyncPlugins() {
 	}
 	s.syncPluginsFor(res) // brings AmneziaWG/olcRTC interfaces UP first
 	if newPlan != nil {
-		// Hybrid: install the kernel plane now that the interfaces exist (best-effort —
-		// a later Apply re-establishes; applyPBR records pbrPlan=nil on failure).
-		if err := s.applyPBR(newPlan); err != nil {
-			log.Printf("SyncPlugins: boot PBR apply failed: %v", err)
+		// Hybrid OR fast/native-only: install the kernel plane now that the interfaces exist
+		// (best-effort — a later Apply re-establishes; applyPBR records pbrPlan=nil on failure).
+		pbrErr := s.applyPBR(newPlan)
+		if pbrErr != nil {
+			log.Printf("SyncPlugins: boot PBR apply failed: %v", pbrErr)
+		}
+		// Native-only boot arm: once the kernel plane is up, STOP the core so a stale
+		// singbox.json the boot autostart (main.go) may have launched does not run a
+		// redundant/black-holing TUN over the native datapath. Gated on a successful kernel
+		// plane (pbrErr == nil) so we never drop the core onto a failed install; Stop() is a
+		// no-op when the core isn't running and clears Desired() so the watchdog leaves it
+		// down (§d). Recomputed here from the SAME (config, profile) that produced newPlan.
+		if pbrErr == nil && s.datapathNativeOnly(c, &p) {
+			if err := s.singbox.Stop(); err != nil {
+				log.Printf("SyncPlugins: native-only sing-box stop failed: %v", err)
+			}
 		}
 	} else if s.pbrRunner != nil {
-		// Not hybrid: clear any stale "wakeroute_pbr" table left by a prior hybrid era
+		// Not hybrid/fast: clear any stale "wakeroute_pbr" table left by a prior hybrid era
 		// (e.g. the user switched to tun via Settings and never Applied, then rebooted —
 		// the in-memory pbrPlan is nil so there's nothing else to tear down). Idempotent.
 		_ = (&pbr.Plan{Table: "wakeroute_pbr"}).Teardown(s.pbrRunner, pbr.Options{})
@@ -272,83 +285,111 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	// genOptionsWithPlan compiles the hybrid Plan ONCE and returns it, so the kernel plane
 	// (applyPBR below) and the TUN route_exclude in opts are the same compile — never desync.
 	opts, newPlan := s.genOptionsWithPlan(&p, c)
+	// Native-only verdict from the SAME (config, profile) the kernel plane is built from
+	// (single source of truth, docs/NATIVE_P4_DESIGN.md §b). When true the kernel plane
+	// (newPlan) provably carries everything and sing-box is droppable: we skip the
+	// singbox.json write/check/rename + reload/start block entirely and STOP the core after
+	// the kernel plane is up (§c, §g). Conservative: it is true only in fast mode with every
+	// endpoint kernel-native and nothing surviving into sing-box — on any doubt it is false
+	// and the path below is byte-identical to today (KEEP sing-box).
+	nativeOnly := s.datapathNativeOnly(c, &p)
+
 	res, err := generator.Generate(&p, opts)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	data, err := json.MarshalIndent(res.Config, "", "  ")
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 
-	path := c.SingBox.Config
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	tmp := path + ".tmp"
-	if err := atomicfile.WriteSynced(tmp, data, 0o600); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
+	var backupErr, reloadErr, commitErr string
 	checked := false
-	if s.singbox.Available() {
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		defer cancel()
-		if err := s.singbox.CheckConfig(ctx, tmp); err != nil {
-			_ = os.Remove(tmp)
-			writeErr(w, http.StatusBadRequest, err.Error())
+	reloaded := false
+	path := c.SingBox.Config
+
+	if !nativeOnly {
+		data, err := json.MarshalIndent(res.Config, "", "  ")
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		checked = true
-	}
 
-	// Snapshot the pre-window config as the rollback baseline — but only at the
-	// FIRST apply of a fail-safe window. A second apply while a window is still
-	// open must NOT overwrite the baseline with the interim (unconfirmed, maybe
-	// broken) config, or a later rollback would restore that instead of the last
-	// known-good config.
-	var backupErr, reloadErr, commitErr string
-	if !s.failsafe.Status().Pending {
-		// A failed Backup means the fail-safe has no rollback target — surface + log it
-		// (don't abort: the PBR-fail and connectivity paths below already degrade safely
-		// when there's no .bak, and the user may still want to apply).
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		tmp := path + ".tmp"
+		if err := atomicfile.WriteSynced(tmp, data, 0o600); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		if s.singbox.Available() {
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			defer cancel()
+			if err := s.singbox.CheckConfig(ctx, tmp); err != nil {
+				_ = os.Remove(tmp)
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			checked = true
+		}
+
+		// Snapshot the pre-window config as the rollback baseline — but only at the
+		// FIRST apply of a fail-safe window. A second apply while a window is still
+		// open must NOT overwrite the baseline with the interim (unconfirmed, maybe
+		// broken) config, or a later rollback would restore that instead of the last
+		// known-good config.
+		if !s.failsafe.Status().Pending {
+			// A failed Backup means the fail-safe has no rollback target — surface + log it
+			// (don't abort: the PBR-fail and connectivity paths below already degrade safely
+			// when there's no .bak, and the user may still want to apply).
+			if err := s.singbox.Backup(); err != nil {
+				backupErr = err.Error()
+				log.Printf("handleApply: backup (rollback snapshot) failed: %v — fail-safe may be unable to restore", err)
+			}
+			s.snapshotPBRBaseline()    // capture the pre-window kernel plan as the rollback target
+			s.snapshotPluginBaseline() // capture the pre-window engine-plugin specs too
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		atomicfile.SyncDir(filepath.Dir(path)) // make the rename durable across power loss
+
+		if s.singbox.Running() {
+			if err := s.singbox.Reload(); err != nil {
+				reloadErr = err.Error()
+				log.Printf("handleApply: sing-box reload failed: %v", err)
+			} else {
+				reloaded = true
+			}
+		} else if s.singbox.Available() {
+			// Not running yet — bring it up so the new config takes effect (and the
+			// watchdog starts supervising it).
+			if err := s.singbox.Start(); err != nil {
+				reloadErr = err.Error()
+				log.Printf("handleApply: sing-box start failed: %v", err)
+			} else {
+				reloaded = true
+			}
+		}
+	} else if !s.failsafe.Status().Pending {
+		// Native-only: do NOT write/check/rename singbox.json or reload the core (the kernel
+		// plane carries everything). The previous singbox.json is left untouched on disk so a
+		// transition back to needs-core is instant; only the live process is stopped (below).
+		// Still snapshot the rollback baseline (kept sing-box-independent): Backup() backs up
+		// the existing config if one is present (no-op + nil error if not), and the kernel +
+		// plugin baselines are the real rollback target for native-only.
 		if err := s.singbox.Backup(); err != nil {
 			backupErr = err.Error()
 			log.Printf("handleApply: backup (rollback snapshot) failed: %v — fail-safe may be unable to restore", err)
 		}
-		s.snapshotPBRBaseline()    // capture the pre-window kernel plan as the rollback target
-		s.snapshotPluginBaseline() // capture the pre-window engine-plugin specs too
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	atomicfile.SyncDir(filepath.Dir(path)) // make the rename durable across power loss
-
-	reloaded := false
-	if s.singbox.Running() {
-		if err := s.singbox.Reload(); err != nil {
-			reloadErr = err.Error()
-			log.Printf("handleApply: sing-box reload failed: %v", err)
-		} else {
-			reloaded = true
-		}
-	} else if s.singbox.Available() {
-		// Not running yet — bring it up so the new config takes effect (and the
-		// watchdog starts supervising it).
-		if err := s.singbox.Start(); err != nil {
-			reloadErr = err.Error()
-			log.Printf("handleApply: sing-box start failed: %v", err)
-		} else {
-			reloaded = true
-		}
+		s.snapshotPBRBaseline()
+		s.snapshotPluginBaseline()
 	}
 
 	// (re)start engine plugins (AmneziaWG, olcRTC) for this config's chained outbounds.
+	// In native-only this brings the kernel-native interfaces UP BEFORE the core is stopped
+	// (§g: kernel plane up before TUN down → no traffic gap).
 	s.syncPluginsFor(res)
 
 	// Kernel PBR plane (hybrid only; newPlan is nil otherwise). Install the fwmark routes
@@ -391,6 +432,21 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Native-only: STOP the sing-box core now that the kernel plane is up (§c, §g). Ordering
+	// is load-bearing — applyPBR (the kernel carve-outs + general→WAN) and the plugin sync
+	// above are already live, so tearing the TUN/core down leaves no datapath gap. Gated on
+	// pbrErr == nil: if the kernel plane FAILED to install we keep sing-box as the fallback
+	// rather than drop the core onto a broken kernel plane (a non-save apply already rolled
+	// back + returned above; a save apply keeps the core up here). Stop() is a no-op when the
+	// core isn't running, clears Desired() so the watchdog won't fight it (§d), and SIGTERMs
+	// for a clean TUN teardown.
+	if nativeOnly && pbrErr == nil {
+		if err := s.singbox.Stop(); err != nil {
+			reloadErr = err.Error()
+			log.Printf("handleApply: native-only sing-box stop failed: %v", err)
+		}
+	}
+
 	if body.Save {
 		if err := s.singbox.Commit(); err != nil {
 			commitErr = err.Error()
@@ -398,7 +454,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		s.failsafe.Confirm()
 	} else {
-		s.armFailSafe()
+		// Pass the native-only verdict so the rollback window judges connectivity by the
+		// kernel-plane ping, not by sing-box liveness (which is intentionally down here).
+		s.armFailSafe(nativeOnly)
 	}
 
 	resp := map[string]any{
@@ -439,6 +497,7 @@ func (s *Server) handleSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	text := body.Text
+	name := "" // subscription display name, from the server's Profile-Title header (URL path only)
 	if body.URL != "" {
 		u, perr := url.Parse(body.URL)
 		if perr != nil {
@@ -469,9 +528,21 @@ func (s *Server) handleSubscription(w http.ResponseWriter, r *http.Request) {
 		}
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		text = string(b)
+		name = subscriptionTitle(resp.Header) // "" when the server sends no usable title
+		// Remember the URL so the opt-in periodic refresh (SubscriptionRefreshLoop)
+		// can re-fetch it later and add newly-rotated endpoints. This does NOT enable
+		// refresh (RefreshHours stays untouched — opt-in); it only records the source.
+		s.cfgMu.Lock()
+		if s.cfg.Subscription.URL != body.URL {
+			s.cfg.Subscription.URL = body.URL
+			if err := s.cfg.Save(); err != nil {
+				log.Printf("wakeroute: could not persist subscription URL for auto-refresh: %v", err)
+			}
+		}
+		s.cfgMu.Unlock()
 	}
 	eps, errs := importer.ParseSubscription(text)
-	writeJSON(w, http.StatusOK, map[string]any{"endpoints": eps, "errors": errs})
+	writeJSON(w, http.StatusOK, map[string]any{"endpoints": eps, "errors": errs, "name": name})
 }
 
 // subscriptionFetchClient is an http.Client for fetching a user-supplied
@@ -498,6 +569,42 @@ func (s *Server) subscriptionFetchClient() *http.Client {
 	}
 }
 
+// errInternalHost marks a target that an SSRF guard must refuse (resolves to an
+// internal address). The TLS-probe guard (refuseInternalHost) returns it.
+var errInternalHost = fmt.Errorf("refusing to reach an internal address")
+
+// cgnatNet is the RFC 6598 carrier-grade NAT (shared address) range 100.64.0.0/10.
+// net.IP.IsPrivate covers only RFC1918/ULA, so a host resolving into CGNAT would
+// otherwise read as "external" and be dialed — letting a subscription URL / Reality
+// probe reach a carrier-side or on-link CGNAT service. Parsed once at init.
+var cgnatNet = mustCIDR("100.64.0.0/10")
+
+func mustCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic("server: bad CIDR " + s + ": " + err.Error())
+	}
+	return n
+}
+
+// isInternalDialIP reports whether ip is one the SSRF guards must refuse: loopback,
+// RFC1918/ULA private, RFC6598 CGNAT (100.64.0.0/10), link-local (unicast incl.
+// 169.254.169.254 metadata, and multicast), or the unspecified address. Single source
+// of truth shared by blockInternalDial (subscription-fetch dial guard) and
+// refuseInternalHost (the Reality dest/SNI probe guard) so the two can never diverge.
+func isInternalDialIP(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	// Normalize IPv4-mapped-IPv6 to 4 bytes so the CGNAT /10 Contains check matches
+	// consistently with the IsPrivate family above (which already handles the mapped form).
+	if v4 := ip.To4(); v4 != nil {
+		return cgnatNet.Contains(v4)
+	}
+	return false
+}
+
 // blockInternalDial rejects a dial to a loopback/private/link-local/unspecified
 // address. address is host:port with host already resolved to an IP literal.
 func blockInternalDial(_, address string, _ syscall.RawConn) error {
@@ -509,7 +616,7 @@ func blockInternalDial(_, address string, _ syscall.RawConn) error {
 	if ip == nil {
 		return fmt.Errorf("could not parse dial address %q", address)
 	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+	if isInternalDialIP(ip) {
 		return fmt.Errorf("refusing to fetch from internal address %s", ip)
 	}
 	return nil
@@ -524,12 +631,16 @@ func (s *Server) handleBulkEndpoints(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	// Skip content-duplicate imports: re-fetching a subscription (fresh IDs each time)
+	// would otherwise pile up identical endpoints. An incoming endpoint whose ID already
+	// exists is an in-place update, not a dupe, and is kept (see importer.DedupeNew).
+	eps, dupes := importer.DedupeNew(s.store.Profile().Endpoints, body.Endpoints)
 	// Non-fatal: each UpsertEndpoint persists immediately, so bailing on the Nth
 	// error would leave 1..N-1 saved while reporting total failure. Accumulate
 	// per-endpoint errors and always report the true saved count.
 	saved := 0
-	var errs []string
-	for _, e := range body.Endpoints {
+	errs := []string{}
+	for _, e := range eps {
 		if e.ID == "" {
 			errs = append(errs, "skipped an endpoint with no id")
 			continue
@@ -540,7 +651,7 @@ func (s *Server) handleBulkEndpoints(w http.ResponseWriter, r *http.Request) {
 		}
 		saved++
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"saved": saved, "errors": errs})
+	writeJSON(w, http.StatusOK, map[string]any{"saved": saved, "duplicates": dupes, "errors": errs})
 }
 
 // routingMode resolves the effective routing mode from a config snapshot: "" derives
@@ -651,6 +762,22 @@ func (s *Server) genOptions(p *model.Profile) generator.Options {
 	return opts
 }
 
+// datapathNativeOnly is the authoritative "skip sing-box" verdict for an apply/sync. It
+// resolves the SAME routing mode (s.routingMode) that genOptionsWithPlan uses to drive the
+// pbr compile, then delegates the (conservative) decision to the pure shared predicate
+// generator.DatapathNativeOnly. Computing it from the identical (config, profile) the kernel
+// plane is built from keeps a single source of truth — the verdict can never disagree with
+// which mode/plan handleApply + SyncPlugins actually install.
+//
+// Fail-safe by construction (see docs/NATIVE_P4_DESIGN.md §h): DatapathNativeOnly returns
+// true ONLY when the kernel plane provably carries everything (fast mode, every endpoint
+// kernel-native, default egress direct/WAN, nothing surviving into sing-box) — on ANY doubt
+// it returns false and sing-box is KEPT. Skipping the core is the only change that can
+// black-hole traffic; this predicate is the gate that makes the skip safe.
+func (s *Server) datapathNativeOnly(c config.Config, p *model.Profile) bool {
+	return generator.DatapathNativeOnly(p, s.routingMode(c))
+}
+
 // applyPBR installs newPlan as the kernel PBR plane, or tears the plane down when nil.
 // One pbrMu-held transaction: Teardown the previously-installed plan first (the nft table
 // is self-flushing on its fixed name, so this only matters to clear ip rules/routes in
@@ -707,6 +834,11 @@ func (s *Server) restorePBRBaseline() {
 	}
 	if s.pbrBaseline != nil {
 		if err := s.pbrBaseline.Apply(s.pbrRunner, pbr.Options{}); err != nil {
+			// Apply isn't transactional across nft+ip; tear the partial baseline install back
+			// out (best-effort) so no orphan ip rules/routes survive to silently mis-route a
+			// dst into a now-stale table — mirrors applyPBR's failure path. Record an
+			// indeterminate state so the next first-apply cleanly reinstalls.
+			_ = s.pbrBaseline.Teardown(s.pbrRunner, pbr.Options{})
 			log.Printf("fail-safe: PBR baseline restore failed: %v", err)
 			s.pbrPlan = nil
 			return

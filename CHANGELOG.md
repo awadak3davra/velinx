@@ -3,6 +3,54 @@
 All notable changes to WakeRoute are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.3]
+
+### Added
+- **Subscription auto-refresh** — keep an imported subscription current automatically. Turn it
+  on in Settings (pick an interval, or hit *Refresh now*) and WakeRoute periodically re-fetches
+  the URL and adds any servers the provider has rotated in, with no manual re-import. The card
+  shows when it last ran and how many connections it added.
+- **Failover groups in the Clash subscription** — a Clash / Clash-Meta client subscribed to
+  WakeRoute now receives your failover groups as real `url-test` / `fallback` / `select` groups,
+  so it keeps the same automatic best-server selection the panel does instead of a flat list.
+- **SSH host-key pinning for the server provisioner** — provisioning a remote VPS now pins its
+  SSH host key to a persistent file (so a later changed key is caught) and prints the key's
+  SHA-256 fingerprint, so you can verify it out-of-band against your provider's console.
+- **A larger error knowledgebase** — Diagnostics now explains more common sing-box / AmneziaWG
+  failures in plain language with a fix: config parse errors, connection-reset (DPI) drops,
+  IPv6 *network unreachable*, TLS-handshake timeouts, AmneziaWG `awg-quick` DNS/route conflicts,
+  and a failover tier whose health check can't reach its target.
+
+### Changed
+- **Diagnostics show how often each problem occurred** — a recurring error now carries a ×N
+  count and rises to the top, so a persistent failure stands out from a one-off blip.
+
+### Fixed
+- **The Clash subscription now imports cleanly into real Clash / Clash-Meta clients** — boolean
+  fields (`tls`, `skip-cert-verify`, `udp-over-tcp`) and the WARP `reserved` list are emitted in
+  the exact YAML shapes the client expects; before, they were quoted in a way a strict parser
+  rejected, which could fail the whole config.
+- **Importing two variants of the same server no longer drops one** — e.g. a WebSocket entry and
+  a Reality entry on the same host:port are kept as distinct connections (and auto-refresh
+  likewise picks up a server that switched transport or TLS).
+- **A corrupt or empty config no longer blocks start-up** — a zero-length `config` / `profile` /
+  `servers` file (the typical result of a power loss) is recreated with defaults instead of
+  bricking the panel; a failed config save no longer leaves memory and disk out of sync.
+- **OpenWrt routers with AmneziaWG are no longer told to install plain WireGuard** they already
+  have — the AmneziaWG kernel module carries vanilla WireGuard too.
+- **Share links escape special characters** in passwords and connection names correctly.
+- **Sturdier failover & supervision** — the Apply rollback can no longer fire twice, and the
+  sing-box watchdog won't restart a core you deliberately stopped; a boot-time config-generation
+  error is logged instead of silently leaving routing down.
+- More accurate per-interface ping latency and per-connection speed tests.
+
+### Security
+- **Self-update is checksum-verified** — the WakeRoute binary is replaced only when its release
+  asset's SHA-256 digest is present and matches; the update tag and release metadata are now
+  validated and size-capped.
+- The subscription-fetch and reachability-probe guards also block carrier-grade-NAT
+  (`100.64.0.0/10`) targets, closing an SSRF gap.
+
 ## [0.3.2]
 
 ### Added

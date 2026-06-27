@@ -18,6 +18,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,7 +93,7 @@ func New(binDir, arch string, mirrors []string) *Updater {
 	if len(mirrors) == 0 {
 		mirrors = []string{""}
 	}
-	return &Updater{BinDir: binDir, Arch: arch, Mirrors: mirrors, hc: &http.Client{}}
+	return &Updater{BinDir: binDir, Arch: arch, Mirrors: mirrors, hc: &http.Client{Timeout: 30 * time.Second}}
 }
 
 // sanitizeMirrors keeps only usable mirror prefixes: the "" sentinel (direct, no
@@ -189,11 +190,16 @@ func (u *Updater) apiGet(ctx context.Context, path string, v any) error {
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			lastErr = fmt.Errorf("%s: status %d", url, resp.StatusCode)
 			continue
 		}
-		err = json.NewDecoder(resp.Body).Decode(v)
+		// Cap the metadata body the same way download() caps asset bodies: a release/tags
+		// list is a few KB, so 8 MiB is generous, but an unbounded Decode would let a
+		// hostile or misbehaving mirror stream arbitrary bytes into RAM on a small-RAM router.
+		err = json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(v)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			lastErr = err
@@ -245,9 +251,57 @@ func (u *Updater) Tags(ctx context.Context, e Engine, limit int) ([]string, erro
 	return out, nil
 }
 
+// validTagSegRe constrains each path SEGMENT of a release tag to characters that are
+// unambiguous in a URL path (no '.'/'..' traversal, no query/fragment/space/control bytes),
+// so a caller- or config-supplied tag can't traverse or inject into the api.github.com path.
+var validTagSegRe = regexp.MustCompile(`^[A-Za-z0-9._+-]+$`)
+
+// validateTag rejects an empty tag, empty/"."/".." path segments, and any character outside
+// the allowed set. A single embedded '/' is permitted because some engines genuinely tag
+// releases with a slash (e.g. apernet/hysteria's "app/v2.0.0"); the GitHub API addresses such
+// a tag as .../releases/tags/app/v2.0.0, so the slash must survive (each segment is still
+// PathEscaped at use). Leading/trailing/double slashes and "../" traversal are rejected.
+func validateTag(tag string) error {
+	if tag == "" {
+		return fmt.Errorf("empty release tag")
+	}
+	segs := strings.Split(tag, "/")
+	for _, s := range segs {
+		if s == "" {
+			return fmt.Errorf("invalid release tag %q: empty path segment (no leading/trailing/double slash)", tag)
+		}
+		if s == "." || s == ".." {
+			return fmt.Errorf("invalid release tag %q: path traversal not allowed", tag)
+		}
+		if !validTagSegRe.MatchString(s) {
+			return fmt.Errorf("invalid release tag %q: only letters, digits, . _ + - and a path-separating / are allowed", tag)
+		}
+	}
+	return nil
+}
+
+// escapeTagPath validates tag and returns it with each '/'-separated segment PathEscaped,
+// rejoined with '/'. Use for the .../releases/tags/<tag> path so reserved bytes in a segment
+// can't alter the URL structure while a legitimate slashed tag (e.g. "app/v2.0.0") still
+// resolves.
+func escapeTagPath(tag string) (string, error) {
+	if err := validateTag(tag); err != nil {
+		return "", err
+	}
+	segs := strings.Split(tag, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/"), nil
+}
+
 func (u *Updater) release(ctx context.Context, e Engine, tag string) (Release, error) {
+	esc, err := escapeTagPath(tag)
+	if err != nil {
+		return Release{}, err
+	}
 	var r Release
-	err := u.apiGet(ctx, "/repos/"+e.Repo+"/releases/tags/"+tag, &r)
+	err = u.apiGet(ctx, "/repos/"+e.Repo+"/releases/tags/"+esc, &r)
 	return r, err
 }
 
@@ -283,7 +337,7 @@ func (u *Updater) Install(ctx context.Context, e Engine, tag string) (string, er
 		return "", fmt.Errorf("no %s asset for arch %q in %s %s", e.ID, u.Arch, e.ID, tag)
 	}
 
-	data, err := u.download(ctx, asset.URL)
+	data, err := u.download(ctx, asset.URL, dlCap(asset.Size))
 	if err != nil {
 		return "", fmt.Errorf("download %s: %w", asset.Name, err)
 	}
@@ -314,7 +368,18 @@ func (u *Updater) Install(ctx context.Context, e Engine, tag string) (string, er
 	return rel.Tag, nil
 }
 
-func (u *Updater) download(ctx context.Context, rawURL string) ([]byte, error) {
+// dlCap bounds how many bytes download buffers in RAM: the asset's known size plus a small
+// margin, so a misbehaving or hostile mirror can't stream far more than the expected archive
+// into memory on a small-RAM router. Falls back to a flat ceiling when the size is unknown
+// (older GitHub releases omit it).
+func dlCap(size int64) int64 {
+	if size > 0 {
+		return size + 1<<20
+	}
+	return 96 << 20
+}
+
+func (u *Updater) download(ctx context.Context, rawURL string, maxBytes int64) ([]byte, error) {
 	var lastErr error
 	for _, m := range u.Mirrors {
 		url := rawURL
@@ -337,15 +402,44 @@ func (u *Updater) download(ctx context.Context, rawURL string) ([]byte, error) {
 			lastErr = fmt.Errorf("%s: status %d", url, resp.StatusCode)
 			continue
 		}
-		b, err := io.ReadAll(io.LimitReader(resp.Body, 96<<20))
+		ct := resp.Header.Get("Content-Type")
+		b, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 		resp.Body.Close()
 		if err != nil {
 			lastErr = err
 			continue
 		}
+		// A real release asset is an archive (gzip/zip/xz magic) or a raw ELF — never an
+		// HTML/error page. A mirror in a censored region can answer 200 with an
+		// interstitial/captcha/error page; without this check those bytes would be
+		// installed verbatim as the "binary" (esp. for raw, non-archive assets, where the
+		// archive parser can't catch it) and the next start would fail to exec it. Reject
+		// and fall through to the next mirror.
+		if looksLikeHTML(ct, b) {
+			lastErr = fmt.Errorf("%s: response looks like an HTML/error page, not a binary asset", url)
+			continue
+		}
 		return b, nil
 	}
 	return nil, lastErr
+}
+
+// looksLikeHTML reports whether a fetched asset is actually an HTML page (a mirror
+// interstitial, captcha, or error page) rather than a real release asset. Real assets are
+// archives or raw ELF binaries: none carry a text/html content-type or begin with an HTML/
+// XML marker. The body check is conservative (a binary never starts with '<') so it cannot
+// false-reject a legitimate download served with an odd content-type.
+func looksLikeHTML(contentType string, b []byte) bool {
+	if i := strings.IndexByte(contentType, ';'); i >= 0 {
+		contentType = contentType[:i]
+	}
+	switch strings.ToLower(strings.TrimSpace(contentType)) {
+	case "text/html", "application/xhtml+xml":
+		return true
+	}
+	t := bytes.TrimSpace(b)
+	return len(t) >= 2 && t[0] == '<' &&
+		(t[1] == '!' || t[1] == 'h' || t[1] == 'H' || t[1] == '?')
 }
 
 // --- asset matching + extraction ------------------------------------------
@@ -501,6 +595,21 @@ func verifyDigest(data []byte, digest string) error {
 	return nil
 }
 
+// verifyDigestRequired is the SELF-UPDATE variant: a non-empty, well-formed sha256 digest
+// is MANDATORY. Unlike verifyDigest (which skips when a release asset carries no digest, so
+// engine releases that lack one can still install best-effort), the WakeRoute binary runs as
+// root after a swap, so we refuse to install one we couldn't verify. WR's own CI publishes
+// every tarball as a GitHub Release asset, which GitHub auto-populates with a sha256 digest,
+// so a real release always passes; an absent digest means the mirror channel is the only
+// trust root and we decline rather than install unverified.
+func verifyDigestRequired(data []byte, digest string) error {
+	parts := strings.SplitN(digest, ":", 2)
+	if len(parts) != 2 || parts[0] != "sha256" || parts[1] == "" {
+		return fmt.Errorf("self-update refused: release asset has no sha256 digest to verify against (an unverified binary would run as root)")
+	}
+	return verifyDigest(data, digest)
+}
+
 // --- WakeRoute self-update -------------------------------------------------
 //
 // WakeRoute can update ITSELF (not just the engines it orchestrates) from its own
@@ -569,11 +678,13 @@ func (u *Updater) SelfUpdate(ctx context.Context, repo, tag, exePath string) (st
 	if asset == nil {
 		return "", fmt.Errorf("no wakeroute %s asset in %s", u.Arch, tag)
 	}
-	data, err := u.download(ctx, asset.URL)
+	data, err := u.download(ctx, asset.URL, dlCap(asset.Size))
 	if err != nil {
 		return "", fmt.Errorf("download %s: %w", asset.Name, err)
 	}
-	if err := verifyDigest(data, asset.Digest); err != nil {
+	// Self-update requires a present + matching digest (see verifyDigestRequired): the new
+	// binary runs as root, so we never install one the mirror channel served unverified.
+	if err := verifyDigestRequired(data, asset.Digest); err != nil {
 		return "", err
 	}
 	bin, err := fromTarGz(data, "wakeroute-"+u.Arch)
@@ -598,13 +709,20 @@ func (u *Updater) SelfUpdate(ctx context.Context, repo, tag, exePath string) (st
 		_ = os.Remove(staged)
 		return "", fmt.Errorf("staged wakeroute binary failed its sanity check (corrupt or wrong arch): %v", runErr)
 	}
-	// Back up the current binary on the same filesystem, then atomically swap. A
-	// half-written backup is worse than none (it poses as a valid rollback), so drop
-	// it on a write error rather than leaving a truncated .bak behind.
-	if cur, err := os.ReadFile(exePath); err == nil {
-		if werr := os.WriteFile(exePath+".bak", cur, 0o755); werr != nil {
-			_ = os.Remove(exePath + ".bak")
-		}
+	// Back up the current binary on the same filesystem, then atomically swap. The .bak is
+	// the reboot-safe rollback, so it is MANDATORY: if we can't read the running binary or
+	// write a COMPLETE backup, abort the swap rather than land a new daemon with no way back
+	// (a self-update that strands the router is the worst outcome). A half-written backup is
+	// worse than none — it poses as a valid rollback — so drop it on a write error too.
+	cur, err := os.ReadFile(exePath)
+	if err != nil {
+		_ = os.Remove(staged)
+		return "", fmt.Errorf("read current binary for rollback backup: %w", err)
+	}
+	if werr := os.WriteFile(exePath+".bak", cur, 0o755); werr != nil {
+		_ = os.Remove(exePath + ".bak")
+		_ = os.Remove(staged)
+		return "", fmt.Errorf("write rollback backup: %w", werr)
 	}
 	if err := os.Rename(staged, exePath); err != nil {
 		_ = os.Remove(staged)

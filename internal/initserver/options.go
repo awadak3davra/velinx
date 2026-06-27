@@ -10,7 +10,7 @@ type Option struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
 	Summary     string   `json:"summary"`
-	Details     []string `json:"details"`
+	Details     []string `json:"details,omitempty"`
 	Port        int      `json:"port"`
 	Transport   string   `json:"transport"`
 	Recommended bool     `json:"recommended"`
@@ -42,6 +42,36 @@ var catalog = []Option{
 		Detect:      func(c string) bool { return strings.Contains(c, "[Interface]") },
 	},
 	{
+		ID:      ProtoWireGuard,
+		Name:    "WireGuard",
+		Summary: "Standard, interoperable WireGuard — fast and universally supported.",
+		Details: []string{
+			"Vanilla WireGuard (no DPI-obfuscation overhead), so any stock WireGuard client — mobile apps, in-kernel wg, routers — imports the generated .conf directly.",
+			"Best where WireGuard isn't blocked and you want maximum throughput and broad client compatibility; choose AmneziaWG instead where plain WireGuard is throttled or whitelisted.",
+			"Server listens on UDP :51821 (subnet 10.14.14.0/24, distinct from AmneziaWG's :51820) so both can run side by side; wakeroute generates the matching client automatically.",
+		},
+		Port:      51821,
+		Transport: "udp",
+		Script:    scriptWireGuard,
+		// A plain WireGuard .conf has an [Interface] block but NONE of AmneziaWG's
+		// obfuscation params (Jc/Jmin/Jmax/S1/S2/H1-H4). Both schemes share the
+		// "[Interface]" marker, so DetectProto checks AmneziaWG first (registered above)
+		// and only falls through to here for a config without those keys — keeping this
+		// detector deliberately conservative so it never claims an AmneziaWG payload.
+		Detect: func(c string) bool {
+			if !strings.Contains(c, "[Interface]") {
+				return false
+			}
+			low := strings.ToLower(c)
+			for _, k := range []string{"\njc", "\njmin", "\njmax", "\ns1", "\ns2", "\nh1", "\nh2", "\nh3", "\nh4"} {
+				if strings.Contains(low, k+" ") || strings.Contains(low, k+"=") {
+					return false
+				}
+			}
+			return true
+		},
+	},
+	{
 		ID:      ProtoReality,
 		Name:    "VLESS-Reality",
 		Summary: "TLS-camouflaged proxy that borrows a real site's certificate.",
@@ -55,6 +85,76 @@ var catalog = []Option{
 		Recommended: true,
 		Script:      scriptReality,
 		Detect:      func(c string) bool { return strings.HasPrefix(strings.TrimSpace(c), "vless://") },
+	},
+	{
+		ID:      ProtoVMess,
+		Name:    "VMess",
+		Summary: "Classic V2Ray protocol over WebSocket + TLS (self-signed).",
+		Details: []string{
+			"sing-box VMess inbound on TCP :8443, WebSocket transport (path /wakeroute) wrapped in TLS.",
+			"TLS uses a self-signed certificate (SNI wakeroute.local); the generated client link carries allowInsecure=1 so it connects without a CA-signed cert or your own domain.",
+			"Per-server uuid is generated once and persisted — re-running the installer never rotates it.",
+		},
+		Port:      8443,
+		Transport: "tcp",
+		Script:    scriptVMess,
+		Detect:    func(c string) bool { return strings.HasPrefix(strings.TrimSpace(c), "vmess://") },
+	},
+	{
+		ID:      ProtoTrojan,
+		Name:    "Trojan",
+		Summary: "TLS proxy that mimics plain HTTPS, authenticated by a password.",
+		Details: []string{
+			"sing-box Trojan inbound on TCP :8444 behind TLS (self-signed cert, SNI wakeroute.local).",
+			"The client link carries insecure=1 (skip-cert-verify) so the self-signed cert is accepted; bring your own domain + real cert for active-probing resistance.",
+			"Per-server password is generated once and persisted across re-runs.",
+		},
+		Port:      8444,
+		Transport: "tcp",
+		Script:    scriptTrojan,
+		Detect:    func(c string) bool { return strings.HasPrefix(strings.TrimSpace(c), "trojan://") },
+	},
+	{
+		ID:      ProtoShadowsocks,
+		Name:    "Shadowsocks",
+		Summary: "Lightweight AEAD proxy (2022-blake3-aes-256-gcm).",
+		Details: []string{
+			"sing-box Shadowsocks inbound on TCP/UDP :8388 using the modern 2022-blake3-aes-256-gcm cipher.",
+			"No TLS layer — Shadowsocks is its own AEAD encryption; the 32-byte PSK is generated once and persisted.",
+			"The client link is the standard SIP002 ss:// form, importable as-is.",
+		},
+		Port:      8388,
+		Transport: "tcp",
+		Script:    scriptShadowsocks,
+		Detect:    func(c string) bool { return strings.HasPrefix(strings.TrimSpace(c), "ss://") },
+	},
+	{
+		ID:      ProtoHysteria2,
+		Name:    "Hysteria2",
+		Summary: "High-throughput QUIC proxy that shrugs off lossy links.",
+		Details: []string{
+			"sing-box Hysteria2 inbound on UDP :8445 over QUIC + TLS (self-signed cert, SNI wakeroute.local, ALPN h3).",
+			"Excellent on high-loss / high-latency networks; the client link carries insecure=1 for the self-signed cert.",
+			"Per-server password is generated once and persisted; the UDP port is opened in iptables best-effort.",
+		},
+		Port:      8445,
+		Transport: "udp",
+		Script:    scriptHysteria2,
+		Detect:    func(c string) bool { return strings.HasPrefix(strings.TrimSpace(c), "hysteria2://") },
+	},
+	{
+		ID:      ProtoTUIC,
+		Name:    "TUIC",
+		Summary: "QUIC-based proxy (TUIC v5) with BBR congestion control.",
+		Details: []string{
+			"sing-box TUIC v5 inbound on UDP :8446 over QUIC + TLS (self-signed cert, SNI wakeroute.local, ALPN h3).",
+			"Low-latency UDP-native proxy; the client link carries insecure=1 for the self-signed cert and congestion_control=bbr.",
+			"Per-server uuid + password are generated once and persisted; the UDP port is opened in iptables best-effort.",
+		},
+		Port:      8446,
+		Transport: "udp",
+		Script:    scriptTUIC,
+		Detect:    func(c string) bool { return strings.HasPrefix(strings.TrimSpace(c), "tuic://") },
 	},
 }
 

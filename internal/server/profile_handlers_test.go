@@ -334,11 +334,16 @@ func TestProfilehandlers_BulkEndpointsBadJSON(t *testing.T) {
 
 func TestProfilehandlers_BulkEndpointsSkipsEmptyID(t *testing.T) {
 	s, _ := sharehandlers_server(t)
+	// v2 needs distinct CONTENT, not just a distinct ID: the bulk handler now skips
+	// content-identical imports (importer.DedupeNew), and the shared fixture otherwise
+	// gives every endpoint the same server/uuid.
+	v2 := profilehandlers_endpoint("v2", "Two")
+	v2.Server = "5.6.7.8"
 	payload := map[string]any{
 		"endpoints": []model.Endpoint{
 			profilehandlers_endpoint("v1", "One"),
 			profilehandlers_endpoint("", "NoID"), // skipped: empty id
-			profilehandlers_endpoint("v2", "Two"),
+			v2,
 		},
 	}
 	body, _ := json.Marshal(payload)

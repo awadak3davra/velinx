@@ -37,6 +37,11 @@ func Parse(raw string) (*model.Endpoint, error) {
 	scheme := ""
 	if i := strings.Index(raw, "://"); i > 0 {
 		scheme = strings.ToLower(raw[:i])
+		// Normalize the scheme prefix to lowercase so the case-sensitive string parsers
+		// (vmess/ss strip "vmess://"/"ss://" via TrimPrefix) accept an upper/mixed-case scheme
+		// like VMESS:// or SS:// — which other clients (v2rayN, sing-box) treat case-insensitively.
+		// Only the scheme is touched; the body after "://" (incl. base64) is left byte-for-byte intact.
+		raw = scheme + raw[i:]
 	}
 
 	// vmess/ss carry base64 bodies that are not always valid URLs.
@@ -47,6 +52,13 @@ func Parse(raw string) (*model.Endpoint, error) {
 		return finalize(parseShadowsocks(raw))
 	}
 
+	// wireguard:// private keys are base64 and routinely carry a raw '/' (which url.Parse would
+	// treat as the start of the path, dropping the userinfo + the real host), and an IPv6
+	// endpoint may arrive with percent-encoded brackets (%5B…%5D) that url.Parse can't parse.
+	// Normalize the wg authority first so url.Parse yields the correct userinfo + host.
+	if scheme == "wireguard" || scheme == "wg" {
+		raw = normalizeWGURL(raw)
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", raw, err)
@@ -293,7 +305,14 @@ func parseShadowsocks(raw string) (*model.Endpoint, error) {
 			}
 		}
 		method, password = splitColon(creds)
-		host, port = splitHostPort(body[at+1:])
+		// The host:port may carry a percent-encoded IPv6 literal ([2001:db8::1] -> %5B…%5D);
+		// decode it so splitHostPort/net.SplitHostPort can strip the brackets (else an IPv6 SS
+		// link fails "missing host/port"). A bare host or a malformed % is left unchanged.
+		hp := body[at+1:]
+		if d, err := url.PathUnescape(hp); err == nil {
+			hp = d
+		}
+		host, port = splitHostPort(hp)
 	} else {
 		// Legacy: ss://base64(method:password@host:port)
 		dec := decodeB64(body)
@@ -364,6 +383,38 @@ func parseSSQuery(query string) map[string]string {
 	return m
 }
 
+// normalizeWGURL repairs a wireguard:// link's AUTHORITY so the stdlib url.Parse can read it:
+//   - a raw '/' in the userinfo (the base64 private key — ~1 in 4 keys contains one, and most
+//     real wg:// links carry it un-percent-encoded) is encoded to %2F, so url.Parse keeps it as
+//     userinfo instead of treating it as the path start (which silently emptied the key and made
+//     the pre-'/' chunk the host — a junk, dead tunnel with no error);
+//   - percent-encoded IPv6 endpoint brackets (%5B…%5D) are decoded to literal […] so url.Parse
+//     can split host:port (it rejects a colon-bearing host that isn't literally bracketed).
+//
+// Only the authority (between "://" and the first '?'/'#') is touched; the query + fragment are
+// left verbatim so percent-encoded query values (publickey=…%2F…, address=…%2F…) decode normally.
+func normalizeWGURL(raw string) string {
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		return raw
+	}
+	head, rest := raw[:i+3], raw[i+3:]
+	tail := ""
+	if j := strings.IndexAny(rest, "?#"); j >= 0 {
+		tail, rest = rest[j:], rest[:j]
+	}
+	debracket := func(s string) string {
+		s = strings.ReplaceAll(strings.ReplaceAll(s, "%5B", "["), "%5b", "[")
+		return strings.ReplaceAll(strings.ReplaceAll(s, "%5D", "]"), "%5d", "]")
+	}
+	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+		rest = strings.ReplaceAll(rest[:at], "/", "%2F") + "@" + debracket(rest[at+1:])
+	} else {
+		rest = debracket(rest)
+	}
+	return head + rest + tail
+}
+
 func parseWireGuardURL(u *url.URL) (*model.Endpoint, error) {
 	q := u.Query()
 	e := &model.Endpoint{
@@ -395,9 +446,12 @@ func parseWireGuardURL(u *url.URL) (*model.Endpoint, error) {
 	if r := parseReserved(q.Get("reserved")); r != nil {
 		e.Params["reserved"] = r
 	}
-	// MTU keeps large packets from fragmenting/blackholing — emitted on the sing-box
-	// WG endpoint. (e.g. WARP links carry mtu=1280.)
-	if mtu := atoiDefault(q.Get("mtu"), 0); mtu > 0 {
+	// MTU keeps large packets from fragmenting/blackholing — emitted on the sing-box WG
+	// endpoint. (e.g. WARP links carry mtu=1280.) Bound to a sane WG range: sing-box's
+	// endpoint mtu is a uint32, so an out-of-range value (e.g. a hostile mtu=999999999999)
+	// overflows at config decode and FATALs the whole shared singbox.json. Bounding also makes
+	// 64-bit and 32-bit (mipsle) builds agree, since strconv.Atoi overflows differently per arch.
+	if mtu := atoiDefault(q.Get("mtu"), 0); mtu >= 576 && mtu <= 65535 {
 		e.Params["mtu"] = mtu
 	}
 	return e, nil

@@ -7,6 +7,15 @@ import (
 	"strings"
 )
 
+// Sane bounds for the per-tunnel link MTU. The lower bound is the IPv4 minimum
+// reassembly buffer (576); the upper is a generous jumbo-frame ceiling (9200)
+// that still covers WG-over-jumbo links. A value outside this range is almost
+// certainly a typo and the WG engine would reject it at link-up.
+const (
+	minMTU = 576
+	maxMTU = 9200
+)
+
 // Validate checks structural integrity: unique IDs, resolvable members and
 // rule targets, and sane ports. It returns the first problem found.
 func (p *Profile) Validate() error {
@@ -22,6 +31,17 @@ func (p *Profile) Validate() error {
 		}
 		ids[e.ID] = "endpoint"
 		enabled[e.ID] = e.Enabled
+		// Per-tunnel link tunables are protocol-agnostic and opt-in: a 0/unset
+		// value means "engine default" and is skipped. When SET they must be in a
+		// sane range, otherwise the generator would emit a value the WG engine
+		// rejects at link-up and take routing down. Checked before the external
+		// short-circuit so an external endpoint with a stray bad value is caught too.
+		if e.MTU != 0 && (e.MTU < minMTU || e.MTU > maxMTU) {
+			return fmt.Errorf("endpoint %q: mtu %d out of range (%d-%d)", e.ID, e.MTU, minMTU, maxMTU)
+		}
+		if e.PersistentKeepalive != 0 && (e.PersistentKeepalive < 1 || e.PersistentKeepalive > 65535) {
+			return fmt.Errorf("endpoint %q: persistent_keepalive %d out of range (1-65535)", e.ID, e.PersistentKeepalive)
+		}
 		if e.Engine == EngineExternal {
 			// Routes via an existing OS interface, not a server — it needs only the
 			// interface name; server/port/protocol do not apply.
@@ -98,11 +118,67 @@ func (p *Profile) Validate() error {
 		}
 	}
 
+	// Reject nested-group CYCLES (g1→g2→g1). The self-check above only catches the trivial
+	// single-node case; an indirect cycle would emit mutually-referencing sing-box outbounds
+	// that FATAL the config at load — failing the apply, or persisting an unappliable profile
+	// when a crafted backup bundle is restored (Validate is the only gate there). DFS with a
+	// visiting/done colouring over the group→group edges; a back-edge to a node on the stack
+	// is a cycle.
+	groupAdj := map[string][]string{}
+	for _, g := range p.Groups {
+		for _, m := range g.Members {
+			if ids[m] == "group" { // only group-typed members can form a cycle
+				groupAdj[g.ID] = append(groupAdj[g.ID], m)
+			}
+		}
+	}
+	const (
+		colVisiting = 1
+		colDone     = 2
+	)
+	color := map[string]int{}
+	var dfs func(id string) error
+	dfs = func(id string) error {
+		color[id] = colVisiting
+		for _, m := range groupAdj[id] {
+			switch color[m] {
+			case colVisiting:
+				return fmt.Errorf("group %q is part of a cycle (via %q)", id, m)
+			case colDone:
+				continue
+			default:
+				if err := dfs(m); err != nil {
+					return err
+				}
+			}
+		}
+		color[id] = colDone
+		return nil
+	}
+	for _, g := range p.Groups {
+		if color[g.ID] == 0 {
+			if err := dfs(g.ID); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Rule targets must resolve to an enabled id or a builtin, and a non-default
 	// rule must carry at least one matcher (a condition-less rule is invalid in
 	// sing-box).
 	defaults := 0
 	for _, r := range p.Rules {
+		// Rule ids share the endpoint/group/routing-list namespace. An empty or duplicate
+		// id silently corrupts rule management (UpsertRule edits the FIRST match, DeleteRule
+		// removes ALL matches → a same-id sibling is lost), and a hand-edited restored bundle
+		// reaches the store via Replace without a per-item guard — so validate it here.
+		if r.ID == "" {
+			return fmt.Errorf("rule has empty id")
+		}
+		if prev, ok := ids[r.ID]; ok {
+			return fmt.Errorf("duplicate id %q (already used by %s)", r.ID, prev)
+		}
+		ids[r.ID] = "rule"
 		if r.Default {
 			defaults++
 		} else {

@@ -1,11 +1,100 @@
 package store
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"wakeroute/internal/model"
 )
+
+// TestProfileMigrationCompat locks the deploy/rollback compat for the user's endpoint DATA —
+// the most painful thing to lose on a device upgrade. BACKWARD (deploy: old profile -> new
+// binary): an older profile loads with new endpoint fields defaulted. FORWARD (rollback: new
+// profile -> old binary): a profile carrying fields this binary doesn't know still loads with
+// endpoints intact — so a post-deploy rollback fed the new profile.json isn't bricked. Holds
+// while Open stays lenient (plain json.Unmarshal); a model.Endpoint field rename/retype, or
+// DisallowUnknownFields, fails here before it can lose a router's saved connections.
+func TestProfileMigrationCompat(t *testing.T) {
+	prof := model.Profile{Endpoints: []model.Endpoint{{
+		ID: "e1", Name: "NL", Engine: model.EngineSingBox, Protocol: model.ProtoVLESS,
+		Server: "1.2.3.4", Port: 443, Enabled: true,
+		Params: map[string]any{"uuid": "u-1"},
+	}}}
+	base, err := json.Marshal(prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := func(b []byte) (*Store, error) {
+		p := filepath.Join(t.TempDir(), "profile.json")
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Open(p)
+	}
+
+	// BACKWARD: the marshaled profile omits omitempty new endpoint fields (mtu/kill_switch/…),
+	// standing in for an older profile — it must load with the endpoint intact + new fields default.
+	s, err := open(base)
+	if err != nil {
+		t.Fatalf("backward: Open(old-style profile) errored: %v", err)
+	}
+	if eps := s.Profile().Endpoints; len(eps) != 1 || eps[0].ID != "e1" || eps[0].MTU != 0 {
+		t.Fatalf("backward: endpoint not migrated cleanly: %+v", eps)
+	}
+
+	// FORWARD/ROLLBACK: inject a field this binary doesn't know; Open must ignore it (not error)
+	// and keep the endpoint — else a rollback after deploy would brick on the new profile.json.
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(base, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["future_profile_field"] = json.RawMessage(`{"x":1}`)
+	fwd, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := open(fwd)
+	if err != nil {
+		t.Fatalf("forward: Open(profile with unknown field) errored — rollback would brick: %v", err)
+	}
+	if eps := s2.Profile().Endpoints; len(eps) != 1 || eps[0].ID != "e1" {
+		t.Errorf("forward: endpoint lost when an unknown field was present: %+v", eps)
+	}
+}
+
+// An empty or whitespace-only profile.json must load as an empty profile and
+// rewrite a valid file — NOT brick boot with "unexpected end of JSON input". A
+// non-empty garbage file still errors.
+func TestOpenEmptyOrGarbage(t *testing.T) {
+	for _, content := range []string{"", "   ", "\n\t \n"} {
+		path := filepath.Join(t.TempDir(), "profile.json")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open(empty %q) returned error: %v", content, err)
+		}
+		if p := s.Profile(); len(p.Endpoints) != 0 || len(p.Groups) != 0 || len(p.Rules) != 0 {
+			t.Fatalf("Open(empty) did not yield an empty profile: %+v", p)
+		}
+		// The file must have been rewritten so a reopen succeeds (valid JSON).
+		if _, err := Open(path); err != nil {
+			t.Fatalf("reopen after empty-file recreate errored: %v", err)
+		}
+	}
+
+	// A genuinely-corrupt NON-empty file must still surface its parse error.
+	path := filepath.Join(t.TempDir(), "profile.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("Open(garbage) should error, not swallow real corruption")
+	}
+}
 
 func TestStoreCRUDAndPersist(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "profile.json")

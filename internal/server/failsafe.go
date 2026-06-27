@@ -13,7 +13,7 @@ import (
 // armFailSafe starts the rollback window after a non-saved Apply: it pings the
 // configured target, rolls the config back if connectivity is lost, and (only
 // when opted in, on-device) reboots as a last resort.
-func (s *Server) armFailSafe() {
+func (s *Server) armFailSafe(nativeOnly bool) {
 	c := s.config()
 	target := c.FailSafe.Target
 	if target == "" {
@@ -27,7 +27,13 @@ func (s *Server) armFailSafe() {
 		// new config CRASHED sing-box, and the fail-safe would never roll back.
 		// Treat "sing-box installed but down" as a connectivity failure so the bad
 		// config is rolled back. (Demo / no core keeps the old ping-only behavior.)
-		if !routingBrainUp(s.singbox.Available(), s.singbox.Running()) {
+		//
+		// EXCEPTION — native-only datapath (P4): when the applied profile is native-only,
+		// sing-box is intentionally STOPPED (Available && !Running) and the kernel PBR plane
+		// is the routing brain. The ping (routed through the kernel plane) IS the authoritative
+		// signal, so we must NOT treat the stopped core as a failure — otherwise every
+		// native-only "Apply (until reboot)" would auto-roll-back at the rollback deadline.
+		if !nativeOnly && !routingBrainUp(s.singbox.Available(), s.singbox.Running()) {
 			return false
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -49,6 +55,9 @@ func (s *Server) armFailSafe() {
 		s.applyMu.Lock()
 		defer s.applyMu.Unlock()
 		log.Printf("fail-safe: connectivity lost — rolling back to the previous config")
+		// Notify (fire-and-forget, async) so a remote operator learns their Apply was
+		// auto-reverted — the key event for managing the router from away.
+		s.alert("⚠️ WakeRoute fail-safe: connectivity was lost after Apply — rolled back to the previous config.")
 		var sbErr error
 		if err := s.singbox.Restore(); err != nil {
 			sbErr = err
@@ -72,6 +81,7 @@ func (s *Server) armFailSafe() {
 	}
 	reboot := func() {
 		log.Printf("fail-safe: still no connectivity after rollback — rebooting router")
+		s.alert("⚠️ WakeRoute fail-safe: no connectivity even after rollback — rebooting the router.")
 		_ = exec.Command("reboot").Start()
 	}
 	allowReboot := !c.Demo && c.FailSafe.AutoReboot

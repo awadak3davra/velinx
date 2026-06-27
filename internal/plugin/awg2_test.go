@@ -132,6 +132,31 @@ func TestAWGConfig_MTU(t *testing.T) {
 	}
 }
 
+// TestAWGConfig_TypedMTUKeepalive: the typed Endpoint fields (set by the UI, which drops the
+// Params copy on edit) must render into the AWG conf — else a UI-edited tunnel loses them at
+// bring-up + export. Typed value wins over a stale Params copy.
+func TestAWGConfig_TypedMTUKeepalive(t *testing.T) {
+	conf := awgConfig(model.Endpoint{
+		Engine: model.EngineAmneziaWG, Server: "1.2.3.4", Port: 8443,
+		MTU: 1280, PersistentKeepalive: 25,
+		Params: map[string]any{"private_key": "P", "peer_public_key": "Q"},
+	})
+	if !strings.Contains(conf, "MTU = 1280") {
+		t.Errorf("typed MTU not in awg conf:\n%s", conf)
+	}
+	if !strings.Contains(conf, "PersistentKeepalive = 25") {
+		t.Errorf("typed PersistentKeepalive not in awg conf:\n%s", conf)
+	}
+	conf2 := awgConfig(model.Endpoint{
+		Engine: model.EngineAmneziaWG, Server: "1.2.3.4", Port: 8443,
+		MTU:    1320,
+		Params: map[string]any{"private_key": "P", "peer_public_key": "Q", "mtu": 1280},
+	})
+	if !strings.Contains(conf2, "MTU = 1320") || strings.Contains(conf2, "MTU = 1280") {
+		t.Errorf("typed MTU should win over the stale Params copy:\n%s", conf2)
+	}
+}
+
 // TestAWGStrip checks the conf fed to `awg setconf` keeps the crypto/peer/junk
 // fields but drops the ip-layer lines (Address/DNS/MTU) that setconf rejects.
 func TestAWGStrip(t *testing.T) {

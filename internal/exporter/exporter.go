@@ -27,6 +27,16 @@ type Result struct {
 // Export renders an endpoint. ok=false for protocols with no client-importable
 // representation (socks/http/olcrtc).
 func Export(e model.Endpoint) (Result, bool) {
+	// EngineExternal routes through an existing OS-owned interface (e.g. a
+	// UCI/netifd-brought-up awg0/awg1). It is device-local and has no keys or
+	// server of its own to hand to a client, so there is nothing shareable — a
+	// share-link/.conf would be wrong, empty, or leak the wrong peer's identity.
+	// Degrade gracefully (ok=false) rather than emit a malformed link. It still
+	// round-trips through profile-JSON export (plain model marshal). Parallels the
+	// EngineAmneziaWG special-case in wgConf below.
+	if e.Engine == model.EngineExternal {
+		return Result{}, false
+	}
 	switch e.Protocol {
 	case model.ProtoVLESS:
 		return Result{Kind: "link", Text: vlessLink(e)}, true
@@ -156,7 +166,7 @@ func ssLink(e model.Endpoint) string {
 		u += "?" + enc
 	}
 	if e.Name != "" {
-		u += "#" + url.PathEscape(e.Name)
+		u += "#" + fragmentEscape(e.Name)
 	}
 	return "ss://" + u
 }
@@ -259,7 +269,12 @@ func plainWGConf(e model.Endpoint) string {
 	if a := util.LocalAddr(e.Params); a != "" {
 		b.WriteString("Address = " + a + "\n")
 	}
-	if mtu := intStr(e.Params, "mtu"); mtu != "0" {
+	// MTU/keepalive now live on typed Endpoint fields (the UI writes them there + drops the
+	// legacy Params copy on edit), so prefer the typed value and fall back to Params for
+	// not-yet-migrated configs — else a UI-edited tunnel would export WITHOUT its MTU.
+	if e.MTU > 0 {
+		b.WriteString("MTU = " + strconv.Itoa(e.MTU) + "\n")
+	} else if mtu := intStr(e.Params, "mtu"); mtu != "0" {
 		b.WriteString("MTU = " + mtu + "\n") // round-trips via parseConf; avoids fragmentation
 	}
 	if r := reservedCSV(e.Params, "reserved"); r != "" {
@@ -272,7 +287,9 @@ func plainWGConf(e model.Endpoint) string {
 	}
 	b.WriteString("Endpoint = " + hostPort(e) + "\n")
 	b.WriteString("AllowedIPs = 0.0.0.0/0\n")
-	if ka := intStr(e.Params, "persistent_keepalive"); ka != "0" {
+	if e.PersistentKeepalive > 0 {
+		b.WriteString("PersistentKeepalive = " + strconv.Itoa(e.PersistentKeepalive) + "\n")
+	} else if ka := intStr(e.Params, "persistent_keepalive"); ka != "0" {
 		b.WriteString("PersistentKeepalive = " + ka + "\n") // else an exported idle tunnel drops behind NAT
 	}
 	return b.String()
@@ -327,22 +344,30 @@ func setTLSQuery(q url.Values, t *model.TLS) {
 	}
 }
 
-// buildURI assembles scheme://user[:pass]@host:port?query#name.
+// buildURI assembles scheme://user[:pass]@host:port?query#name. The userinfo is encoded by
+// the stdlib (url.User/UserPassword) so a credential containing ':' / '@' / '/' is
+// percent-escaped — a bare ':' in a password would otherwise be read by every client as the
+// user:pass separator and silently truncate the password.
 func buildURI(scheme, user, pass string, e model.Endpoint, q url.Values) string {
-	var b strings.Builder
-	b.WriteString(scheme + "://")
-	b.WriteString(url.PathEscape(user))
+	u := url.URL{Scheme: scheme, Host: hostPort(e), RawQuery: q.Encode()}
 	if pass != "" {
-		b.WriteString(":" + url.PathEscape(pass))
+		u.User = url.UserPassword(user, pass)
+	} else {
+		u.User = url.User(user)
 	}
-	b.WriteString("@" + hostPort(e))
-	if enc := q.Encode(); enc != "" {
-		b.WriteString("?" + enc)
-	}
+	s := u.String()
 	if e.Name != "" {
-		b.WriteString("#" + url.PathEscape(e.Name))
+		s += "#" + fragmentEscape(e.Name)
 	}
-	return b.String()
+	return s
+}
+
+// fragmentEscape percent-encodes a #name fragment so it decodes IDENTICALLY whether a client
+// uses path- or query-unescaping. The only divergence is '+': query-unescape turns a bare
+// '+' into a space (SS import + many clients do this). PathEscape already gives %20 for a
+// space (safe for both); additionally escaping '+' -> %2B keeps a name like "My+VPS" intact.
+func fragmentEscape(s string) string {
+	return strings.ReplaceAll(url.PathEscape(s), "+", "%2B")
 }
 
 // hostPort joins server+port for a URI/conf, bracketing an IPv6 literal

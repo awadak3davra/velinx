@@ -3,10 +3,17 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
 
 	"wakeroute/internal/kb"
 )
+
+// maxDiagLines caps how many log lines the analyzer processes. Pasted text is bounded only
+// by the 16 MiB body cap, which at ~2 bytes/line is millions of lines; analyze() allocates
+// O(lines) and re-serializes them all, so without this cap a huge paste could OOM the
+// memory-constrained router daemon. A real log paste is at most a few thousand lines.
+const maxDiagLines = 5000
 
 type lineMatch struct {
 	Line    string     `json:"line"`
@@ -26,22 +33,37 @@ func analyze(lines []string) []lineMatch {
 	return out
 }
 
-func respondDiagnostics(w http.ResponseWriter, lines []string) {
+// foundCause is a distinct diagnostic cause plus how many analyzed log lines matched
+// it. The count distinguishes a persistent, spamming failure (e.g. a failover tier whose
+// url-test times out every probe) from a one-off blip — a much stronger signal for the
+// operator than "this cause appeared at least once".
+type foundCause struct {
+	kb.Entry
+	Count int `json:"count"`
+}
+
+func respondDiagnostics(w http.ResponseWriter, lines []string, truncated bool) {
 	analyzed := analyze(lines)
-	seen := map[string]bool{}
-	var found []kb.Entry
+	idx := map[string]int{} // entry ID -> index in found
+	found := []foundCause{}
 	for _, lm := range analyzed {
 		for _, e := range lm.Entries {
-			if !seen[e.ID] {
-				seen[e.ID] = true
-				found = append(found, e)
+			if i, ok := idx[e.ID]; ok {
+				found[i].Count++
+				continue
 			}
+			idx[e.ID] = len(found)
+			found = append(found, foundCause{Entry: e, Count: 1})
 		}
 	}
+	// Most-frequent cause first — a persistently-spamming failure is the strongest signal.
+	// Stable so equal-count causes keep first-seen order (deterministic output for tests).
+	sort.SliceStable(found, func(i, j int) bool { return found[i].Count > found[j].Count })
 	writeJSON(w, http.StatusOK, map[string]any{
-		"lines": analyzed,
-		"found": found,
-		"count": len(lines),
+		"lines":     analyzed,
+		"found":     found,
+		"count":     len(lines),
+		"truncated": truncated,
 	})
 }
 
@@ -51,7 +73,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	if s.singbox != nil {
 		lines = s.singbox.LogLines()
 	}
-	respondDiagnostics(w, lines)
+	respondDiagnostics(w, lines, false) // live log is ring-buffer-bounded already
 }
 
 // handleDiagnosticsAnalyze analyzes pasted log text (works anywhere, incl. logs
@@ -64,13 +86,28 @@ func (s *Server) handleDiagnosticsAnalyze(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	// Stream-split with a hard line cap. Splitting the whole body up front would itself
+	// allocate O(lines) string headers before any cap could apply, so walk it line by line
+	// (cheap O(1) string slices) and stop at maxDiagLines.
 	var lines []string
-	for _, ln := range strings.Split(body.Text, "\n") {
+	truncated := false
+	rest := body.Text
+	for rest != "" {
+		var ln string
+		if i := strings.IndexByte(rest, '\n'); i >= 0 {
+			ln, rest = rest[:i], rest[i+1:]
+		} else {
+			ln, rest = rest, ""
+		}
 		if ln = strings.TrimRight(ln, "\r"); strings.TrimSpace(ln) != "" {
 			lines = append(lines, ln)
+			if len(lines) >= maxDiagLines {
+				truncated = rest != "" // more input remained beyond the cap
+				break
+			}
 		}
 	}
-	respondDiagnostics(w, lines)
+	respondDiagnostics(w, lines, truncated)
 }
 
 // handleKB returns the whole error knowledgebase for browsing.

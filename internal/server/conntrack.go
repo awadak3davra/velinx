@@ -39,7 +39,7 @@ var tcpStates = map[string]bool{
 // the REPLY tuple; the first src/dst/dport and the first bytes= are the original (upstream)
 // direction, the second bytes= is the reply (download). mark= is the connmark.
 func parseConntrack(s string) []Conn {
-	var out []Conn
+	out := []Conn{}
 	for _, line := range strings.Split(s, "\n") {
 		f := strings.Fields(line)
 		if len(f) < 4 {

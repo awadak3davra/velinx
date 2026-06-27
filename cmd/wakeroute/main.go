@@ -18,6 +18,7 @@ import (
 	"wakeroute/internal/clash"
 	"wakeroute/internal/config"
 	"wakeroute/internal/core"
+	"wakeroute/internal/generator"
 	"wakeroute/internal/health"
 	"wakeroute/internal/platform"
 	"wakeroute/internal/server"
@@ -104,9 +105,24 @@ func main() {
 
 	// Autostart sing-box if a config already exists (so it's supervised from
 	// boot). Demo mode and a missing binary are no-ops handled by Start.
+	//
+	// P4 (sing-box optionality): when the live profile + resolved routing mode are
+	// provably native-only (generator.DatapathNativeOnly), the kernel-PBR plane +
+	// engine plugins carry everything and the sing-box core must NOT come up — even
+	// if a stale singbox.json is still on disk. SyncPlugins (started just below)
+	// installs the kernel plane and Stops any running core in the native-only arm,
+	// but gating the boot autostart here avoids briefly starting a core we'd then
+	// tear down. Fail-safe: DatapathNativeOnly returns false on ANY ambiguity
+	// (nil/empty profile, non-fast mode, a surviving sing-box-only reference), so a
+	// false verdict (start the core) is the conservative default. The routing mode
+	// is resolved exactly as the server does (Server.routingMode): an explicit
+	// value wins, "" derives from Gateway.
 	if !cfg.Demo && sb.Available() {
 		if _, err := os.Stat(cfg.SingBox.Config); err == nil {
-			if err := sb.Start(); err != nil {
+			prof := st.Profile()
+			if generator.DatapathNativeOnly(&prof, bootRoutingMode(cfg)) {
+				log.Printf("sing-box autostart skipped: profile is native-only (kernel-PBR datapath)")
+			} else if err := sb.Start(); err != nil {
 				log.Printf("sing-box autostart: %v", err)
 			} else {
 				log.Printf("sing-box started")
@@ -115,8 +131,9 @@ func main() {
 	}
 
 	srv := server.New(cfg, hub, cl, sb, st, mon, ss, web.FS())
-	go srv.SyncPlugins()       // bring engine plugins (AmneziaWG interfaces, olcRTC) up from boot
-	go srv.AutoUpdateLoop(ctx) // self-update WakeRoute when Updater.AutoUpdate is on (default off)
+	go srv.SyncPlugins()                // bring engine plugins (AmneziaWG interfaces, olcRTC) up from boot
+	go srv.AutoUpdateLoop(ctx)          // self-update WakeRoute when Updater.AutoUpdate is on (default off)
+	go srv.SubscriptionRefreshLoop(ctx) // re-fetch an imported subscription when auto-refresh is opted in (off by default)
 	// Crash-restart supervision for sing-box (+ best-effort engine plugins).
 	wdDone := make(chan struct{})
 	go func() { srv.Watchdog().Run(ctx); close(wdDone) }()
@@ -145,6 +162,24 @@ func main() {
 	<-wdDone
 	_ = sb.Stop()
 	srv.Plugins().StopAll() // stop engine plugins (olcRTC procs, awg interfaces) so they don't orphan
+}
+
+// bootRoutingMode resolves the effective routing mode from a config snapshot for
+// the boot-time native-only check, mirroring Server.routingMode (the canonical
+// resolver, internal/server/profile.go): an explicit "tun"/"hybrid"/"fast"/"mixed"
+// wins; "" derives from Gateway (TUN when on, else mixed). The Server's method is
+// unexported and the Server is not constructed until after the autostart decision,
+// so this keeps the boot path and the apply path agreeing on which mode is active.
+func bootRoutingMode(cfg *config.Config) string {
+	mode := cfg.RoutingMode
+	if mode == "" {
+		if cfg.Gateway {
+			mode = "tun"
+		} else {
+			mode = "mixed"
+		}
+	}
+	return mode
 }
 
 // runClashTraffic keeps the Clash /traffic stream connected, retrying on failure.

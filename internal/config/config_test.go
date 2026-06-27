@@ -1,6 +1,105 @@
 package config
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// TestConfigMigrationCompat locks in the deploy/rollback config-compat invariant that
+// makes a device upgrade safe in BOTH directions:
+//
+//   - BACKWARD (deploy: old config -> new binary): a config missing the newer fields
+//     loads with them at their zero/default.
+//   - FORWARD (rollback: new config -> older binary): a config carrying fields this
+//     binary does NOT know still loads — it must ignore them, not error, or a post-deploy
+//     rollback fed the new binary's config would brick boot.
+//
+// Both hold only while Load stays lenient (plain json.Unmarshal, no DisallowUnknownFields).
+// Renaming/retyping a persisted field, or tightening the decoder, fails this test before it
+// can reach a router. (Verified 20281db..HEAD that every config json tag change is additive.)
+func TestConfigMigrationCompat(t *testing.T) {
+	base, err := json.Marshal(Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	load := func(b []byte) (*Config, error) {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "config.json")
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(p)
+	}
+
+	// BACKWARD: Default()'s JSON omits the omitempty new fields (url/refresh_hours/offload…),
+	// so it stands in for an older config — it must load with those fields defaulted.
+	c, err := load(base)
+	if err != nil {
+		t.Fatalf("backward: Load(old-style config) errored: %v", err)
+	}
+	if c.Subscription.URL != "" || c.Subscription.RefreshHours != 0 {
+		t.Errorf("backward: new fields not defaulted: url=%q hours=%d", c.Subscription.URL, c.Subscription.RefreshHours)
+	}
+
+	// FORWARD/ROLLBACK: inject fields this binary doesn't know; Load must ignore them (not
+	// error) and preserve the known fields — else a rollback after a deploy would brick.
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(base, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["future_top_field"] = json.RawMessage(`{"nested":[1,2,3],"flag":true}`)
+	fwd, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := load(fwd)
+	if err != nil {
+		t.Fatalf("forward: Load(newer config with an unknown field) errored — a rollback would brick: %v", err)
+	}
+	if c2.Listen != Default().Listen {
+		t.Errorf("forward: a known field was lost when an unknown field was present: Listen=%q", c2.Listen)
+	}
+}
+
+// An empty or whitespace-only config.json (the canonical power-loss / overlayfs
+// artifact on a router) must load as defaults and rewrite a valid file — NOT brick
+// boot with "unexpected end of JSON input". A non-empty garbage file still errors.
+func TestLoadEmptyOrGarbage(t *testing.T) {
+	for _, content := range []string{"", "   ", "\n\t  \n"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.json")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load(empty %q) returned error: %v", content, err)
+		}
+		if c.Listen != Default().Listen {
+			t.Fatalf("Load(empty) did not apply defaults: Listen=%q", c.Listen)
+		}
+		// The file must have been rewritten to a valid (re-loadable) config.
+		c2, err := Load(path)
+		if err != nil {
+			t.Fatalf("reload after empty-file recreate errored: %v", err)
+		}
+		if c2.Listen != Default().Listen {
+			t.Fatalf("rewritten config not valid defaults: %q", c2.Listen)
+		}
+	}
+
+	// A genuinely-corrupt NON-empty file must still surface its parse error.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load(garbage) should error, not swallow real corruption")
+	}
+}
 
 func TestConfigValidate(t *testing.T) {
 	// Default() must always validate — it is the reset/import baseline.

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,6 +18,16 @@ import (
 	"wakeroute/internal/updater"
 	"wakeroute/internal/util"
 )
+
+// sshKnownHostsPath is the persistent, WakeRoute-owned known_hosts file used to pin
+// provisioned-server SSH host keys. It lives next to the sing-box config (a writable,
+// persistent WR-owned directory) so the pin survives reboots — unlike a router's default
+// known_hosts, which may be non-persistent (re-TOFU each reboot) or unreadable. Set as
+// Creds.KnownHostsFile on every Provision call; SingBox.Config is fixed at startup, so
+// reading s.cfg directly here is race-safe (matches New()'s direct read).
+func (s *Server) sshKnownHostsPath() string {
+	return filepath.Join(filepath.Dir(s.cfg.SingBox.Config), "ssh_known_hosts")
+}
 
 // ---- saved-server registry (redundancy: manage several servers) ----
 
@@ -36,6 +47,10 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "enter a valid host or IP")
 		return
 	}
+	if sv.User != "" && !netdiag.ValidTarget(sv.User) {
+		writeErr(w, http.StatusBadRequest, "enter a valid SSH user")
+		return
+	}
 	if sv.Port == 0 {
 		sv.Port = 22
 	}
@@ -47,6 +62,9 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 	}
 	if sv.Name == "" {
 		sv.Name = sv.Host
+	}
+	if sv.Installed == nil {
+		sv.Installed = []string{}
 	}
 	if err := s.servers.Upsert(sv); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -120,6 +138,16 @@ func (s *Server) handleServerScript(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(b.Protocols) == 0 {
 		writeErr(w, http.StatusBadRequest, "pick at least one protocol")
+		return
+	}
+	for _, p := range b.Protocols {
+		if !initserver.ValidOption(p) {
+			writeErr(w, http.StatusBadRequest, "unknown option: "+p)
+			return
+		}
+	}
+	if b.Host != "" && !netdiag.ValidTarget(b.Host) {
+		writeErr(w, http.StatusBadRequest, "enter a valid host or IP")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"script": initserver.BuildScript(b.Protocols, b.Host)})
@@ -218,8 +246,8 @@ func (s *Server) runProvision(job *initserver.Job, b provisionReq) {
 		return
 	}
 
-	var added []string       // endpoint ids created (for the job result + count)
-	var addedProtos []string // protocol ids that ACTUALLY provisioned (config parsed + imported)
+	added := []string{}       // endpoint ids created (for the job result + count)
+	addedProtos := []string{} // protocol ids that ACTUALLY provisioned (config parsed + imported)
 	for _, tc := range configs {
 		label := initserver.OptionName(tc.Proto)
 		job.Start("Create client: " + label)
@@ -269,7 +297,7 @@ func (s *Server) provisionReal(ctx context.Context, job *initserver.Job, b provi
 
 	job.Start("Install " + strings.Join(protoNames(b.Protocols), " + "))
 	script := initserver.BuildScript(b.Protocols, b.Host)
-	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key}
+	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key, KnownHostsFile: s.sshKnownHostsPath()}
 	out, ran, err := initserver.Provision(ctx, creds, script)
 	if !ran {
 		job.Fail("auto-provision unavailable on this router",
@@ -353,7 +381,7 @@ func (s *Server) resolveHardenTarget(b *hardenReq) bool {
 	if b.Port == 0 {
 		b.Port = 22
 	}
-	return netdiag.ValidTarget(b.Host) && b.User != ""
+	return netdiag.ValidTarget(b.Host) && b.User != "" && netdiag.ValidTarget(b.User)
 }
 
 // handleServerHardenKeys generates a fresh SSH key on the server, installs the
@@ -374,6 +402,12 @@ func (s *Server) handleServerHardenKeys(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) runHardenKeys(job *initserver.Job, b hardenReq) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			job.Fail("internal error", fmt.Sprintf("%v", rec))
+			job.Finish(false, nil)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	job.Start("Generate + install SSH key for " + b.User + "@" + b.Host)
@@ -384,7 +418,7 @@ func (s *Server) runHardenKeys(job *initserver.Job, b hardenReq) {
 		job.Finish(true, map[string]any{"private_key": priv, "public_key": "ssh-ed25519 AAAA...demo wakeroute-managed", "filename": keyFilename(b)})
 		return
 	}
-	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key}
+	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key, KnownHostsFile: s.sshKnownHostsPath()}
 	out, ran, err := initserver.Provision(ctx, creds, initserver.HardenKeysScript(b.User))
 	if !ran {
 		job.Fail("auto-hardening needs the ssh client on the router", "Install ssh (and sshpass for password auth), or harden the server manually.")
@@ -426,6 +460,12 @@ func (s *Server) handleServerLockdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runLockdown(job *initserver.Job, b hardenReq) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			job.Fail("internal error", fmt.Sprintf("%v", rec))
+			job.Finish(false, nil)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if s.config().Demo {
@@ -439,7 +479,7 @@ func (s *Server) runLockdown(job *initserver.Job, b hardenReq) {
 		job.Finish(true, map[string]any{"hardened": true})
 		return
 	}
-	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Key: b.Key}
+	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Key: b.Key, KnownHostsFile: s.sshKnownHostsPath()}
 
 	job.Start("Verify key-based login")
 	if _, ran, err := initserver.Provision(ctx, creds, "echo WR_KEY_OK"); !ran || err != nil {
@@ -490,16 +530,22 @@ func (s *Server) handleServerCheckVersions(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) runCheckVersions(job *initserver.Job, b hardenReq) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			job.Fail("internal error", fmt.Sprintf("%v", rec))
+			job.Finish(false, nil)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	job.Start("Read installed versions on " + b.Host)
 	if s.config().Demo {
 		time.Sleep(400 * time.Millisecond)
 		job.OK("read sing-box + AmneziaWG (simulated)")
-		job.Finish(true, map[string]any{"binaries": demoServerBinaries(), "arch": "x86_64"})
+		job.Finish(true, map[string]any{"binaries": demoServerBinaries(), "arch": "x86_64", "curl": true})
 		return
 	}
-	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key}
+	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key, KnownHostsFile: s.sshKnownHostsPath()}
 	out, ran, err := initserver.Provision(ctx, creds, initserver.VersionCheckScript())
 	if !ran {
 		job.Fail("version check needs the ssh client on the router", "Install ssh (and sshpass for password auth), or check manually with `sing-box version`.")
@@ -517,10 +563,13 @@ func (s *Server) runCheckVersions(job *initserver.Job, b hardenReq) {
 	if len(binaries) == 0 {
 		job.OK("no managed binaries found on the server")
 	} else {
+		if found["curl"] == "0" {
+			job.Output("⚠ curl not found on the server — sing-box binary updates require curl")
+		}
 		job.OK(versionsSummary(binaries))
 	}
 	_ = s.servers.Patch(b.ServerID, func(sv *serverstore.Server) { sv.LastJob = job.ID() })
-	job.Finish(true, map[string]any{"binaries": binaries, "arch": found["arch"]})
+	job.Finish(true, map[string]any{"binaries": binaries, "arch": found["arch"], "curl": found["curl"] == "1"})
 }
 
 // resolveBinaryVersions turns the raw probe markers into UI rows: parsed installed
@@ -583,6 +632,12 @@ func (s *Server) handleServerUpdateBinary(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) runUpdateServerBinary(job *initserver.Job, b serverBinUpdateReq) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			job.Fail("internal error", fmt.Sprintf("%v", rec))
+			job.Finish(false, nil)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	name := b.Binary
@@ -599,7 +654,7 @@ func (s *Server) runUpdateServerBinary(job *initserver.Job, b serverBinUpdateReq
 		return
 	}
 	script, _ := initserver.UpdateScriptFor(b.Binary, b.Version)
-	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key}
+	creds := initserver.Creds{Host: b.Host, Port: b.Port, User: b.User, Password: b.Password, Key: b.Key, KnownHostsFile: s.sshKnownHostsPath()}
 	job.Logf("the current binary is backed up as <path>.wakeroute.bak on the server before the swap")
 	out, ran, err := initserver.Provision(ctx, creds, script)
 	if !ran {
@@ -702,7 +757,7 @@ func slug(s string) string {
 
 func mergeStrings(a, b []string) []string {
 	seen := map[string]bool{}
-	var out []string
+	out := []string{}
 	for _, s := range append(append([]string{}, a...), b...) {
 		if s != "" && !seen[s] {
 			seen[s] = true

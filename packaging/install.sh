@@ -14,7 +14,7 @@
 # Idempotent: re-running upgrades in place. POSIX sh / busybox-safe (no bashisms,
 # no `pkill -f`/`pgrep` assumption, no base64, no `od -A`). See --help for flags.
 
-VERSION="0.3.0"
+VERSION="0.3.3"
 
 # ---------------------------------------------------------------------------
 # Output helpers (colour only on a TTY)
@@ -116,6 +116,40 @@ pgrep_f() {
 }
 proc_running() { [ -n "$(pgrep_f "$1")" ]; }
 
+# Advisory-only: report which native VPN engines the kernel/userland can carry,
+# and recommend an opkg package for any that are absent. DETECT + RECOMMEND ONLY
+# -- this never installs anything. POSIX/busybox-safe; no-op if probes are missing.
+native_have() {
+  # $1 = lsmod module name(s, space-sep), $2 = userland cmd, $3..= candidate proto .sh files
+  mod="$1"; cmd="$2"; shift 2
+  for m in $mod; do
+    lsmod 2>/dev/null | grep -q "^$m" && return 0
+  done
+  [ -n "$cmd" ] && command -v "$cmd" >/dev/null 2>&1 && return 0
+  for f in "$@"; do [ -f "$f" ] && return 0; done
+  return 1
+}
+
+native_summary() {
+  hdr "Native VPN support"
+  present=""
+  # AmneziaWG (kernel module 'amneziawg', userland 'awg', or a netifd proto handler)
+  if native_have amneziawg awg /lib/netifd/proto/amneziawg.sh /opt/lib/netifd/proto/amneziawg.sh; then
+    present="$present amneziawg"
+  else
+    info "for native amneziawg: opkg install amneziawg-go  (or kmod-amneziawg + amneziawg-tools)"
+  fi
+  # WireGuard (kernel module 'wireguard', userland 'wg', or a netifd proto handler)
+  if native_have wireguard wg /lib/netifd/proto/wireguard.sh /opt/lib/netifd/proto/wireguard.sh; then
+    present="$present wireguard"
+  else
+    info "for native wireguard: opkg install wireguard-tools  (+ kmod-wireguard)"
+  fi
+  if [ -n "$present" ]; then ok "native:$present"
+  else info "native: none detected -- WakeRoute will tunnel these via sing-box instead"; fi
+  info "(advisory only -- nothing was installed; WakeRoute carries non-native protocols via sing-box)"
+}
+
 SRC="$(cd "$(dirname "$0")" && pwd)"
 say "WakeRoute installer $VERSION"
 [ "$DRY_RUN" = 1 ] && warn "DRY-RUN: no changes will be made"
@@ -167,7 +201,10 @@ if [ "$PLATFORM" = keenetic ] && [ -x /bin/ndmc ]; then
   model="$(ndmc -c 'show version' 2>/dev/null | grep -iE 'model|device' | head -n1 | sed 's/^ *//')"
   [ -n "$model" ] && info "router:   $model"
 fi
-case "$ARCH" in mips|mipsle) info "note:     MIPS builds are softfloat; if the daemon crashes on start, re-run with the other MIPS arch.";; esac
+case "$ARCH" in mips|mipsle)
+  info "note:     MIPS builds are softfloat; if the daemon crashes on start, re-run with the other MIPS arch."
+  info "          → to force little-endian: sh install.sh mipsle   (big-endian: sh install.sh mips)"
+;; esac
 
 # ===========================================================================
 # 2. ROUTER STATUS (non-blocking)
@@ -217,11 +254,27 @@ if [ -n "$MISSING" ] && command -v opkg >/dev/null 2>&1; then
   fi
 fi
 
+# nftables: needed for the hybrid kernel PBR mode (optional — sing-box TUN mode works without it).
+if command -v nft >/dev/null 2>&1; then
+  ok "nft:      $(nft --version 2>/dev/null | head -1)"
+else
+  info "nft:      not found (install nftables for hybrid PBR mode; sing-box TUN mode works without it)"
+fi
+
 # sing-box (UI works without it; Apply needs it). $SB always holds a path.
 SB="/opt/sbin/sing-box"
 if [ -x "$SB" ]; then ok "sing-box: $SB"
 elif command -v sing-box >/dev/null 2>&1; then SB="$(command -v sing-box)"; ok "sing-box: $SB"
 else warn "sing-box not found -- the UI will start, but you cannot Apply a proxy config until it exists at $SB (opkg install sing-box, or drop the $ARCH build from github.com/SagerNet/sing-box/releases)"; fi
+# Version compatibility: WakeRoute targets sing-box 1.12.x (1.13 removed the wireguard outbound).
+if [ -x "$SB" ]; then
+  SB_VER="$("$SB" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  SB_MAJOR="$(echo "$SB_VER" | cut -d. -f1)"
+  SB_MINOR="$(echo "$SB_VER" | cut -d. -f2)"
+  if [ -n "$SB_MAJOR" ] && [ "$SB_MAJOR" -eq 1 ] && [ "$SB_MINOR" -lt 12 ] 2>/dev/null; then
+    warn "sing-box $SB_VER is older than 1.12 — WakeRoute needs 1.12+ (upgrade: opkg install sing-box, or use the GitHub release)"
+  fi
+fi
 
 # ===========================================================================
 # 4. CONFLICTS  (detect, then offer to resolve each one)
@@ -362,6 +415,10 @@ hdr "Install"
 
 SBIN="/opt/sbin"
 VAR="/opt/var/wakeroute"
+if [ -x "$SBIN/wakeroute" ]; then
+  PREV_VER="$("$SBIN/wakeroute" --version 2>/dev/null | head -1)"
+  [ -n "$PREV_VER" ] && info "upgrading from: $PREV_VER"
+fi
 mkdir -p "$SBIN" "$INITD" "$ETC" "$VAR" || die "could not create install directories"
 
 if [ -x "$INITD/S99wakeroute" ]; then
@@ -374,7 +431,7 @@ fi
 say "installing binary -> $SBIN/wakeroute"
 cp "$BIN" "$SBIN/wakeroute.new" || die "failed to copy binary"
 chmod 0755 "$SBIN/wakeroute.new" || die "failed to chmod binary"
-[ -f "$SBIN/wakeroute" ] && cp "$SBIN/wakeroute" "$SBIN/wakeroute.bak"   # single rolling backup
+[ -f "$SBIN/wakeroute" ] && { cp "$SBIN/wakeroute" "$SBIN/wakeroute.bak" || warn "could not create backup (rollback with wakeroute.bak unavailable)"; }
 mv "$SBIN/wakeroute.new" "$SBIN/wakeroute" || die "failed to install binary"
 ok "binary installed ($(wc -c < "$SBIN/wakeroute" 2>/dev/null) bytes)"
 
@@ -411,8 +468,9 @@ else
   if [ -n "$cur" ] && [ "$cur" != "$PORT" ]; then
     warn "existing config listens on :$cur but you selected :$PORT"
     if ask "  update the config's listen port to :$PORT?" y; then
-      if sed -i "s|\"listen\"[^,]*|\"listen\": \":$PORT\"|" "$ETC/config.json"; then ok "config now listens on :$PORT"
-      else warn "could not edit config; change \"listen\" to \":$PORT\" by hand"; PORT="$cur"; fi
+      if sed -i "s|\"listen\"[^,]*|\"listen\": \":$PORT\"|" "$ETC/config.json" && \
+         grep -q "\"listen\": \":$PORT\"" "$ETC/config.json"; then ok "config now listens on :$PORT"
+      else warn "could not update config; change \"listen\" to \":$PORT\" by hand"; PORT="$cur"; fi
     else PORT="$cur"; info "keeping the configured port :$cur"; fi
   fi
 fi
@@ -423,6 +481,7 @@ fi
 if [ "$NO_START" = 1 ]; then
   hdr "Done (not started)"
   say "installed but not started (--no-start). Start later: $INITD/S99wakeroute start"
+  native_summary
   exit 0
 fi
 
@@ -436,24 +495,33 @@ else
 fi
 sleep 2
 
-# health check the UI
+# health check the UI (curl preferred; busybox wget fallback)
+# Detect the probe tool once so the inner loop doesn't re-run command -v on every attempt.
+PROBE_TOOL=""
+if command -v curl >/dev/null 2>&1; then PROBE_TOOL=curl
+elif command -v wget >/dev/null 2>&1; then PROBE_TOOL=wget; fi
 HEALTHY=0
-if command -v curl >/dev/null 2>&1; then
-  i=0
-  while [ "$i" -lt 5 ]; do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/" 2>/dev/null)"
-    [ "$code" = 200 ] && { HEALTHY=1; break; }
-    i=$((i+1)); sleep 1
-  done
-fi
+i=0
+while [ "$i" -lt 5 ]; do
+  case "$PROBE_TOOL" in
+    curl) code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/" 2>/dev/null)"
+          [ "$code" = 200 ] && { HEALTHY=1; break; } ;;
+    wget) wget -q -O /dev/null --timeout=3 "http://127.0.0.1:$PORT/" 2>/dev/null && { HEALTHY=1; break; } ;;
+    *)    break ;;
+  esac
+  i=$((i+1)); sleep 1
+done
 
 IP="$(ip route get 1 2>/dev/null | awk '{print $7; exit}')"
 [ -z "$IP" ] && IP="$(uname -n 2>/dev/null)"
 
+INSTALLED_VER="$("$SBIN/wakeroute" --version 2>/dev/null | head -1)"
 hdr "Done"
+[ -n "$INSTALLED_VER" ] && ok "version:  $INSTALLED_VER"
 if [ "$HEALTHY" = 1 ]; then ok "UI is up (HTTP 200 on :$PORT)"
 else warn "UI not answering yet on :$PORT -- give it a few seconds, then check: logread 2>/dev/null | grep wakeroute"; fi
 say "open  ->  http://${IP:-<router-ip>}:$PORT"
+native_summary
 echo ""
 echo "  next steps:"
 [ -x "$SB" ] || echo "    1. install sing-box   (opkg install sing-box) so you can Apply configs"

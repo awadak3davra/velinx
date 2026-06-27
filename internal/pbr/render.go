@@ -98,6 +98,43 @@ func (pl *Plan) RenderNft() string {
 		b.WriteString("\t}\n")
 	}
 
+	// Forwarded-LAN MASQUERADE on every tunnel egress dev. Forwarded LAN traffic steered out
+	// an adopted/owned kernel tunnel iface (an EgressInterface egress) keeps its private
+	// (RFC1918) source unless we SNAT it to the tunnel's source — the peer would otherwise have
+	// no route back (the exact black-hole from project history; the Keenetic iptables path
+	// already MASQUERADEs every failover member — this nft path was the gap). We match on
+	// oifname (the egress dev), NOT fwmark: by POSTROUTING the packet is already on the tunnel
+	// dev, so masquerade is a harmless no-op for the router's own egress (already tunnel-src'd)
+	// and only rewrites forwarded LAN flows. One line per UNIQUE iface so a failover re-election
+	// to another member dev stays NATed. The chain lives in THIS plan's own self-flushing table,
+	// so RenderTeardown's `delete table inet <pl.Table>` removes it automatically (fail-safe).
+	// v4 ONLY: mirror render_ipset.go's fail-closed posture — no v6 MASQUERADE (no v6 LAN on
+	// target; v6 forwarded flows stay in the tunnel table rather than leak).
+	// WAN-fallback MASQUERADE companion to the tunnel-iface lines above. If a failover/
+	// no-kill-switch policy ever routes WR-marked forwarded traffic OUT the WAN uplink dev (an
+	// EgressWAN egress that carries a concrete Iface — e.g. a "direct" fallback that hands
+	// general/failover flows to the WAN netdev instead of the main-table fall-through), those
+	// forwarded LAN flows would leave un-NATed and the upstream would have no route back — the
+	// same black-hole the tunnel masquerade prevents, mirroring render_ipset.go's WAN-fallback
+	// SNAT (which MASQUERADEs WAN-marked forwarded traffic via Options.WanIface). Here the WAN
+	// iface is read from the compiled Plan's EgressWAN.Iface (empty today → this stays a
+	// byte-identical no-op for every current plan and protects the render/render_masq goldens).
+	// Same posture as the tunnel lines: v4-only, oifname-matched (not fwmark), deduped against
+	// the tunnel ifaces, and inside THIS plan's self-flushing table so RenderTeardown removes it.
+	tunIfaces := pl.masqIfaces()
+	wanIfaces := pl.masqWanIfaces(tunIfaces)
+	if len(tunIfaces) > 0 || len(wanIfaces) > 0 {
+		b.WriteString("\tchain wr_nat {\n")
+		b.WriteString("\t\ttype nat hook postrouting priority srcnat; policy accept;\n")
+		for _, ifc := range tunIfaces {
+			fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 oifname \"%s\" masquerade\n", ifc)
+		}
+		for _, ifc := range wanIfaces {
+			fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 oifname \"%s\" masquerade\n", ifc)
+		}
+		b.WriteString("\t}\n")
+	}
+
 	b.WriteString("}\n")
 	return b.String()
 }
@@ -144,23 +181,56 @@ func excludesFor(opt Options, cidrs []string) []ipRuleExclude {
 	return out
 }
 
-// RenderIP returns the idempotent `ip rule`/`ip route` commands to install the plan.
+// hasV6 reports whether this plan marks any IPv6 traffic (a bypass peer or a v6 zone
+// CIDR). Used to gate the symmetric ip -6 rule / ip -6 route commands: a v4-only plan
+// must emit no `ip -6` at all (v4-only plan → v4-only ip-rule table, exact parity with
+// the nft wr_mark chain which only sets mark for ip/ip6 daddr respectively).
+func (pl *Plan) hasV6() bool {
+	if len(pl.BypassV6) > 0 {
+		return true
+	}
+	for _, z := range pl.Zones {
+		if len(z.V6) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// RenderIP returns the idempotent `ip rule`/`ip route` (and symmetric `ip -6 rule`/
+// `ip -6 route` when the plan marks v6) commands to install the plan.
 // WAN-marked traffic (the bypass) needs no rule — it falls through to the main table.
 func (pl *Plan) RenderIP(opt Options) []string {
 	opt.withDefaults()
+	v6 := pl.hasV6()
 	var cmds []string
 	for _, x := range privateExcludes(opt) {
 		cmds = append(cmds, fmt.Sprintf("ip rule add to %s lookup main priority %d", x.CIDR, x.Priority))
+	}
+	if v6 {
+		for _, x := range privateExcludesV6(opt) {
+			cmds = append(cmds, fmt.Sprintf("ip -6 rule add to %s lookup main priority %d", x.CIDR, x.Priority))
+		}
 	}
 	for i, e := range pl.nonWanEgresses() {
 		pref := opt.RulePref + i
 		cmds = append(cmds, fmt.Sprintf("ip rule add fwmark %s/%s table %d priority %d",
 			hexMark(e.Mark), hexMark(pl.Mask), e.Table, pref))
+		if v6 {
+			cmds = append(cmds, fmt.Sprintf("ip -6 rule add fwmark %s/%s table %d priority %d",
+				hexMark(e.Mark), hexMark(pl.Mask), e.Table, pref))
+		}
 		switch e.Kind {
 		case EgressInterface:
 			cmds = append(cmds, fmt.Sprintf("ip route replace default dev %s table %d", e.Iface, e.Table))
+			if v6 {
+				cmds = append(cmds, fmt.Sprintf("ip -6 route replace default dev %s table %d", e.Iface, e.Table))
+			}
 		case EgressBlackhole:
 			cmds = append(cmds, fmt.Sprintf("ip route replace blackhole default table %d", e.Table))
+			if v6 {
+				cmds = append(cmds, fmt.Sprintf("ip -6 route add blackhole default table %d", e.Table))
+			}
 		}
 	}
 	return cmds
@@ -169,15 +239,28 @@ func (pl *Plan) RenderIP(opt Options) []string {
 // ipTeardown returns just the `ip rule`/`ip route` removal commands (no nft).
 func (pl *Plan) ipTeardown(opt Options) []string {
 	opt.withDefaults()
+	v6 := pl.hasV6()
 	var cmds []string
 	for i, e := range pl.nonWanEgresses() {
 		pref := opt.RulePref + i
 		cmds = append(cmds, fmt.Sprintf("ip rule del fwmark %s/%s table %d priority %d",
 			hexMark(e.Mark), hexMark(pl.Mask), e.Table, pref))
+		if v6 {
+			cmds = append(cmds, fmt.Sprintf("ip -6 rule del fwmark %s/%s table %d priority %d",
+				hexMark(e.Mark), hexMark(pl.Mask), e.Table, pref))
+		}
 		cmds = append(cmds, fmt.Sprintf("ip route flush table %d", e.Table))
+		if v6 {
+			cmds = append(cmds, fmt.Sprintf("ip -6 route flush table %d", e.Table))
+		}
 	}
 	for _, x := range privateExcludes(opt) {
 		cmds = append(cmds, fmt.Sprintf("ip rule del to %s lookup main priority %d", x.CIDR, x.Priority))
+	}
+	if v6 {
+		for _, x := range privateExcludesV6(opt) {
+			cmds = append(cmds, fmt.Sprintf("ip -6 rule del to %s lookup main priority %d", x.CIDR, x.Priority))
+		}
 	}
 	return cmds
 }
@@ -185,6 +268,37 @@ func (pl *Plan) ipTeardown(opt Options) []string {
 // RenderTeardown returns the commands to remove everything RenderNft/RenderIP installed.
 func (pl *Plan) RenderTeardown(opt Options) []string {
 	return append([]string{fmt.Sprintf("nft delete table inet %s", pl.Table)}, pl.ipTeardown(opt)...)
+}
+
+// masqIfaces returns the unique kernel tunnel ifnames that need a forwarded-LAN MASQUERADE.
+// The set is plan.MasqIfaces (populated by Compile from all enabled EngineExternal endpoints)
+// so an adopted tunnel that only carries IPv6 CIDRs — filtered from zones by the v4-only
+// posture — still gets a MASQUERADE rule. Empty for plans with no external-interface endpoints.
+func (pl *Plan) masqIfaces() []string { return pl.MasqIfaces }
+
+// masqWanIfaces returns the unique WAN uplink ifnames that need the WAN-fallback forwarded-LAN
+// MASQUERADE: any EgressWAN egress that carries a concrete Iface (a no-kill-switch / failover
+// fallback that routes WR-marked forwarded traffic out the WAN netdev rather than the main-table
+// fall-through). Empty for every current plan — Compile leaves EgressWAN.Iface "" — so the nft
+// output is byte-identical to today (the no-op the render/render_masq goldens depend on). Any
+// iface already covered by the tunnel-masquerade lines (`skip`) is dropped so the WAN line is
+// never a duplicate of a tunnel line, and the result is de-duped + stable-sorted for determinism.
+func (pl *Plan) masqWanIfaces(skip []string) []string {
+	skipped := make(map[string]bool, len(skip))
+	for _, s := range skip {
+		skipped[s] = true
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range pl.Egresses {
+		if e.Kind != EgressWAN || e.Iface == "" || skipped[e.Iface] || seen[e.Iface] {
+			continue
+		}
+		seen[e.Iface] = true
+		out = append(out, e.Iface)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // nonWanEgresses returns interface/blackhole egresses in stable (mark) order.

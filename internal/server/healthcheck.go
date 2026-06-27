@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
+
+	"wakeroute/internal/generator"
+	"wakeroute/internal/netdiag"
 )
 
 // healthRow is one server-side diagnostic result, shaped for the Diagnostics
@@ -34,7 +38,10 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	// The checks are independent + each fans out to remote probes, so run them
 	// concurrently — sequential would risk blowing the request timeout.
-	checks := []func(context.Context) healthRow{clockSkewCheck, ipv6LeakCheck, dnsHealthCheck, flowOffloadCheck}
+	checks := []func(context.Context) healthRow{clockSkewCheck, ipv6LeakCheck, dnsHealthCheck, flowOffloadCheck,
+		func(ctx context.Context) healthRow { return s.pbrKernelCheck(ctx) },
+		func(ctx context.Context) healthRow { return s.nativeOnlyCheck(ctx) },
+		func(ctx context.Context) healthRow { return s.endpointReachCheck(ctx) }}
 	rows := make([]healthRow, len(checks))
 	var wg sync.WaitGroup
 	for i, fn := range checks {
@@ -155,8 +162,12 @@ func ipv6HasGlobal(ifInet6 string) bool {
 // carve-outs by firewall mark, so a flowtable must EXCLUDE marked connections; otherwise a
 // carve-out could be offloaded straight past the VPN (a leak). The fix text says so, to avoid
 // a naive flow_offloading_hw flip. Degrades to a warn off-OpenWrt.
-func flowOffloadCheck(_ context.Context) healthRow {
+func flowOffloadCheck(ctx context.Context) healthRow {
 	row := healthRow{ID: "offload", Label: "Flow offload (fast path)"}
+	if ctx.Err() != nil {
+		row.Status, row.Summary = "warn", "check cancelled"
+		return row
+	}
 	b, err := os.ReadFile("/etc/config/firewall")
 	if err != nil {
 		row.Status, row.Summary = "warn", "can't read the firewall config (non-OpenWrt?)"
@@ -305,4 +316,151 @@ func dnsJSONOK(body []byte) bool {
 		return false
 	}
 	return v.Status == 0 && len(v.Answer) > 0
+}
+
+// endpointReachCheck dials each enabled endpoint's server:port DIRECTLY from the router to
+// isolate transport reachability from proxy/protocol health. The per-endpoint monitor tests
+// the full proxy path (clash delay); this complements it: a failed direct dial means the
+// server is down / the port is wrong / the path is blocked at the network, whereas a
+// reachable server whose connection still fails points at a config/protocol problem. Dials
+// run concurrently with a short timeout; endpoints with no dialable host:port (e.g. a
+// kernel-managed external tunnel with no server set) are skipped. These are the operator's
+// own configured servers, so there is no SSRF surface here.
+func (s *Server) endpointReachCheck(ctx context.Context) healthRow {
+	row := healthRow{ID: "endpoint_reach", Label: "VPN servers reachable"}
+	p := s.store.Profile()
+	type tgt struct {
+		name, host string
+		port       int
+	}
+	var tgts []tgt
+	for _, e := range p.Endpoints {
+		if !e.Enabled {
+			continue
+		}
+		host, port := e.Server, e.Port
+		if host == "" { // an external/native tunnel may carry the peer in params instead
+			if ip, _ := e.Params["endpoint_ip"].(string); ip != "" {
+				host = ip
+			}
+		}
+		if host == "" || port <= 0 || port > 65535 {
+			continue // nothing dialable
+		}
+		name := e.Name
+		if name == "" {
+			name = e.ID
+		}
+		tgts = append(tgts, tgt{name, host, port})
+	}
+	if len(tgts) == 0 {
+		row.Status, row.Summary = "pass", "no dialable endpoints to check"
+		return row
+	}
+	type res struct {
+		name string
+		ok   bool
+	}
+	out := make([]res, len(tgts))
+	var wg sync.WaitGroup
+	for i, t := range tgts {
+		wg.Add(1)
+		go func(i int, t tgt) {
+			defer wg.Done()
+			out[i] = res{t.name, netdiag.DialPort(t.host, t.port, 4*time.Second)}
+		}(i, t)
+	}
+	wg.Wait()
+
+	var down []string
+	for _, r := range out {
+		if !r.ok {
+			down = append(down, r.name)
+		}
+	}
+	if len(down) == 0 {
+		row.Status = "pass"
+		row.Summary = fmt.Sprintf("all %d server(s) TCP-reachable", len(tgts))
+		return row
+	}
+	row.Status = "warn"
+	row.Summary = fmt.Sprintf("%d of %d server(s) unreachable", len(down), len(tgts))
+	row.Detail = "unreachable: " + strings.Join(down, ", ")
+	row.Fix = "These VPN servers didn't accept a TCP connection from the router — the server may be down, the port wrong, or the path blocked (DPI/firewall). If a server IS reachable here but its connection still fails, the problem is the proxy/protocol config, not the network."
+	return row
+}
+
+// pbrKernelCheck verifies the nft table is present when hybrid PBR is supposed to be installed.
+// Only runs a real nft probe when the plan is active; returns pass/skip otherwise.
+//
+// Native-only ("fast" + ProfileNativeOnly + nothing surviving into sing-box, per
+// generator.DatapathNativeOnly): the kernel plane carries everything and sing-box is
+// intentionally absent. The companion native-only check (nativeOnlyCheck) reports that
+// state as informational so the battery does NOT read the missing core as a fault.
+func (s *Server) pbrKernelCheck(ctx context.Context) healthRow {
+	row := healthRow{ID: "pbr_kernel", Label: "Kernel routing (PBR)"}
+
+	c := s.config()
+	mode := s.routingMode(c)
+	s.pbrMu.Lock()
+	plan := s.pbrPlan
+	s.pbrMu.Unlock()
+
+	// In "fast"/native-only the kernel PBR IS the datapath (no TUN), so a kernel probe is
+	// warranted exactly as in hybrid. In "tun"/"mixed" the TUN carries general traffic and
+	// no kernel PBR is expected. Treat "fast" like "hybrid" below.
+	if mode != "hybrid" && mode != "fast" {
+		row.Status, row.Summary = "pass", "TUN mode — no kernel PBR needed"
+		return row
+	}
+	if plan == nil {
+		row.Status, row.Summary = "warn", mode+" mode but plan not installed — click Apply"
+		row.Fix = "Apply a config with at least one routing list to activate kernel PBR."
+		return row
+	}
+
+	cmd := exec.CommandContext(ctx, "nft", "list", "table", "inet", plan.Table)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		row.Status = "warn"
+		row.Summary = "nft table missing — plan was applied but table is gone"
+		row.Detail = strings.TrimSpace(string(out))
+		row.Fix = "Click Apply to re-install the nftables routing rules (fw4 reload may have flushed them)."
+		return row
+	}
+	row.Status = "pass"
+	row.Summary = fmt.Sprintf("active — %d zone(s) installed", len(plan.Zones))
+	return row
+}
+
+// nativeOnlyCheck reports whether the sing-box core is intentionally absent because the
+// live profile is native-only (generator.DatapathNativeOnly: "fast" mode + every enabled
+// endpoint kernel-native + the default egress is WAN/direct + nothing survives into
+// sing-box). In that regime the kernel plane (PBR) carries everything and there is NO
+// sing-box process to probe — so the battery's core/clash checks must NOT read the absent
+// core as a fault. This row makes that state explicit: a "pass" row "no sing-box core
+// needed". When the profile is NOT native-only, sing-box IS the (or a) datapath and its
+// presence is governed by the normal core checks — this row reports a benign pass that
+// just states the core is in use, never a false alarm in either direction.
+//
+// Fail-safe-aligned: DatapathNativeOnly is conservative (false on any ambiguity — nil
+// profile, non-fast mode, anything that would survive into sing-box), so this row only
+// claims "core not needed" when it is provably safe to omit it.
+func (s *Server) nativeOnlyCheck(ctx context.Context) healthRow {
+	row := healthRow{ID: "native_only", Label: "Datapath core (sing-box)"}
+	if ctx.Err() != nil {
+		row.Status, row.Summary = "warn", "check cancelled"
+		return row
+	}
+	p := s.store.Profile()
+	mode := s.routingMode(s.config())
+	if generator.DatapathNativeOnly(&p, mode) {
+		row.Status = "pass"
+		row.Summary = "sing-box not needed (native-only mode)"
+		row.Detail = "All endpoints are kernel-native and traffic is routed by the kernel plane (PBR) in fast mode, so the sing-box core is intentionally absent — its absence is NOT a fault."
+		return row
+	}
+	row.Status = "pass"
+	row.Summary = "sing-box core is part of the datapath"
+	row.Detail = "The profile is not native-only, so sing-box carries part of the traffic; the core/clash checks govern whether it is actually running."
+	return row
 }
