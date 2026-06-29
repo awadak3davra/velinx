@@ -11,7 +11,7 @@ INIT="$HERE/../S99velinx"
 : "${SOURCE_DATE_EPOCH:=0}"
 [ -f "$BIN" ]  || { echo "pack-entware: binary not found: $BIN" >&2; exit 1; }
 [ -f "$INIT" ] || { echo "pack-entware: init not found: $INIT" >&2; exit 1; }
-mkdir -p "$OUT"
+mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"   # absolute: `ar` runs after cd into the work dir
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 
 mkdir -p "$work/data/opt/sbin" "$work/data/opt/etc/init.d"

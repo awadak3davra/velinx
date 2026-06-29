@@ -12,7 +12,7 @@ INIT="$HERE/../openwrt/velinx.init"
 : "${SOURCE_DATE_EPOCH:=0}"
 [ -f "$BIN" ]  || { echo "pack-ipk: binary not found: $BIN" >&2; exit 1; }
 [ -f "$INIT" ] || { echo "pack-ipk: init not found: $INIT" >&2; exit 1; }
-mkdir -p "$OUT"
+mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"   # absolute: `ar` runs after cd into the work dir
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 
 # data tree: the binary + the procd init, reproducible (fixed owner/mtime, sorted).
