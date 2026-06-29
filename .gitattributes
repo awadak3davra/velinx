@@ -7,3 +7,5 @@ S99kx text eol=lf
 *.png binary
 *.exe binary
 *.gz binary
+# signing keys are exact blobs — never touch their line endings (avoids CRLF normalize warnings)
+packaging/feed/keys/* -text

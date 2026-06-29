@@ -9,6 +9,12 @@
 /servers.json
 /servers.json.tmp
 /singbox.json
+# feed signing PRIVATE keys — the .pub halves ARE committed; the private halves live only in the
+# GitHub Actions secrets (VELINX_USIGN_SEC / VELINX_APK_SEC_PEM) and your local Drive backup. Losing
+# them forces a key rotation (every device must re-trust), so keep the backup.
+/packaging/feed/keys/*.sec
+/packaging/feed/keys/*.pem
+
 # editor / OS cruft
 *.swp
 .DS_Store

@@ -1,0 +1,146 @@
+name: feed
+
+# Build + sign + publish the native package feed (opkg .ipk + Entware + apk .apk) to the
+# awadak3davra/velinx-feed GitHub Pages site. Runs on a v* release tag, or manually for validation.
+# The opkg/Entware path is the verified core; the apk path is best-effort until apk-tools v3 is pinned.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version to package (no leading v); blank = latest release tag'
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  feed:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Resolve version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -eu
+          if printf '%s' "${GITHUB_REF_NAME:-}" | grep -q '^v[0-9]'; then
+            v="${GITHUB_REF_NAME#v}"
+          elif [ -n "${INPUT_VERSION:-}" ]; then
+            v="${INPUT_VERSION#v}"
+          else
+            v="$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName | sed 's/^v//')"
+          fi
+          [ -n "$v" ] || { echo "could not resolve a version" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "packaging Velinx $v"
+
+      - name: Build per-arch binaries
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+        run: |
+          set -eu
+          v="${{ steps.ver.outputs.version }}"
+          mkdir -p bins
+          build() { GOARCH="$2" GOMIPS="${3:-}" GOARM="${4:-}" go build -trimpath \
+            -ldflags "-s -w -X velinx/internal/version.Version=$v" -o "bins/velinx-$1" ./cmd/velinx; }
+          build mipsle mipsle softfloat
+          build mips   mips   softfloat
+          build arm    arm    ''        7
+          build arm64  arm64
+          build amd64  amd64
+          go build -o bins/usigntool ./packaging/feed/usigntool
+          ls -la bins
+
+      - name: Pack opkg (.ipk) + Entware
+        run: |
+          set -eu
+          v="${{ steps.ver.outputs.version }}"
+          export SOURCE_DATE_EPOCH=0
+          mkdir -p feed
+          # arch-map lines:  goname  openwrt-tokens...  |  entware-token
+          while IFS= read -r line; do
+            case "$line" in ''|\#*) continue ;; esac
+            ow="${line%%|*}"; ew="${line##*|}"
+            # shellcheck disable=SC2086
+            set -- $ow
+            goname="$1"; shift; owtokens="$*"
+            ewtoken="$(printf '%s' "$ew" | tr -d ' ')"
+            # shellcheck disable=SC2086
+            sh packaging/feed/pack-ipk.sh     "bins/velinx-$goname" "$v" 1 feed/ipk     $owtokens
+            sh packaging/feed/pack-entware.sh "bins/velinx-$goname" "$v" 1 feed/entware "$ewtoken"
+          done < packaging/feed/arch-map.txt
+
+      - name: Sign opkg indexes (usign)
+        run: |
+          set -eu
+          umask 077
+          printf '%s' "${{ secrets.VELINX_USIGN_SEC }}" > "$RUNNER_TEMP/velinx.sec"
+          sh packaging/feed/make-index.sh feed "$RUNNER_TEMP/velinx.sec" bins/usigntool
+          rm -f "$RUNNER_TEMP/velinx.sec"
+
+      - name: Pack apk (.apk) + index — best-effort (needs apk-tools v3 in a container)
+        id: apk
+        continue-on-error: true
+        run: |
+          set -eu
+          v="${{ steps.ver.outputs.version }}"
+          command -v docker >/dev/null 2>&1 || { echo "::warning::no docker on runner — skipping apk feed (opkg feed still published)"; exit 0; }
+          printf '%s' "${{ secrets.VELINX_APK_SEC_PEM }}" > "$PWD/.apk-sign.pem"
+          # apk-tools v3 (apk mkpkg/mkndx/adbsign) is not in Alpine stable; try edge's apk-tools.
+          docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -euc '
+            apk add --no-cache apk-tools >/dev/null 2>&1 || true
+            if ! apk mkpkg --help >/dev/null 2>&1; then
+              echo "::warning::apk mkpkg unavailable (apk-tools v3 not present) — apk feed skipped"; exit 0
+            fi
+            v="'"$v"'"
+            while IFS= read -r line; do
+              case "$line" in ""|\#*) continue ;; esac
+              ow="${line%%|*}"; set -- $ow; goname="$1"; shift; owtokens="$*"
+              sh packaging/feed/pack-apk.sh "bins/velinx-$goname" "$v" 1 feed $owtokens
+            done < packaging/feed/arch-map.txt
+            for d in feed/apk/*/; do
+              [ -d "$d" ] || continue
+              ( cd "$d" && apk mkndx -o packages.adb ./*.apk && apk adbsign --sign-key /w/.apk-sign.pem packages.adb )
+            done
+          '
+          rm -f "$PWD/.apk-sign.pem"
+
+      - name: Assemble feed root (keys + landing page)
+        run: |
+          set -eu
+          rm -f "$PWD/.apk-sign.pem" 2>/dev/null || true
+          cp packaging/feed/keys/velinx.pub          feed/velinx.pub
+          cp packaging/feed/keys/velinx-apk.pem.pub  feed/velinx-apk.pem.pub
+          touch feed/.nojekyll
+          {
+            echo "<!doctype html><meta charset=utf-8><title>Velinx package feed</title>"
+            echo "<h1>Velinx package feed</h1>"
+            echo "<p>Native OpenWrt / Entware / Keenetic feed for <a href=https://github.com/awadak3davra/velinx>Velinx</a>."
+            echo "See <a href=https://github.com/awadak3davra/velinx/blob/main/docs/INSTALL_OPENWRT.md>install docs</a>.</p>"
+            echo "<pre>opkg: src/gz velinx \$BASE/ipk/\$arch   key: velinx.pub"
+            echo "apk : \$BASE/apk/\$arch/packages.adb       key: velinx-apk.pem.pub</pre>"
+          } > feed/index.html
+          echo "feed tree:"; find feed -maxdepth 3 -type f | sort
+
+      - name: Deploy to velinx-feed Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          deploy_key: ${{ secrets.FEED_DEPLOY_KEY }}
+          external_repository: awadak3davra/velinx-feed
+          publish_branch: gh-pages
+          publish_dir: ./feed
+          force_orphan: true
+          commit_message: "Velinx feed ${{ steps.ver.outputs.version }}"

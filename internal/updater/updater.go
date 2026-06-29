@@ -6,10 +6,7 @@
 package updater
 
 import (
-	"archive/tar"
-	"archive/zip"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -359,36 +356,20 @@ func (u *Updater) Install(ctx context.Context, e Engine, tag string) (string, er
 	if asset == nil {
 		return "", fmt.Errorf("no %s asset for arch %q in %s %s", e.ID, u.Arch, e.ID, tag)
 	}
-	// Pre-flight RAM check BEFORE downloading: the install buffers the compressed asset AND the
-	// decompressed binary in RAM at once, so on a low-RAM router a large engine would OOM-kill
-	// the daemon (and other processes) mid-install. Refuse cleanly instead of crashing.
-	if avail, ok := availMemBytes(); !enoughMemForDownload(avail, ok, asset.Size) {
-		return "", fmt.Errorf("not enough free memory to install %s: needs ~%d MiB but only ~%d MiB is available (the panel downloads and unpacks the binary in RAM). Free memory and retry, or install it over SSH", e.ID, peakInstallRAM(asset.Size)>>20, avail>>20)
-	}
-
-	data, err := u.download(ctx, asset.URL, dlCap(asset.Size))
-	if err != nil {
-		return "", fmt.Errorf("download %s: %w", asset.Name, err)
-	}
-	if err := verifyDigest(data, asset.Digest); err != nil {
-		return "", err
-	}
-
-	bin, err := extractBinary(asset.Name, data, e.BinName)
-	if err != nil {
-		return "", err
-	}
 	if err := os.MkdirAll(u.BinDir, 0o755); err != nil {
 		return "", err
 	}
-	if avail, ok := AvailBytes(u.BinDir); !enoughSpaceFor(avail, ok, len(bin), false) {
-		return "", fmt.Errorf("not enough free space to install %s in %s (~%d MiB free) — free some space and retry", e.ID, u.BinDir, avail>>20)
+	// Flash pre-flight BEFORE downloading: streamAssetToFile writes the decompressed binary into
+	// BinDir as it downloads. On a tiny router overlay a large core simply cannot fit, so refuse
+	// early with an actionable message instead of failing mid-write. (Streaming retired the old
+	// in-RAM compressed+decompressed peak, so RAM is no longer the binding constraint here.)
+	if avail, ok := AvailBytes(u.BinDir); !enoughFlashFor(avail, ok, asset.Size, false) {
+		return "", fmt.Errorf("not enough free space to install %s in %s (~%d MiB free, need ~%d MiB for the unpacked binary) — free space, mount external storage, or install over SSH", e.ID, u.BinDir, avail>>20, peakInstallDisk(asset.Size, false)>>20)
 	}
 	dst := filepath.Join(u.BinDir, e.BinName)
 	tmp := dst + ".new"
-	if err := os.WriteFile(tmp, bin, 0o755); err != nil {
-		_ = os.Remove(tmp) // don't leave a partial .new wasting the overlay
-		return "", err
+	if err := u.streamAssetToFile(ctx, *asset, e.BinName, tmp, false); err != nil {
+		return "", fmt.Errorf("download %s: %w", asset.Name, err)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
@@ -570,94 +551,59 @@ func matchAsset(name, arch string) bool {
 	return false
 }
 
+// extractBinary returns the wanted binary from an asset held in memory. It is the []byte
+// convenience form of extractStreamTo (stream.go); the streaming install path uses the io.Writer
+// form directly so it never buffers the decompressed binary. Kept for tests + small callers.
 func extractBinary(assetName string, data []byte, binName string) ([]byte, error) {
-	n := strings.ToLower(assetName)
-	switch {
-	case strings.HasSuffix(n, ".tar.gz") || strings.HasSuffix(n, ".tgz"):
-		return fromTarGz(data, binName)
-	case strings.HasSuffix(n, ".zip"):
-		return fromZip(data, binName)
-	case strings.HasSuffix(n, ".gz"):
-		return fromGz(data)
-	default:
-		return data, nil // raw binary
+	br := bytes.NewReader(data)
+	var b bytes.Buffer
+	if err := extractStreamTo(assetName, br, br, int64(len(data)), binName, &b); err != nil {
+		return nil, err
 	}
+	return b.Bytes(), nil
 }
 
 func fromGz(data []byte) ([]byte, error) {
-	zr, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
+	var b bytes.Buffer
+	if err := fromGzStream(bytes.NewReader(data), &b); err != nil {
 		return nil, err
 	}
-	defer zr.Close()
-	return io.ReadAll(io.LimitReader(zr, 256<<20))
+	return b.Bytes(), nil
 }
 
 func fromTarGz(data []byte, binName string) ([]byte, error) {
-	zr, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
+	var b bytes.Buffer
+	if err := fromTarGzStream(bytes.NewReader(data), binName, &b); err != nil {
 		return nil, err
 	}
-	defer zr.Close()
-	tr := tar.NewReader(zr)
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		if h.Typeflag == tar.TypeReg && filepath.Base(h.Name) == binName {
-			return io.ReadAll(io.LimitReader(tr, 256<<20))
-		}
-	}
-	return nil, fmt.Errorf("binary %q not found in archive", binName)
+	return b.Bytes(), nil
 }
 
 func fromZip(data []byte, binName string) ([]byte, error) {
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
+	br := bytes.NewReader(data)
+	var b bytes.Buffer
+	if err := fromZipStream(br, int64(len(data)), binName, &b); err != nil {
 		return nil, err
 	}
-	for _, f := range zr.File {
-		if filepath.Base(f.Name) == binName {
-			rc, err := f.Open()
-			if err != nil {
-				return nil, err
-			}
-			defer rc.Close()
-			return io.ReadAll(io.LimitReader(rc, 256<<20))
-		}
-	}
-	return nil, fmt.Errorf("binary %q not found in zip", binName)
+	return b.Bytes(), nil
 }
 
+// verifyDigest checks data held in memory against a "sha256:<hex>" digest. A missing/!sha256 digest
+// is a best-effort SKIP, so an engine release without one still installs. See verifyDigestSum
+// (stream.go), which the streaming path calls with a sum computed as the asset streamed.
 func verifyDigest(data []byte, digest string) error {
-	parts := strings.SplitN(digest, ":", 2)
-	if len(parts) != 2 || parts[0] != "sha256" {
-		return nil // no/unknown digest -> best-effort, skip
-	}
 	sum := sha256.Sum256(data)
-	if !strings.EqualFold(hex.EncodeToString(sum[:]), parts[1]) {
-		return fmt.Errorf("sha256 mismatch: refusing to install")
-	}
-	return nil
+	return verifyDigestSum("sha256:"+hex.EncodeToString(sum[:]), digest, false)
 }
 
-// verifyDigestRequired is the SELF-UPDATE variant: a non-empty, well-formed sha256 digest
-// is MANDATORY. Unlike verifyDigest (which skips when a release asset carries no digest, so
-// engine releases that lack one can still install best-effort), the Velinx binary runs as
-// root after a swap, so we refuse to install one we couldn't verify. WR's own CI publishes
-// every tarball as a GitHub Release asset, which GitHub auto-populates with a sha256 digest,
-// so a real release always passes; an absent digest means the mirror channel is the only
-// trust root and we decline rather than install unverified.
+// verifyDigestRequired is the SELF-UPDATE variant: a present, matching sha256 is MANDATORY because
+// the Velinx binary runs as root after a swap, so we refuse to install one we couldn't verify. WR's
+// own CI publishes every tarball as a GitHub Release asset, which GitHub auto-populates with a
+// sha256 digest, so a real release always passes; an absent digest means the mirror channel is the
+// only trust root and we decline.
 func verifyDigestRequired(data []byte, digest string) error {
-	parts := strings.SplitN(digest, ":", 2)
-	if len(parts) != 2 || parts[0] != "sha256" || parts[1] == "" {
-		return fmt.Errorf("self-update refused: release asset has no sha256 digest to verify against (an unverified binary would run as root)")
-	}
-	return verifyDigest(data, digest)
+	sum := sha256.Sum256(data)
+	return verifyDigestSum("sha256:"+hex.EncodeToString(sum[:]), digest, true)
 }
 
 // --- Velinx self-update -------------------------------------------------
@@ -728,35 +674,18 @@ func (u *Updater) SelfUpdate(ctx context.Context, repo, tag, exePath string) (st
 	if asset == nil {
 		return "", fmt.Errorf("no velinx %s asset in %s", u.Arch, tag)
 	}
-	// Pre-flight RAM check (see enoughMemForDownload): the self-update also buffers compressed +
-	// decompressed in RAM; refuse cleanly on a low-RAM router rather than risk an OOM mid-swap.
-	if avail, ok := availMemBytes(); !enoughMemForDownload(avail, ok, asset.Size) {
-		return "", fmt.Errorf("not enough free memory to self-update: needs ~%d MiB but only ~%d MiB is available (the binary is downloaded and unpacked in RAM). Free memory and retry, or update over SSH", peakInstallRAM(asset.Size)>>20, avail>>20)
-	}
-	data, err := u.download(ctx, asset.URL, dlCap(asset.Size))
-	if err != nil {
-		return "", fmt.Errorf("download %s: %w", asset.Name, err)
-	}
-	// Self-update requires a present + matching digest (see verifyDigestRequired): the new
-	// binary runs as root, so we never install one the mirror channel served unverified.
-	if err := verifyDigestRequired(data, asset.Digest); err != nil {
-		return "", err
-	}
-	bin, err := fromTarGz(data, "velinx-"+u.Arch)
-	if err != nil {
-		return "", fmt.Errorf("extract velinx-%s: %w", u.Arch, err)
-	}
 	dir := filepath.Dir(exePath)
-	// Pre-flight: the staged binary AND the .bak backup both land on exePath's
-	// filesystem. On the tiny router overlay a swap that runs out of space mid-write
-	// would otherwise leave a truncated binary — abort cleanly instead, untouched.
-	if avail, ok := AvailBytes(dir); !enoughSpaceFor(avail, ok, len(bin), true) {
-		return "", fmt.Errorf("not enough free space to self-update safely on %s (~%d MiB free, need ~%d MiB for the new binary + backup) — free some space and retry", dir, avail>>20, (uint64(len(bin))*2+(2<<20))>>20)
+	// Flash pre-flight: the staged binary AND the .bak backup both land on exePath's filesystem.
+	// On the tiny router overlay a swap that won't fit would otherwise fail mid-write — abort
+	// cleanly, untouched. (Streaming retired the in-RAM peak, so flash is the binding constraint.)
+	if avail, ok := AvailBytes(dir); !enoughFlashFor(avail, ok, asset.Size, true) {
+		return "", fmt.Errorf("not enough free space to self-update safely on %s (~%d MiB free, need ~%d MiB for the new binary + backup) — free space, mount external storage, or update over SSH", dir, avail>>20, peakInstallDisk(asset.Size, true)>>20)
 	}
 	staged := filepath.Join(dir, ".velinx.new")
-	if err := os.WriteFile(staged, bin, 0o755); err != nil {
-		_ = os.Remove(staged) // don't leave a partial .velinx.new wasting the overlay
-		return "", err
+	// Stream the asset straight to the staged file (digest MANDATORY — the new binary runs as root):
+	// no compressed/decompressed RAM buffer, so a self-update can't OOM the router mid-swap.
+	if err := u.streamAssetToFile(ctx, *asset, "velinx-"+u.Arch, staged, true); err != nil {
+		return "", fmt.Errorf("download velinx-%s: %w", u.Arch, err)
 	}
 	// Sanity-run BEFORE swapping — refuse a binary that won't execute on this arch.
 	out, runErr := exec.CommandContext(ctx, staged, "-version").CombinedOutput()

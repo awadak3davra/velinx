@@ -63,10 +63,10 @@ func (s *Server) handleUpdaterVersions(w http.ResponseWriter, r *http.Request) {
 	for _, rl := range rels {
 		tags = append(tags, rl.Tag)
 	}
-	latest := ""
-	if len(tags) > 0 {
-		latest = tags[0]
-	}
+	// "latest" must be the newest STABLE release: GitHub returns newest-first, but the top entry can
+	// be a prerelease (e.g. a sing-box 1.14.0-alpha that outranks the 1.12.x line the panel targets),
+	// which must never be surfaced as the recommended version. LatestStable skips prereleases.
+	latest := updater.LatestStable(rels)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"latest":    latest,
 		"versions":  tags,

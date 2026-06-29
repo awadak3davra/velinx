@@ -1,0 +1,7 @@
+#!/bin/sh
+# opkg post-install. OpenWrt's default_postinst already enables a shipped init.d script; this also
+# STARTS it on a live device. The guard keeps it from running on the build host / inside ImageBuilder.
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+/etc/init.d/velinx enable 2>/dev/null
+/etc/init.d/velinx start 2>/dev/null
+exit 0

@@ -1,0 +1,5 @@
+#!/bin/sh
+# apk post-install trigger (OpenWrt apk also runs default_postinst to enable a shipped init.d script).
+/etc/init.d/velinx enable 2>/dev/null
+/etc/init.d/velinx start 2>/dev/null
+exit 0
